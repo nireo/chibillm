@@ -1,0 +1,16 @@
+# Meson build directories
+/builddir/
+
+# Editor/build caches
+/.cache/
+
+# Generated compilation database
+/compile_commands.json
+
+# Meson subproject downloads
+/subprojects/doctest-*/
+/subprojects/packagecache/
+/subprojects/.wraplock
+
+# Local model downloads (large generated artifacts)
+/qwen_model/
