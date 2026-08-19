@@ -36,14 +36,21 @@ enum class seq_errc : std::uint8_t {
     invalid_temperature,
     invalid_max_new_tokens,
     invalid_block_size,
-    invalid_state,
-    invalid_token_count,
+    already_finished,
+    invalid_state_transition,
+    invalid_finish_reason,
+    zero_scheduled_tokens,
+    work_already_scheduled,
+    too_many_scheduled_tokens,
+    no_work_scheduled,
+    cached_token_count_out_of_range,
     index_out_of_range,
+    block_table_full,
 };
 
 struct sampling_params {
     float temperature { 1.0f };
-    size_t max_new_tokens { 64 };
+    std::size_t max_new_tokens { 64 };
     bool ignore_eos { false };
 };
 
@@ -53,7 +60,7 @@ struct seq {
         seq_id id,
         std::vector<token_id> prompt_tokens,
         sampling_params params,
-        size_t kv_block_size);
+        std::size_t kv_block_size);
 
     seq(const seq&) = delete;
     seq& operator=(const seq&) = delete;
@@ -72,9 +79,9 @@ struct seq {
 
     [[nodiscard]] token_id last_token() const noexcept;
 
-    [[nodiscard]] size_t token_count() const noexcept;
-    [[nodiscard]] size_t prompt_token_count() const noexcept;
-    [[nodiscard]] size_t completion_token_count() const noexcept;
+    [[nodiscard]] std::size_t token_count() const noexcept;
+    [[nodiscard]] std::size_t prompt_token_count() const noexcept;
+    [[nodiscard]] std::size_t completion_token_count() const noexcept;
 
     // Append a token sampled by the model.
     //
@@ -108,17 +115,17 @@ struct seq {
     std::expected<void, seq_errc> finish(finish_reason reason);
 
     // KV-cache progress
-    [[nodiscard]] size_t cached_token_count() const noexcept;
-    [[nodiscard]] size_t scheduled_token_count() const noexcept;
+    [[nodiscard]] std::size_t cached_token_count() const noexcept;
+    [[nodiscard]] std::size_t scheduled_token_count() const noexcept;
 
     // Number of tokens that do not yet have valid K/V entries. Scheduled tokens
     // still count as uncached until the model execution succeeds.
-    [[nodiscard]] size_t uncached_token_count() const noexcept;
+    [[nodiscard]] std::size_t uncached_token_count() const noexcept;
 
     // Number of additional tokens the scheduler may reserve:
     //
     // token_count - cached_token_count - scheduled_token_count
-    [[nodiscard]] size_t schedulable_token_count() const noexcept;
+    [[nodiscard]] std::size_t schedulable_token_count() const noexcept;
 
     // Reserve uncached tokens for the next model invocation.
     //
@@ -128,7 +135,7 @@ struct seq {
     // - more tokens than schedulable_token_count().
     [[nodiscard]]
     std::expected<void, seq_errc>
-    schedule_tokens(size_t count);
+    schedule_tokens(std::size_t count);
 
     // Call only after successful model execution. Moves all scheduled tokens into
     // the cached prefix and resets scheduled_token_count_ to zero.
@@ -143,14 +150,14 @@ struct seq {
     // The count must not exceed token_count().
     [[nodiscard]]
     std::expected<void, seq_errc>
-    set_cached_token_count(size_t count);
+    set_cached_token_count(std::size_t count);
 
     // Block geometry
-    [[nodiscard]] size_t block_size() const noexcept;
+    [[nodiscard]] std::size_t block_size() const noexcept;
 
     // Number of logical token blocks required, including a partially full final
     // block.
-    [[nodiscard]] size_t logical_block_count() const noexcept;
+    [[nodiscard]] std::size_t logical_block_count() const noexcept;
 
     // Number of valid tokens in the final logical block.
     //
@@ -159,12 +166,12 @@ struct seq {
     // - 17 total tokens -> 1
     // - 31 total tokens -> 15
     // - 32 total tokens -> 16
-    [[nodiscard]] size_t tokens_in_last_block() const noexcept;
+    [[nodiscard]] std::size_t tokens_in_last_block() const noexcept;
 
     // Return the token slice covered by one logical block.
     [[nodiscard]]
     std::expected<std::span<const token_id>, seq_errc>
-    logical_block_tokens(size_t logical_block) const noexcept;
+    logical_block_tokens(std::size_t logical_block) const noexcept;
 
     // Logical block index -> physical KV-cache block ID.
     [[nodiscard]] std::span<const block_id> block_table() const noexcept;
@@ -176,7 +183,8 @@ struct seq {
     append_physical_block(block_id physical_block);
 
     // Called after the block manager has decremented all physical block reference
-    // counts. Preserve tokens but reset cached/scheduled counts and block IDs.
+    // counts. The sequence must not be running or have scheduled work. Preserve
+    // tokens but reset the cached count and physical block IDs.
     [[nodiscard]]
     std::expected<void, seq_errc> reset_cache_metadata();
 
@@ -194,7 +202,7 @@ private:
         seq_id id,
         std::vector<token_id> prompt_tokens,
         sampling_params params,
-        size_t kv_block_size);
+        std::size_t kv_block_size);
 
     // Use assertions here to detect bugs inside your own implementation.
     void assert_invariants() const noexcept;
@@ -208,13 +216,13 @@ private:
 
     // Immutable in meaning, even though it is not declared const. Keeping members
     // assignable makes the overall seq type easier to store in containers.
-    size_t prompt_token_count_;
+    std::size_t prompt_token_count_;
 
     // cached_token_count_ is always the length of a prefix of tokens_.
-    size_t cached_token_count_ { 0 };
-    size_t scheduled_token_count_ { 0 };
+    std::size_t cached_token_count_ { 0 };
+    std::size_t scheduled_token_count_ { 0 };
 
-    size_t block_size_;
+    std::size_t block_size_;
     std::vector<block_id> block_table_;
 
     sampling_params params_;
