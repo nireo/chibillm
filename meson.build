@@ -17,7 +17,10 @@ doctest_dep = dependency(
 
 chibillm_core = static_library(
   'chibillm_core',
-  'src/seq.cc',
+  [
+    'src/seq.cc',
+    'src/block_manager.cc',
+  ],
   include_directories: src_include,
   install: false,
 )
@@ -32,7 +35,10 @@ executable(
 
 chibillm_tests = executable(
   'chibillm_tests',
-  'tests/seq_test.cc',
+  [
+    'tests/seq_test.cc',
+    'tests/block_manager_test.cc',
+  ],
   include_directories: src_include,
   dependencies: doctest_dep,
   link_with: chibillm_core,
