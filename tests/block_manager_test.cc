@@ -35,9 +35,7 @@ TEST_CASE("block manager construction validates its geometry")
     REQUIRE_FALSE(zero_size.has_value());
     CHECK(zero_size.error() == block_manager_errc::invalid_block_size);
 
-    if constexpr (
-        std::numeric_limits<std::size_t>::max() >
-        std::numeric_limits<block_id>::max()) {
+    if constexpr (std::numeric_limits<std::size_t>::max() > std::numeric_limits<block_id>::max()) {
         const auto unrepresentable =
             static_cast<std::size_t>(std::numeric_limits<block_id>::max()) + 2;
         auto too_many = block_manager::make(unrepresentable, 16);
@@ -103,7 +101,7 @@ TEST_CASE("ensure capacity assigns every missing physical block")
     CHECK(manager.blocks()[0].ref_count == 1);
     CHECK(manager.blocks()[1].ref_count == 1);
 
-    // Calling again when every logical block is already mapped is a no-op.
+    // calling again when every logical block is already mapped is a no-op.
     REQUIRE(manager.ensure_capacity(sequence).has_value());
     CHECK(sequence.block_table().size() == 2);
     CHECK(manager.free_block_count() == 2);
@@ -142,13 +140,13 @@ TEST_CASE("decode growth allocates only when crossing a block boundary")
     REQUIRE(sequence.commit_scheduled_tokens().has_value());
     REQUIRE(sequence.mark_running().has_value());
 
-    // Token 4 fills the existing second logical block.
+    // token 4 fills the existing second logical block.
     REQUIRE(sequence.append_token(4).has_value());
     REQUIRE(manager.ensure_capacity(sequence).has_value());
     CHECK(sequence.block_table().size() == 2);
     CHECK(manager.free_block_count() == 1);
 
-    // Process token 4, then append token 5. Position 4 begins logical block 2.
+    // process token 4, then append token 5. position 4 begins logical block 2.
     REQUIRE(sequence.schedule_tokens(1).has_value());
     REQUIRE(sequence.commit_scheduled_tokens().has_value());
     REQUIRE(sequence.append_token(5).has_value());
@@ -174,7 +172,7 @@ TEST_CASE("release returns blocks and FIFO allocation reuses the oldest free ID"
     CHECK(manager.free_block_count() == 3);
     CHECK(manager.used_block_count() == 0);
 
-    // Block 2 was never used and remained at the front while 0 and 1 were
+    // block 2 was never used and remained at the front while 0 and 1 were
     // released to the back.
     auto second_result = seq::make(2, { 9 }, sampling_params {}, 2);
     REQUIRE(second_result.has_value());

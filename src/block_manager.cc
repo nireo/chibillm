@@ -6,28 +6,26 @@
 
 namespace chibillm {
 
-bool kv_block::is_free() const noexcept
+bool
+kv_block::is_free() const noexcept
 {
     return ref_count == 0;
 }
 
-std::expected<block_manager, block_manager_errc>
-block_manager::make(
-    std::size_t block_count,
-    std::size_t block_size)
+result<block_manager, block_manager_errc>
+block_manager::make(std::size_t block_count, std::size_t block_size)
 {
     if (block_count == 0) {
-        return std::unexpected(block_manager_errc::invalid_block_count);
+        return fail(block_manager_errc::invalid_block_count);
     }
 
     if (block_size == 0) {
-        return std::unexpected(block_manager_errc::invalid_block_size);
+        return fail(block_manager_errc::invalid_block_size);
     }
 
-    // IDs range from zero through block_count - 1. Validate the largest ID before
-    // narrowing each size_t index to block_id in the constructor.
+    // validate the largest id before narrowing indices to block_id.
     if (block_count - 1 > std::numeric_limits<block_id>::max()) {
-        return std::unexpected(block_manager_errc::too_many_blocks);
+        return fail(block_manager_errc::too_many_blocks);
     }
 
     return block_manager {
@@ -36,9 +34,7 @@ block_manager::make(
     };
 }
 
-block_manager::block_manager(
-    std::size_t block_count,
-    std::size_t block_size)
+block_manager::block_manager(std::size_t block_count, std::size_t block_size)
     : block_size_(block_size)
 {
     blocks_.reserve(block_count);
@@ -56,27 +52,32 @@ block_manager::block_manager(
     assert_invariants();
 }
 
-std::size_t block_manager::block_count() const noexcept
+std::size_t
+block_manager::block_count() const noexcept
 {
     return blocks_.size();
 }
 
-std::size_t block_manager::block_size() const noexcept
+std::size_t
+block_manager::block_size() const noexcept
 {
     return block_size_;
 }
 
-std::size_t block_manager::free_block_count() const noexcept
+std::size_t
+block_manager::free_block_count() const noexcept
 {
     return free_block_ids_.size();
 }
 
-std::size_t block_manager::used_block_count() const noexcept
+std::size_t
+block_manager::used_block_count() const noexcept
 {
     return blocks_.size() - free_block_ids_.size();
 }
 
-std::span<const kv_block> block_manager::blocks() const noexcept
+std::span<const kv_block>
+block_manager::blocks() const noexcept
 {
     return {
         blocks_.data(),
@@ -84,70 +85,63 @@ std::span<const kv_block> block_manager::blocks() const noexcept
     };
 }
 
-std::expected<std::size_t, block_manager_errc>
-block_manager::additional_blocks_required(
-    const seq& sequence) const noexcept
+result<std::size_t, block_manager_errc>
+block_manager::additional_blocks_required(const seq& sequence) const noexcept
 {
     if (sequence.block_size() != block_size_) {
-        return std::unexpected(block_manager_errc::incompatible_block_size);
+        return fail(block_manager_errc::incompatible_block_size);
     }
 
     const auto table = sequence.block_table();
     const auto log_count = sequence.logical_block_count();
 
     if (table.size() > log_count) {
-        return std::unexpected(block_manager_errc::inconsistent_block_table);
+        return fail(block_manager_errc::inconsistent_block_table);
     }
 
     for (const auto physical_id : table) {
         if (physical_id >= blocks_.size()) {
-            return std::unexpected(block_manager_errc::invalid_block_id);
+            return fail(block_manager_errc::invalid_block_id);
         }
 
         if (blocks_[physical_id].is_free()) {
-            return std::unexpected(block_manager_errc::block_not_in_use);
+            return fail(block_manager_errc::block_not_in_use);
         }
     }
 
     return log_count - table.size();
 }
 
-std::expected<bool, block_manager_errc>
-block_manager::can_ensure_capacity(
-    const seq& sequence) const noexcept
+result<bool, block_manager_errc>
+block_manager::can_ensure_capacity(const seq& sequence) const noexcept
 {
     const auto amount_needed = additional_blocks_required(sequence);
     if (!amount_needed) {
-        return std::unexpected(amount_needed.error());
+        return fail(amount_needed.error());
     }
 
     return *amount_needed <= free_block_ids_.size();
 }
 
-// -----------------------------------------------------------------------------
-// Allocation
-// -----------------------------------------------------------------------------
-
-std::expected<void, block_manager_errc>
+result<void, block_manager_errc>
 block_manager::ensure_capacity(seq& sequence)
 {
     if (sequence.status() == seq_status::finished) {
-        return std::unexpected(block_manager_errc::sequence_finished);
+        return fail(block_manager_errc::sequence_finished);
     }
 
     const auto amount_needed = additional_blocks_required(sequence);
     if (!amount_needed) {
-        return std::unexpected(amount_needed.error());
+        return fail(amount_needed.error());
     }
 
     const auto amount = *amount_needed;
     if (amount == 0) {
-        // we don't need to do anything here
-        return { };
+        return {};
     }
 
     if (amount > free_block_ids_.size()) {
-        return std::unexpected(block_manager_errc::insufficient_free_blocks);
+        return fail(block_manager_errc::insufficient_free_blocks);
     }
 
     for (std::size_t i = 0; i < amount; ++i) {
@@ -155,12 +149,11 @@ block_manager::ensure_capacity(seq& sequence)
         auto& fblock = blocks_[free_id];
         assert(fblock.is_free());
 
-        // Append before changing manager ownership. All domain preconditions were
-        // checked above, so failure indicates an internal contract mismatch.
+        // update the sequence before taking manager ownership.
         const auto ok = sequence.append_physical_block(fblock.id);
         if (!ok) {
             assert(false && "prevalidated physical-block append failed");
-            return std::unexpected(block_manager_errc::sequence_update_failed);
+            return fail(block_manager_errc::sequence_update_failed);
         }
 
         free_block_ids_.pop_front();
@@ -168,43 +161,38 @@ block_manager::ensure_capacity(seq& sequence)
     }
 
     assert_invariants();
-    return { };
+    return {};
 }
 
-// -----------------------------------------------------------------------------
-// Release
-// -----------------------------------------------------------------------------
-
-std::expected<void, block_manager_errc>
+result<void, block_manager_errc>
 block_manager::release(seq& sequence)
 {
     if (sequence.status() == seq_status::running) {
-        return std::unexpected(block_manager_errc::sequence_running);
+        return fail(block_manager_errc::sequence_running);
     }
 
     if (sequence.scheduled_token_count() != 0) {
-        return std::unexpected(block_manager_errc::sequence_has_scheduled_work);
+        return fail(block_manager_errc::sequence_has_scheduled_work);
     }
 
     if (sequence.block_size() != block_size_) {
-        return std::unexpected(block_manager_errc::incompatible_block_size);
+        return fail(block_manager_errc::incompatible_block_size);
     }
 
-    // Validate the complete table before modifying any refcount so ordinary
-    // errors cannot leave a partially released sequence.
+    // validate the full table before changing any refcount.
     std::vector<bool> seen(blocks_.size(), false);
     for (const auto id : sequence.block_table()) {
         if (id >= blocks_.size()) {
-            return std::unexpected(block_manager_errc::invalid_block_id);
+            return fail(block_manager_errc::invalid_block_id);
         }
 
         if (seen[id]) {
-            return std::unexpected(block_manager_errc::inconsistent_block_table);
+            return fail(block_manager_errc::inconsistent_block_table);
         }
         seen[id] = true;
 
         if (blocks_[id].is_free()) {
-            return std::unexpected(block_manager_errc::block_not_in_use);
+            return fail(block_manager_errc::block_not_in_use);
         }
     }
 
@@ -219,25 +207,20 @@ block_manager::release(seq& sequence)
     const auto ok = sequence.reset_cache_metadata();
     if (!ok) {
         assert(false && "prevalidated sequence cache reset failed");
-        return std::unexpected(block_manager_errc::sequence_update_failed);
+        return fail(block_manager_errc::sequence_update_failed);
     }
 
     assert_invariants();
-    return { };
+    return {};
 }
 
-// -----------------------------------------------------------------------------
-// Internal consistency
-// -----------------------------------------------------------------------------
-
-void block_manager::assert_invariants() const noexcept
+void
+block_manager::assert_invariants() const noexcept
 {
 #ifndef NDEBUG
     assert(block_size_ > 0);
 
-    // A zero refcount and free-list membership are two representations of the same
-    // state. Validate that they agree and that the free list contains no duplicate
-    // or out-of-range IDs.
+    // refcounts and free-list membership must describe the same state.
     std::vector<bool> seen_free(blocks_.size(), false);
     for (const auto id : free_block_ids_) {
         assert(id < blocks_.size());
