@@ -390,6 +390,7 @@ finish_reason seq::evaluate_stop(token_id eos_token) const noexcept
 
 void seq::assert_invariants() const noexcept
 {
+#ifndef NDEBUG
     assert(!tokens_.empty());
     assert(prompt_token_count_ > 0);
     assert(prompt_token_count_ <= tokens_.size());
@@ -406,6 +407,7 @@ void seq::assert_invariants() const noexcept
     } else {
         assert(finish_reason_ == finish_reason::none);
     }
+#endif
 }
 
 } // namespace chibillm
