@@ -21,6 +21,7 @@ chibillm_core = static_library(
     'src/seq.cc',
     'src/block_manager.cc',
     'src/scheduler.cc',
+    'src/model_batch.cc',
   ],
   include_directories: src_include,
   install: false,
@@ -56,3 +57,13 @@ chibillm_scheduler_tests = executable(
 )
 
 test('chibillm scheduler tests', chibillm_scheduler_tests)
+
+chibillm_model_batch_tests = executable(
+  'chibillm_model_batch_tests',
+  'tests/model_batch_test.cc',
+  include_directories: src_include,
+  dependencies: doctest_dep,
+  link_with: chibillm_core,
+)
+
+test('chibillm model batch tests', chibillm_model_batch_tests)
