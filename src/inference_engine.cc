@@ -20,16 +20,15 @@ inference_engine::make(scheduler_config config, model_runner& runner)
 inference_engine::inference_engine(scheduler scheduler, model_runner& runner) noexcept
     : scheduler_(std::move(scheduler))
     , runner_(&runner)
-{}
+{
+}
 
-bool
-inference_engine::is_finished() const noexcept
+bool inference_engine::is_finished() const noexcept
 {
     return scheduler_.is_finished();
 }
 
-bool
-inference_engine::has_in_flight_batch() const noexcept
+bool inference_engine::has_in_flight_batch() const noexcept
 {
     return scheduler_.has_in_flight_batch();
 }
@@ -48,7 +47,7 @@ inference_engine::add(seq sequence)
         return fail(inference_engine_errc::sequence_add_failed);
     }
 
-    return {};
+    return { };
 }
 
 result<void, inference_engine_errc>
@@ -78,7 +77,7 @@ inference_engine::step()
         return fail(inference_engine_errc::batch_completion_failed);
     }
 
-    return {};
+    return { };
 }
 
 result<void, inference_engine_errc>
