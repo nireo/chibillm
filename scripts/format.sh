@@ -7,16 +7,16 @@ mode=${1:-format}
 
 case "$mode" in
 format)
-    clang-format -i \
-        "$project_root"/src/*.h \
-        "$project_root"/src/*.cc \
-        "$project_root"/tests/*.cc
+    find "$project_root/src" "$project_root/tests" "$project_root/shaders" \
+        -type f \
+        \( -name '*.h' -o -name '*.cc' -o -name '*.cpp' -o -name '*.mm' -o -name '*.metal' \) \
+        -exec clang-format -i {} +
     ;;
 check)
-    clang-format --dry-run --Werror \
-        "$project_root"/src/*.h \
-        "$project_root"/src/*.cc \
-        "$project_root"/tests/*.cc
+    find "$project_root/src" "$project_root/tests" "$project_root/shaders" \
+        -type f \
+        \( -name '*.h' -o -name '*.cc' -o -name '*.cpp' -o -name '*.mm' -o -name '*.metal' \) \
+        -exec clang-format --dry-run --Werror {} +
     ;;
 *)
     echo "usage: $0 [format|check]" >&2

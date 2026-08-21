@@ -127,7 +127,6 @@ chibillm_metal_tests = executable(
 
 test('chibillm metal tests', chibillm_metal_tests)
 
-# this target specifies the unfinished tensor learning implementation.
 chibillm_tensor_tests = executable(
   'chibillm_tensor_tests',
   'tests/tensor_test.cc',
@@ -145,3 +144,5 @@ chibillm_tensor_tests = executable(
     chibillm_metal,
   ],
 )
+
+test('chibillm tensor tests', chibillm_tensor_tests)
