@@ -4,7 +4,8 @@
 #include "inference_engine.h"
 #include "model_runner.h"
 
-int main()
+int
+main()
 {
     using namespace chibillm;
 
@@ -24,12 +25,12 @@ int main()
     }
 
     auto sequence = seq::make(1, { 10, 20, 30 },
-        sampling_params {
-            .temperature = 1.0F,
-            .max_new_tokens = 5,
-            .ignore_eos = false,
-        },
-        2);
+                              sampling_params {
+                                  .temperature = 1.0F,
+                                  .max_new_tokens = 5,
+                                  .ignore_eos = false,
+                              },
+                              2);
     if (!sequence || !engine->add(std::move(*sequence))) {
         std::cerr << "failed to add the demo sequence\n";
         return 1;

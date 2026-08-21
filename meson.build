@@ -42,7 +42,9 @@ chibillm_core = static_library(
 
 chibillm_metal = static_library(
   'chibillm_metal',
-  'src/metal/metal_context.mm',
+  [
+    'src/metal/metal_context.mm',
+  ],
   include_directories: src_include,
   dependencies: metal_framework_dep,
   install: false,
@@ -124,3 +126,22 @@ chibillm_metal_tests = executable(
 )
 
 test('chibillm metal tests', chibillm_metal_tests)
+
+# this target specifies the unfinished tensor learning implementation.
+chibillm_tensor_tests = executable(
+  'chibillm_tensor_tests',
+  'tests/tensor_test.cc',
+  include_directories: src_include,
+  cpp_args: [
+    '-DCHIBILLM_VECTOR_ADD_SHADER_PATH="' + metal_shader_path + '"',
+  ],
+  dependencies: [
+    doctest_dep,
+    metal_framework_dep,
+  ],
+  link_args: ['-Wl,-no_warn_duplicate_libraries'],
+  link_with: [
+    chibillm_core,
+    chibillm_metal,
+  ],
+)
