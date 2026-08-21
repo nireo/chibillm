@@ -388,6 +388,54 @@ scheduler::complete(const scheduled_batch& batch, std::span<const token_id> samp
     return {};
 }
 
+result<void, scheduler_errc>
+scheduler::abort(const scheduled_batch& batch)
+{
+    if (!active_batch_.has_value()) {
+        return fail(scheduler_errc::no_batch_in_flight);
+    }
+
+    const auto& active = *active_batch_;
+    if (batch.id != active.id) {
+        return fail(scheduler_errc::batch_id_mismatch);
+    }
+
+    if (batch.phase != active.phase || batch.items.size() != active.items.size()) {
+        return fail(scheduler_errc::invalid_sequence_state);
+    }
+
+    for (std::size_t index = 0; index < active.items.size(); ++index) {
+        const auto& expected_item = active.items[index];
+        const auto& supplied_item = batch.items[index];
+        if (supplied_item.id != expected_item.id
+            || supplied_item.token_count != expected_item.token_count) {
+            return fail(scheduler_errc::invalid_sequence_state);
+        }
+
+        const auto* sequence = find_sequence(expected_item.id);
+        if (sequence == nullptr) {
+            return fail(scheduler_errc::unknown_sequence);
+        }
+
+        const auto expected_status =
+            active.phase == batch_phase::prefill ? seq_status::waiting : seq_status::running;
+        const auto& expected_queue = active.phase == batch_phase::prefill ? waiting_ : running_;
+
+        if (sequence->status() != expected_status
+            || sequence->scheduled_token_count() != expected_item.token_count
+            || std::find(expected_queue.begin(), expected_queue.end(), expected_item.id)
+                == expected_queue.end()) {
+            return fail(scheduler_errc::invalid_sequence_state);
+        }
+    }
+
+    rollback_reservations(active);
+    active_batch_.reset();
+    assert_invariants();
+
+    return {};
+}
+
 bool
 scheduler::remove_from_queue(std::deque<seq_id>& queue, seq_id id) noexcept
 {

@@ -5,8 +5,7 @@
 
 namespace chibillm {
 
-bool
-model_batch::empty() const noexcept
+bool model_batch::empty() const noexcept
 {
     return items.empty();
 }
@@ -55,8 +54,7 @@ build_model_batch(const scheduled_batch& scheduled, const scheduler& engine)
             return fail(model_batch_errc::unknown_sequence);
         }
 
-        const auto expected_status =
-            scheduled.phase == batch_phase::prefill ? seq_status::waiting : seq_status::running;
+        const auto expected_status = scheduled.phase == batch_phase::prefill ? seq_status::waiting : seq_status::running;
         if (sequence->status() != expected_status) {
             return fail(model_batch_errc::invalid_sequence_state);
         }
@@ -88,9 +86,9 @@ build_model_batch(const scheduled_batch& scheduled, const scheduler& engine)
         .id = scheduled.id,
         .phase = scheduled.phase,
         .kv_block_size = block_size,
-        .tokens = {},
-        .positions = {},
-        .items = {},
+        .tokens = { },
+        .positions = { },
+        .items = { },
     };
 
     const auto total_token_count = scheduled.token_count();

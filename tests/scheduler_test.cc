@@ -277,6 +277,64 @@ TEST_CASE("completion validation leaves an in-flight reservation untouched")
     CHECK(unchanged->cached_token_count() == 0);
 }
 
+TEST_CASE("abort cancels reservations and retains allocated cache blocks")
+{
+    auto scheduler_result = scheduler::make(test_config());
+    auto sequence = seq::make(1, { 10, 20, 30 }, sampling_params {}, 2);
+    REQUIRE(scheduler_result.has_value());
+    REQUIRE(sequence.has_value());
+    auto& engine = *scheduler_result;
+    REQUIRE(engine.add(std::move(*sequence)).has_value());
+
+    auto batch = engine.schedule();
+    REQUIRE(batch.has_value());
+    CHECK(engine.cache().used_block_count() == 2);
+
+    REQUIRE(engine.abort(*batch).has_value());
+    CHECK_FALSE(engine.has_in_flight_batch());
+    CHECK(engine.waiting_count() == 1);
+    CHECK(engine.running_count() == 0);
+    CHECK(engine.cache().used_block_count() == 2);
+
+    const auto* unchanged = engine.find_sequence(1);
+    REQUIRE(unchanged != nullptr);
+    CHECK(unchanged->cached_token_count() == 0);
+    CHECK(unchanged->scheduled_token_count() == 0);
+    CHECK(unchanged->block_table().size() == 2);
+
+    auto retried = engine.schedule();
+    REQUIRE(retried.has_value());
+    REQUIRE(retried->items.size() == 1);
+    CHECK(retried->items[0].id == batch->items[0].id);
+    CHECK(retried->items[0].token_count == batch->items[0].token_count);
+}
+
+TEST_CASE("abort validates the active batch before changing reservations")
+{
+    auto scheduler_result = scheduler::make(test_config());
+    auto sequence = seq::make(1, { 10 }, sampling_params {}, 2);
+    REQUIRE(scheduler_result.has_value());
+    REQUIRE(sequence.has_value());
+    auto& engine = *scheduler_result;
+    REQUIRE(engine.add(std::move(*sequence)).has_value());
+
+    auto batch = engine.schedule();
+    REQUIRE(batch.has_value());
+
+    auto wrong_batch = *batch;
+    ++wrong_batch.id;
+    auto rejected = engine.abort(wrong_batch);
+    REQUIRE_FALSE(rejected.has_value());
+    CHECK(rejected.error() == scheduler_errc::batch_id_mismatch);
+    CHECK(engine.has_in_flight_batch());
+
+    const auto* unchanged = engine.find_sequence(1);
+    REQUIRE(unchanged != nullptr);
+    CHECK(unchanged->scheduled_token_count() == 1);
+
+    REQUIRE(engine.abort(*batch).has_value());
+}
+
 TEST_CASE("waiting prefill work is chosen before existing decode work")
 {
     auto scheduler_result = scheduler::make(test_config());

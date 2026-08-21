@@ -22,6 +22,8 @@ chibillm_core = static_library(
     'src/block_manager.cc',
     'src/scheduler.cc',
     'src/model_batch.cc',
+    'src/model_runner.cc',
+    'src/inference_engine.cc',
   ],
   include_directories: src_include,
   install: false,
@@ -67,3 +69,13 @@ chibillm_model_batch_tests = executable(
 )
 
 test('chibillm model batch tests', chibillm_model_batch_tests)
+
+chibillm_inference_engine_tests = executable(
+  'chibillm_inference_engine_tests',
+  'tests/inference_engine_test.cc',
+  include_directories: src_include,
+  dependencies: doctest_dep,
+  link_with: chibillm_core,
+)
+
+test('chibillm inference engine tests', chibillm_inference_engine_tests)
