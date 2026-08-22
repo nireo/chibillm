@@ -14,6 +14,7 @@ enum class tensor_op_errc : std::uint8_t {
     inner_dimension_mismatch,
     output_shape_mismatch,
     token_out_of_range,
+    invalid_epsilon,
     backend_failure,
 };
 
@@ -34,5 +35,12 @@ enum class tensor_op_errc : std::uint8_t {
                                                             const metal_tensor& token_ids,
                                                             const metal_tensor& weight,
                                                             metal_tensor& output);
+
+// normalizes each f32 input row and scales it with a bf16 hidden-size weight.
+[[nodiscard]] result<void, tensor_op_errc> rms_norm(const metal_context& context,
+                                                    const metal_tensor& input,
+                                                    const metal_tensor& weight,
+                                                    float epsilon,
+                                                    metal_tensor& output);
 
 } // namespace chibillm

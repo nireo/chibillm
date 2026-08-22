@@ -4,6 +4,7 @@
 #include <Metal/Metal.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -45,6 +46,7 @@ struct metal_context::implementation {
     id<MTLComputePipelineState> matmul_f32_pipeline;
     id<MTLComputePipelineState> linear_bf16_pipeline;
     id<MTLComputePipelineState> embedding_bf16_pipeline;
+    id<MTLComputePipelineState> rms_norm_bf16_pipeline;
     std::string device_name;
 };
 
@@ -164,6 +166,21 @@ metal_context::make(std::string_view shader_source)
                                               "failed to create the embedding_bf16 pipeline")));
         }
 
+        id<MTLFunction> rms_norm_bf16 = [library newFunctionWithName:@"rms_norm_bf16"];
+        if (rms_norm_bf16 == nil) {
+            return fail(make_error(metal_errc::shader_function_not_found,
+                                   "the Metal shader library does not contain rms_norm_bf16"));
+        }
+
+        pipeline_error = nil;
+        id<MTLComputePipelineState> rms_norm_bf16_pipeline =
+            [device newComputePipelineStateWithFunction:rms_norm_bf16 error:&pipeline_error];
+        if (rms_norm_bf16_pipeline == nil) {
+            return fail(make_error(
+                metal_errc::pipeline_creation_failed,
+                message_from_error(pipeline_error, "failed to create the rms_norm_bf16 pipeline")));
+        }
+
         const char* device_name = device.name.UTF8String;
         auto implementation = std::make_unique<metal_context::implementation>();
         implementation->device = device;
@@ -172,6 +189,7 @@ metal_context::make(std::string_view shader_source)
         implementation->matmul_f32_pipeline = matmul_f32_pipeline;
         implementation->linear_bf16_pipeline = linear_bf16_pipeline;
         implementation->embedding_bf16_pipeline = embedding_bf16_pipeline;
+        implementation->rms_norm_bf16_pipeline = rms_norm_bf16_pipeline;
         implementation->device_name = device_name == nullptr ? "unknown Metal device" : device_name;
 
         return metal_context { std::move(implementation) };
@@ -391,6 +409,66 @@ metal_context::dispatch_embedding_bf16(const metal_buffer& token_ids,
 
         [encoder dispatchThreads:MTLSizeMake(hidden_size, token_count, 1)
             threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return fail(make_error(
+                metal_errc::execution_failed,
+                message_from_error(command_buffer.error, "Metal command execution failed")));
+        }
+
+        return {};
+    }
+}
+
+result<void, metal_error>
+metal_context::dispatch_rms_norm_bf16(const metal_buffer& input,
+                                      const metal_buffer& weight,
+                                      metal_buffer& output,
+                                      std::size_t rows,
+                                      std::size_t hidden_size,
+                                      float epsilon) const
+{
+    @autoreleasepool {
+        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
+        if (rows > max_shader_dimension || hidden_size > max_shader_dimension) {
+            return fail(make_error(metal_errc::invalid_input,
+                                   "rms norm dimensions exceed the shader uint range"));
+        }
+
+        const auto shader_rows = static_cast<std::uint32_t>(rows);
+        const auto shader_hidden_size = static_cast<std::uint32_t>(hidden_size);
+
+        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
+        if (command_buffer == nil) {
+            return fail(make_error(metal_errc::command_buffer_creation_failed,
+                                   "failed to create a Metal command buffer"));
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return fail(make_error(metal_errc::command_encoder_creation_failed,
+                                   "failed to create a Metal compute encoder"));
+        }
+
+        [encoder setComputePipelineState:implementation_->rms_norm_bf16_pipeline];
+        [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:weight.implementation_->buffer offset:0 atIndex:1];
+        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:2];
+        [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:3];
+        [encoder setBytes:&shader_hidden_size length:sizeof(shader_hidden_size) atIndex:4];
+        [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:5];
+
+        constexpr std::size_t preferred_thread_count = 256;
+        const auto max_threads = static_cast<std::size_t>(
+            implementation_->rms_norm_bf16_pipeline.maxTotalThreadsPerThreadgroup);
+        const auto thread_count = std::bit_floor(std::min(preferred_thread_count, max_threads));
+
+        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
         [encoder endEncoding];
 
         [command_buffer commit];

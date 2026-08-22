@@ -5,6 +5,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -24,6 +25,7 @@ using chibillm::linear;
 using chibillm::matmul;
 using chibillm::metal_context;
 using chibillm::metal_tensor;
+using chibillm::rms_norm;
 using chibillm::tensor_descriptor;
 using chibillm::tensor_op_errc;
 using chibillm::tensor_shape;
@@ -443,4 +445,169 @@ TEST_CASE("embedding lookup rejects token ids beyond the vocabulary")
     auto gathered = embedding_lookup(*context, token_ids, weight, output);
     REQUIRE_FALSE(gathered.has_value());
     CHECK(gathered.error() == tensor_op_errc::token_out_of_range);
+}
+
+TEST_CASE("rms norm normalizes and scales each row independently")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto input = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto weight = make_tensor(*context, dtype::bf16, { 3 });
+    auto output = make_tensor(*context, dtype::f32, { 2, 3 });
+    write_floats(input, { 1.0F, 2.0F, 2.0F, -1.0F, -2.0F, 2.0F });
+    write_bf16(weight, { 1.0F, 0.5F, 2.0F });
+
+    auto normalized = rms_norm(*context, input, weight, 1.0F, output);
+    REQUIRE(normalized.has_value());
+
+    const auto values = read_floats(output);
+    const std::vector<float> expected { 0.5F, 0.5F, 2.0F, -0.5F, -0.5F, 2.0F };
+    REQUIRE(values.size() == expected.size());
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        CHECK(values[index] == doctest::Approx(expected[index]));
+    }
+}
+
+TEST_CASE("rms norm requires rank-two activations and a rank-one weight")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    SUBCASE("input")
+    {
+        auto input = make_tensor(*context, dtype::f32, { 6 });
+        auto weight = make_tensor(*context, dtype::bf16, { 3 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 3 });
+
+        auto normalized = rms_norm(*context, input, weight, 1.0F, output);
+        REQUIRE_FALSE(normalized.has_value());
+        CHECK(normalized.error() == tensor_op_errc::invalid_rank);
+    }
+
+    SUBCASE("weight")
+    {
+        auto input = make_tensor(*context, dtype::f32, { 2, 3 });
+        auto weight = make_tensor(*context, dtype::bf16, { 1, 3 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 3 });
+
+        auto normalized = rms_norm(*context, input, weight, 1.0F, output);
+        REQUIRE_FALSE(normalized.has_value());
+        CHECK(normalized.error() == tensor_op_errc::invalid_rank);
+    }
+
+    SUBCASE("output")
+    {
+        auto input = make_tensor(*context, dtype::f32, { 2, 3 });
+        auto weight = make_tensor(*context, dtype::bf16, { 3 });
+        auto output = make_tensor(*context, dtype::f32, { 6 });
+
+        auto normalized = rms_norm(*context, input, weight, 1.0F, output);
+        REQUIRE_FALSE(normalized.has_value());
+        CHECK(normalized.error() == tensor_op_errc::invalid_rank);
+    }
+}
+
+TEST_CASE("rms norm requires f32 activations and a bf16 weight")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    SUBCASE("input")
+    {
+        auto input = make_tensor(*context, dtype::bf16, { 2, 3 });
+        auto weight = make_tensor(*context, dtype::bf16, { 3 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 3 });
+
+        auto normalized = rms_norm(*context, input, weight, 1.0F, output);
+        REQUIRE_FALSE(normalized.has_value());
+        CHECK(normalized.error() == tensor_op_errc::unsupported_dtype);
+    }
+
+    SUBCASE("weight")
+    {
+        auto input = make_tensor(*context, dtype::f32, { 2, 3 });
+        auto weight = make_tensor(*context, dtype::f32, { 3 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 3 });
+
+        auto normalized = rms_norm(*context, input, weight, 1.0F, output);
+        REQUIRE_FALSE(normalized.has_value());
+        CHECK(normalized.error() == tensor_op_errc::unsupported_dtype);
+    }
+
+    SUBCASE("output")
+    {
+        auto input = make_tensor(*context, dtype::f32, { 2, 3 });
+        auto weight = make_tensor(*context, dtype::bf16, { 3 });
+        auto output = make_tensor(*context, dtype::bf16, { 2, 3 });
+
+        auto normalized = rms_norm(*context, input, weight, 1.0F, output);
+        REQUIRE_FALSE(normalized.has_value());
+        CHECK(normalized.error() == tensor_op_errc::unsupported_dtype);
+    }
+}
+
+TEST_CASE("rms norm requires the weight to match the hidden size")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto input = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto weight = make_tensor(*context, dtype::bf16, { 4 });
+    auto output = make_tensor(*context, dtype::f32, { 2, 3 });
+
+    auto normalized = rms_norm(*context, input, weight, 1.0F, output);
+    REQUIRE_FALSE(normalized.has_value());
+    CHECK(normalized.error() == tensor_op_errc::inner_dimension_mismatch);
+}
+
+TEST_CASE("rms norm requires output to match the input shape")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    SUBCASE("row count")
+    {
+        auto input = make_tensor(*context, dtype::f32, { 2, 3 });
+        auto weight = make_tensor(*context, dtype::bf16, { 3 });
+        auto output = make_tensor(*context, dtype::f32, { 1, 3 });
+
+        auto normalized = rms_norm(*context, input, weight, 1.0F, output);
+        REQUIRE_FALSE(normalized.has_value());
+        CHECK(normalized.error() == tensor_op_errc::output_shape_mismatch);
+    }
+
+    SUBCASE("hidden size")
+    {
+        auto input = make_tensor(*context, dtype::f32, { 2, 3 });
+        auto weight = make_tensor(*context, dtype::bf16, { 3 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 4 });
+
+        auto normalized = rms_norm(*context, input, weight, 1.0F, output);
+        REQUIRE_FALSE(normalized.has_value());
+        CHECK(normalized.error() == tensor_op_errc::output_shape_mismatch);
+    }
+}
+
+TEST_CASE("rms norm requires a positive finite epsilon")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto input = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto weight = make_tensor(*context, dtype::bf16, { 3 });
+    auto output = make_tensor(*context, dtype::f32, { 2, 3 });
+
+    const std::vector<float> invalid_values {
+        0.0F,
+        -1.0F,
+        std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::quiet_NaN(),
+    };
+
+    for (const auto epsilon : invalid_values) {
+        auto normalized = rms_norm(*context, input, weight, epsilon, output);
+        REQUIRE_FALSE(normalized.has_value());
+        CHECK(normalized.error() == tensor_op_errc::invalid_epsilon);
+    }
 }

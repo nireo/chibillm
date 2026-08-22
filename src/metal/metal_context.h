@@ -46,6 +46,12 @@ private:
                                                          const metal_tensor& weight,
                                                          metal_tensor& output);
 
+    friend result<void, tensor_op_errc> rms_norm(const metal_context& context,
+                                                 const metal_tensor& input,
+                                                 const metal_tensor& weight,
+                                                 float epsilon,
+                                                 metal_tensor& output);
+
     struct implementation;
 
     explicit metal_context(std::unique_ptr<implementation> implementation) noexcept;
@@ -69,6 +75,13 @@ private:
                                                                     metal_buffer& output,
                                                                     std::size_t token_count,
                                                                     std::size_t hidden_size) const;
+
+    [[nodiscard]] result<void, metal_error> dispatch_rms_norm_bf16(const metal_buffer& input,
+                                                                   const metal_buffer& weight,
+                                                                   metal_buffer& output,
+                                                                   std::size_t rows,
+                                                                   std::size_t hidden_size,
+                                                                   float epsilon) const;
 
     std::unique_ptr<implementation> implementation_;
 };
