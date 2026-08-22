@@ -33,7 +33,7 @@ namespace {
 std::string
 load_shader_source()
 {
-    std::ifstream input(CHIBILLM_VECTOR_ADD_SHADER_PATH);
+    std::ifstream input(CHIBILLM_SHADER_PATH);
     return {
         std::istreambuf_iterator<char>(input),
         std::istreambuf_iterator<char>(),

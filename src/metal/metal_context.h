@@ -30,16 +30,21 @@ public:
     [[nodiscard]] result<metal_buffer, metal_error>
     make_shared_buffer(std::size_t size_bytes) const;
 
-    [[nodiscard]] result<void, metal_error> dispatch_vector_add(const metal_buffer& lhs,
-                                                                const metal_buffer& rhs,
-                                                                metal_buffer& output,
-                                                                std::size_t element_count) const;
-
 private:
     friend result<void, tensor_op_errc> matmul(const metal_context& context,
                                                const metal_tensor& lhs,
                                                const metal_tensor& rhs,
                                                metal_tensor& output);
+
+    friend result<void, tensor_op_errc> linear(const metal_context& context,
+                                               const metal_tensor& input,
+                                               const metal_tensor& weight,
+                                               metal_tensor& output);
+
+    friend result<void, tensor_op_errc> embedding_lookup(const metal_context& context,
+                                                         const metal_tensor& token_ids,
+                                                         const metal_tensor& weight,
+                                                         metal_tensor& output);
 
     struct implementation;
 
@@ -51,6 +56,19 @@ private:
                                                             std::size_t rows,
                                                             std::size_t inner_dimension,
                                                             std::size_t columns) const;
+
+    [[nodiscard]] result<void, metal_error> dispatch_linear_bf16(const metal_buffer& input,
+                                                                 const metal_buffer& weight,
+                                                                 metal_buffer& output,
+                                                                 std::size_t rows,
+                                                                 std::size_t input_features,
+                                                                 std::size_t output_features) const;
+
+    [[nodiscard]] result<void, metal_error> dispatch_embedding_bf16(const metal_buffer& token_ids,
+                                                                    const metal_buffer& weight,
+                                                                    metal_buffer& output,
+                                                                    std::size_t token_count,
+                                                                    std::size_t hidden_size) const;
 
     std::unique_ptr<implementation> implementation_;
 };

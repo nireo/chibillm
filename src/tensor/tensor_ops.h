@@ -13,6 +13,7 @@ enum class tensor_op_errc : std::uint8_t {
     unsupported_dtype,
     inner_dimension_mismatch,
     output_shape_mismatch,
+    token_out_of_range,
     backend_failure,
 };
 
@@ -21,5 +22,17 @@ enum class tensor_op_errc : std::uint8_t {
                                                   const metal_tensor& lhs,
                                                   const metal_tensor& rhs,
                                                   metal_tensor& output);
+
+// projects input [m, k] with bf16 weight [n, k] into f32 output [m, n].
+[[nodiscard]] result<void, tensor_op_errc> linear(const metal_context& context,
+                                                  const metal_tensor& input,
+                                                  const metal_tensor& weight,
+                                                  metal_tensor& output);
+
+// gathers i32 token ids [t] from bf16 weight [vocabulary, hidden] into f32 output [t, hidden].
+[[nodiscard]] result<void, tensor_op_errc> embedding_lookup(const metal_context& context,
+                                                            const metal_tensor& token_ids,
+                                                            const metal_tensor& weight,
+                                                            metal_tensor& output);
 
 } // namespace chibillm

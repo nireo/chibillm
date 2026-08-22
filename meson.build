@@ -105,7 +105,7 @@ test('chibillm inference engine tests', chibillm_inference_engine_tests)
 metal_shader_path = join_paths(
   meson.project_source_root(),
   'shaders',
-  'vector_add.metal',
+  'tensor_ops.metal',
 )
 
 chibillm_metal_tests = executable(
@@ -113,7 +113,7 @@ chibillm_metal_tests = executable(
   'tests/metal_test.cc',
   include_directories: src_include,
   cpp_args: [
-    '-DCHIBILLM_VECTOR_ADD_SHADER_PATH="' + metal_shader_path + '"',
+    '-DCHIBILLM_SHADER_PATH="' + metal_shader_path + '"',
   ],
   dependencies: [
     doctest_dep,
@@ -133,7 +133,7 @@ chibillm_tensor_tests = executable(
   'tests/tensor_test.cc',
   include_directories: src_include,
   cpp_args: [
-    '-DCHIBILLM_VECTOR_ADD_SHADER_PATH="' + metal_shader_path + '"',
+    '-DCHIBILLM_SHADER_PATH="' + metal_shader_path + '"',
   ],
   dependencies: [
     doctest_dep,
@@ -153,7 +153,7 @@ chibillm_tensor_ops_tests = executable(
   'tests/tensor_ops_test.cc',
   include_directories: src_include,
   cpp_args: [
-    '-DCHIBILLM_VECTOR_ADD_SHADER_PATH="' + metal_shader_path + '"',
+    '-DCHIBILLM_SHADER_PATH="' + metal_shader_path + '"',
   ],
   dependencies: [
     doctest_dep,

@@ -73,11 +73,15 @@ embedding_bf16(device const int* token_ids [[buffer(0)]],
         return;
     }
 
-    // todo(embedding-2): copy one embedding element into the output.
-    // position.y selects the token and position.x selects its hidden feature.
-    // the host has already checked that every token id names a valid weight row.
-    // rebuild the bf16 value by shifting its bits into an f32 and use as_type.
-    (void)token_ids;
-    (void)weight;
-    output[ulong(position.y) * ulong(hidden_size) + ulong(position.x)] = 0.0F;
+    const ulong token_position = position.y;
+    const ulong hidden_feature = position.x;
+    const ulong hidden_count = hidden_size;
+    const ulong token = ulong(token_ids[token_position]);
+
+    const ulong weight_index = token * hidden_count + hidden_feature;
+    const uint float_bits = uint(weight[weight_index]) << 16;
+    const float value = as_type<float>(float_bits);
+
+    const ulong output_index = token_position * hidden_count + hidden_feature;
+    output[output_index] = value;
 }
