@@ -4,12 +4,12 @@ using namespace metal;
 
 kernel void
 matmul_f32(device const float* lhs [[buffer(0)]],
-    device const float* rhs [[buffer(1)]],
-    device float* output [[buffer(2)]],
-    constant uint& rows [[buffer(3)]],
-    constant uint& inner_dimension [[buffer(4)]],
-    constant uint& columns [[buffer(5)]],
-    uint2 position [[thread_position_in_grid]])
+           device const float* rhs [[buffer(1)]],
+           device float* output [[buffer(2)]],
+           constant uint& rows [[buffer(3)]],
+           constant uint& inner_dimension [[buffer(4)]],
+           constant uint& columns [[buffer(5)]],
+           uint2 position [[thread_position_in_grid]])
 {
     if (position.x >= columns || position.y >= rows) {
         return;
@@ -32,12 +32,12 @@ matmul_f32(device const float* lhs [[buffer(0)]],
 
 kernel void
 linear_bf16(device const float* input [[buffer(0)]],
-    device const ushort* weight [[buffer(1)]],
-    device float* output [[buffer(2)]],
-    constant uint& rows [[buffer(3)]],
-    constant uint& input_features [[buffer(4)]],
-    constant uint& output_features [[buffer(5)]],
-    uint2 position [[thread_position_in_grid]])
+            device const ushort* weight [[buffer(1)]],
+            device float* output [[buffer(2)]],
+            constant uint& rows [[buffer(3)]],
+            constant uint& input_features [[buffer(4)]],
+            constant uint& output_features [[buffer(5)]],
+            uint2 position [[thread_position_in_grid]])
 {
     if (position.x >= output_features || position.y >= rows) {
         return;
@@ -63,11 +63,11 @@ linear_bf16(device const float* input [[buffer(0)]],
 
 kernel void
 embedding_bf16(device const int* token_ids [[buffer(0)]],
-    device const ushort* weight [[buffer(1)]],
-    device float* output [[buffer(2)]],
-    constant uint& token_count [[buffer(3)]],
-    constant uint& hidden_size [[buffer(4)]],
-    uint2 position [[thread_position_in_grid]])
+               device const ushort* weight [[buffer(1)]],
+               device float* output [[buffer(2)]],
+               constant uint& token_count [[buffer(3)]],
+               constant uint& hidden_size [[buffer(4)]],
+               uint2 position [[thread_position_in_grid]])
 {
     if (position.x >= hidden_size || position.y >= token_count) {
         return;
@@ -88,14 +88,14 @@ embedding_bf16(device const int* token_ids [[buffer(0)]],
 
 kernel void
 rms_norm_bf16(device const float* input [[buffer(0)]],
-    device const ushort* weight [[buffer(1)]],
-    device float* output [[buffer(2)]],
-    constant uint& row_count [[buffer(3)]],
-    constant uint& hidden_size [[buffer(4)]],
-    constant float& epsilon [[buffer(5)]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint3 threadgroup_position [[threadgroup_position_in_grid]],
-    uint3 threads_per_threadgroup [[threads_per_threadgroup]])
+              device const ushort* weight [[buffer(1)]],
+              device float* output [[buffer(2)]],
+              constant uint& row_count [[buffer(3)]],
+              constant uint& hidden_size [[buffer(4)]],
+              constant float& epsilon [[buffer(5)]],
+              uint thread_index [[thread_index_in_threadgroup]],
+              uint3 threadgroup_position [[threadgroup_position_in_grid]],
+              uint3 threads_per_threadgroup [[threads_per_threadgroup]])
 {
     const uint row = threadgroup_position.x;
     if (row >= row_count) {
@@ -135,4 +135,21 @@ rms_norm_bf16(device const float* input [[buffer(0)]],
         const float weight_value = as_type<float>(weight_bits);
         output[index] = input[index] * inverse_rms * weight_value;
     }
+}
+
+kernel void
+silu_mul_f32(device const float* gate [[buffer(0)]],
+             device const float* up [[buffer(1)]],
+             device float* output [[buffer(2)]],
+             constant uint& element_count [[buffer(3)]],
+             uint position [[thread_position_in_grid]])
+{
+    if (position >= element_count) {
+        return;
+    }
+
+    const float x = gate[position];
+    const float silu = x / (1.0F + exp(-x));
+
+    output[position] = silu * up[position];
 }

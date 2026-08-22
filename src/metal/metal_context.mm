@@ -47,6 +47,7 @@ struct metal_context::implementation {
     id<MTLComputePipelineState> linear_bf16_pipeline;
     id<MTLComputePipelineState> embedding_bf16_pipeline;
     id<MTLComputePipelineState> rms_norm_bf16_pipeline;
+    id<MTLComputePipelineState> silu_mul_f32_pipeline;
     std::string device_name;
 };
 
@@ -181,6 +182,21 @@ metal_context::make(std::string_view shader_source)
                 message_from_error(pipeline_error, "failed to create the rms_norm_bf16 pipeline")));
         }
 
+        id<MTLFunction> silu_mul_f32 = [library newFunctionWithName:@"silu_mul_f32"];
+        if (silu_mul_f32 == nil) {
+            return fail(make_error(metal_errc::shader_function_not_found,
+                                   "the Metal shader library does not contain silu_mul_f32"));
+        }
+
+        pipeline_error = nil;
+        id<MTLComputePipelineState> silu_mul_f32_pipeline =
+            [device newComputePipelineStateWithFunction:silu_mul_f32 error:&pipeline_error];
+        if (silu_mul_f32_pipeline == nil) {
+            return fail(make_error(
+                metal_errc::pipeline_creation_failed,
+                message_from_error(pipeline_error, "failed to create the silu_mul_f32 pipeline")));
+        }
+
         const char* device_name = device.name.UTF8String;
         auto implementation = std::make_unique<metal_context::implementation>();
         implementation->device = device;
@@ -190,6 +206,7 @@ metal_context::make(std::string_view shader_source)
         implementation->linear_bf16_pipeline = linear_bf16_pipeline;
         implementation->embedding_bf16_pipeline = embedding_bf16_pipeline;
         implementation->rms_norm_bf16_pipeline = rms_norm_bf16_pipeline;
+        implementation->silu_mul_f32_pipeline = silu_mul_f32_pipeline;
         implementation->device_name = device_name == nullptr ? "unknown Metal device" : device_name;
 
         return metal_context { std::move(implementation) };
@@ -469,6 +486,61 @@ metal_context::dispatch_rms_norm_bf16(const metal_buffer& input,
 
         [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return fail(make_error(
+                metal_errc::execution_failed,
+                message_from_error(command_buffer.error, "Metal command execution failed")));
+        }
+
+        return {};
+    }
+}
+
+result<void, metal_error>
+metal_context::dispatch_silu_mul_f32(const metal_buffer& gate,
+                                     const metal_buffer& up,
+                                     metal_buffer& output,
+                                     std::size_t element_count) const
+{
+    @autoreleasepool {
+        if (element_count > std::numeric_limits<std::uint32_t>::max()) {
+            return fail(make_error(metal_errc::invalid_input,
+                                   "silu multiply element count exceeds the shader uint range"));
+        }
+
+        const auto shader_element_count = static_cast<std::uint32_t>(element_count);
+
+        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
+        if (command_buffer == nil) {
+            return fail(make_error(metal_errc::command_buffer_creation_failed,
+                                   "failed to create a Metal command buffer"));
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return fail(make_error(metal_errc::command_encoder_creation_failed,
+                                   "failed to create a Metal compute encoder"));
+        }
+
+        [encoder setComputePipelineState:implementation_->silu_mul_f32_pipeline];
+        [encoder setBuffer:gate.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:up.implementation_->buffer offset:0 atIndex:1];
+        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:2];
+        [encoder setBytes:&shader_element_count length:sizeof(shader_element_count) atIndex:3];
+
+        constexpr std::size_t preferred_threadgroup_size = 256;
+        const auto threadgroup_size =
+            std::min(preferred_threadgroup_size,
+                     static_cast<std::size_t>(
+                         implementation_->silu_mul_f32_pipeline.maxTotalThreadsPerThreadgroup));
+
+        [encoder dispatchThreads:MTLSizeMake(element_count, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
         [encoder endEncoding];
 
         [command_buffer commit];

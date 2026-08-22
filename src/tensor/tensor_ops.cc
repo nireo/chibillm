@@ -182,4 +182,46 @@ rms_norm(const metal_context& context,
     return {};
 }
 
+result<void, tensor_op_errc>
+silu_mul(const metal_context& context,
+         const metal_tensor& gate,
+         const metal_tensor& up,
+         metal_tensor& output)
+{
+    const auto& gate_descriptor = gate.descriptor();
+    const auto& up_descriptor = up.descriptor();
+    const auto& output_descriptor = output.descriptor();
+    const auto& gate_shape = gate_descriptor.shape();
+    const auto& up_shape = up_descriptor.shape();
+    const auto& output_shape = output_descriptor.shape();
+
+    if (gate_shape.rank() != 2 || up_shape.rank() != 2 || output_shape.rank() != 2) {
+        return fail(tensor_op_errc::invalid_rank);
+    }
+
+    if (gate_descriptor.type() != dtype::f32
+        || up_descriptor.type() != dtype::f32
+        || output_descriptor.type() != dtype::f32) {
+        return fail(tensor_op_errc::unsupported_dtype);
+    }
+
+    if (gate_shape.dimensions()[0] != up_shape.dimensions()[0]
+        || gate_shape.dimensions()[1] != up_shape.dimensions()[1]) {
+        return fail(tensor_op_errc::input_shape_mismatch);
+    }
+
+    if (output_shape.dimensions()[0] != gate_shape.dimensions()[0]
+        || output_shape.dimensions()[1] != gate_shape.dimensions()[1]) {
+        return fail(tensor_op_errc::output_shape_mismatch);
+    }
+
+    const auto dispatched = context.dispatch_silu_mul_f32(
+        gate.buffer(), up.buffer(), output.buffer(), gate_shape.element_count());
+    if (!dispatched) {
+        return fail(tensor_op_errc::backend_failure);
+    }
+
+    return {};
+}
+
 } // namespace chibillm

@@ -52,6 +52,11 @@ private:
                                                  float epsilon,
                                                  metal_tensor& output);
 
+    friend result<void, tensor_op_errc> silu_mul(const metal_context& context,
+                                                 const metal_tensor& gate,
+                                                 const metal_tensor& up,
+                                                 metal_tensor& output);
+
     struct implementation;
 
     explicit metal_context(std::unique_ptr<implementation> implementation) noexcept;
@@ -82,6 +87,11 @@ private:
                                                                    std::size_t rows,
                                                                    std::size_t hidden_size,
                                                                    float epsilon) const;
+
+    [[nodiscard]] result<void, metal_error> dispatch_silu_mul_f32(const metal_buffer& gate,
+                                                                  const metal_buffer& up,
+                                                                  metal_buffer& output,
+                                                                  std::size_t element_count) const;
 
     std::unique_ptr<implementation> implementation_;
 };

@@ -26,6 +26,7 @@ using chibillm::matmul;
 using chibillm::metal_context;
 using chibillm::metal_tensor;
 using chibillm::rms_norm;
+using chibillm::silu_mul;
 using chibillm::tensor_descriptor;
 using chibillm::tensor_op_errc;
 using chibillm::tensor_shape;
@@ -610,4 +611,132 @@ TEST_CASE("rms norm requires a positive finite epsilon")
         REQUIRE_FALSE(normalized.has_value());
         CHECK(normalized.error() == tensor_op_errc::invalid_epsilon);
     }
+}
+
+TEST_CASE("silu multiply gates the up projection elementwise")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto gate = make_tensor(*context, dtype::f32, { 2, 2 });
+    auto up = make_tensor(*context, dtype::f32, { 2, 2 });
+    auto output = make_tensor(*context, dtype::f32, { 2, 2 });
+    write_floats(gate, { 0.0F, 1.0F, -1.0F, 2.0F });
+    write_floats(up, { 2.0F, 3.0F, 4.0F, -0.5F });
+
+    auto activated = silu_mul(*context, gate, up, output);
+    REQUIRE(activated.has_value());
+
+    const auto values = read_floats(output);
+    const std::vector<float> expected { 0.0F, 2.1931758F, -1.0757657F, -0.8807971F };
+    REQUIRE(values.size() == expected.size());
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        CHECK(values[index] == doctest::Approx(expected[index]));
+    }
+}
+
+TEST_CASE("silu multiply requires rank-two tensors")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    SUBCASE("gate")
+    {
+        auto gate = make_tensor(*context, dtype::f32, { 4 });
+        auto up = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 2 });
+
+        auto activated = silu_mul(*context, gate, up, output);
+        REQUIRE_FALSE(activated.has_value());
+        CHECK(activated.error() == tensor_op_errc::invalid_rank);
+    }
+
+    SUBCASE("up")
+    {
+        auto gate = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto up = make_tensor(*context, dtype::f32, { 4 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 2 });
+
+        auto activated = silu_mul(*context, gate, up, output);
+        REQUIRE_FALSE(activated.has_value());
+        CHECK(activated.error() == tensor_op_errc::invalid_rank);
+    }
+
+    SUBCASE("output")
+    {
+        auto gate = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto up = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto output = make_tensor(*context, dtype::f32, { 4 });
+
+        auto activated = silu_mul(*context, gate, up, output);
+        REQUIRE_FALSE(activated.has_value());
+        CHECK(activated.error() == tensor_op_errc::invalid_rank);
+    }
+}
+
+TEST_CASE("silu multiply requires f32 tensors")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    SUBCASE("gate")
+    {
+        auto gate = make_tensor(*context, dtype::bf16, { 2, 2 });
+        auto up = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 2 });
+
+        auto activated = silu_mul(*context, gate, up, output);
+        REQUIRE_FALSE(activated.has_value());
+        CHECK(activated.error() == tensor_op_errc::unsupported_dtype);
+    }
+
+    SUBCASE("up")
+    {
+        auto gate = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto up = make_tensor(*context, dtype::bf16, { 2, 2 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 2 });
+
+        auto activated = silu_mul(*context, gate, up, output);
+        REQUIRE_FALSE(activated.has_value());
+        CHECK(activated.error() == tensor_op_errc::unsupported_dtype);
+    }
+
+    SUBCASE("output")
+    {
+        auto gate = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto up = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto output = make_tensor(*context, dtype::bf16, { 2, 2 });
+
+        auto activated = silu_mul(*context, gate, up, output);
+        REQUIRE_FALSE(activated.has_value());
+        CHECK(activated.error() == tensor_op_errc::unsupported_dtype);
+    }
+}
+
+TEST_CASE("silu multiply requires matching input shapes")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto gate = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto up = make_tensor(*context, dtype::f32, { 3, 2 });
+    auto output = make_tensor(*context, dtype::f32, { 2, 3 });
+
+    auto activated = silu_mul(*context, gate, up, output);
+    REQUIRE_FALSE(activated.has_value());
+    CHECK(activated.error() == tensor_op_errc::input_shape_mismatch);
+}
+
+TEST_CASE("silu multiply requires output to match the inputs")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto gate = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto up = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto output = make_tensor(*context, dtype::f32, { 3, 2 });
+
+    auto activated = silu_mul(*context, gate, up, output);
+    REQUIRE_FALSE(activated.has_value());
+    CHECK(activated.error() == tensor_op_errc::output_shape_mismatch);
 }

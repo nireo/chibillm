@@ -11,6 +11,7 @@ namespace chibillm {
 enum class tensor_op_errc : std::uint8_t {
     invalid_rank,
     unsupported_dtype,
+    input_shape_mismatch,
     inner_dimension_mismatch,
     output_shape_mismatch,
     token_out_of_range,
@@ -41,6 +42,12 @@ enum class tensor_op_errc : std::uint8_t {
                                                     const metal_tensor& input,
                                                     const metal_tensor& weight,
                                                     float epsilon,
+                                                    metal_tensor& output);
+
+// applies silu to gate and multiplies it elementwise by up.
+[[nodiscard]] result<void, tensor_op_errc> silu_mul(const metal_context& context,
+                                                    const metal_tensor& gate,
+                                                    const metal_tensor& up,
                                                     metal_tensor& output);
 
 } // namespace chibillm
