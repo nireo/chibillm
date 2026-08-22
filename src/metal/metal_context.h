@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string_view>
 
@@ -9,6 +10,9 @@
 #include "result.h"
 
 namespace chibillm {
+
+class metal_tensor;
+enum class tensor_op_errc : std::uint8_t;
 
 // owns the metal device, queue, shader library, and compute pipelines.
 class metal_context {
@@ -32,9 +36,21 @@ public:
                                                                 std::size_t element_count) const;
 
 private:
+    friend result<void, tensor_op_errc> matmul(const metal_context& context,
+                                               const metal_tensor& lhs,
+                                               const metal_tensor& rhs,
+                                               metal_tensor& output);
+
     struct implementation;
 
     explicit metal_context(std::unique_ptr<implementation> implementation) noexcept;
+
+    [[nodiscard]] result<void, metal_error> dispatch_matmul(const metal_buffer& lhs,
+                                                            const metal_buffer& rhs,
+                                                            metal_buffer& output,
+                                                            std::size_t rows,
+                                                            std::size_t inner_dimension,
+                                                            std::size_t columns) const;
 
     std::unique_ptr<implementation> implementation_;
 };

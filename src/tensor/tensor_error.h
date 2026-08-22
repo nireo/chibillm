@@ -5,9 +5,6 @@
 namespace chibillm {
 
 enum class tensor_errc : std::uint8_t {
-    // remove after the tensor learning implementation is complete.
-    not_implemented,
-
     unsupported_dtype,
     empty_shape,
     zero_dimension,
