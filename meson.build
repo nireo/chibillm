@@ -44,6 +44,7 @@ chibillm_metal = static_library(
   'chibillm_metal',
   [
     'src/metal/metal_context.mm',
+    'src/metal/metal_kv_cache.cc',
     'src/tensor/tensor_ops.cc',
   ],
   include_directories: src_include,
@@ -127,6 +128,26 @@ chibillm_metal_tests = executable(
 )
 
 test('chibillm metal tests', chibillm_metal_tests)
+
+chibillm_kv_cache_tests = executable(
+  'chibillm_kv_cache_tests',
+  'tests/metal_kv_cache_test.cc',
+  include_directories: src_include,
+  cpp_args: [
+    '-DCHIBILLM_SHADER_PATH="' + metal_shader_path + '"',
+  ],
+  dependencies: [
+    doctest_dep,
+    metal_framework_dep,
+  ],
+  link_args: ['-Wl,-no_warn_duplicate_libraries'],
+  link_with: [
+    chibillm_core,
+    chibillm_metal,
+  ],
+)
+
+test('chibillm kv cache tests', chibillm_kv_cache_tests)
 
 chibillm_tensor_tests = executable(
   'chibillm_tensor_tests',
