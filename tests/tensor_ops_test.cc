@@ -1,6 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -18,6 +19,7 @@
 #include "tensor/tensor_ops.h"
 #include "tensor/tensor_shape.h"
 
+using chibillm::add;
 using chibillm::bf16;
 using chibillm::dtype;
 using chibillm::embedding_lookup;
@@ -26,6 +28,7 @@ using chibillm::matmul;
 using chibillm::metal_context;
 using chibillm::metal_tensor;
 using chibillm::rms_norm;
+using chibillm::rope;
 using chibillm::silu_mul;
 using chibillm::tensor_descriptor;
 using chibillm::tensor_op_errc;
@@ -85,6 +88,14 @@ write_i32(metal_tensor& tensor, const std::vector<std::int32_t>& values)
 {
     REQUIRE(tensor.descriptor().type() == dtype::i32);
     REQUIRE(tensor.buffer().size_bytes() == values.size() * sizeof(std::int32_t));
+    std::memcpy(tensor.buffer().bytes().data(), values.data(), tensor.buffer().size_bytes());
+}
+
+void
+write_u32(metal_tensor& tensor, const std::vector<std::uint32_t>& values)
+{
+    REQUIRE(tensor.descriptor().type() == dtype::u32);
+    REQUIRE(tensor.buffer().size_bytes() == values.size() * sizeof(std::uint32_t));
     std::memcpy(tensor.buffer().bytes().data(), values.data(), tensor.buffer().size_bytes());
 }
 
@@ -739,4 +750,345 @@ TEST_CASE("silu multiply requires output to match the inputs")
     auto activated = silu_mul(*context, gate, up, output);
     REQUIRE_FALSE(activated.has_value());
     CHECK(activated.error() == tensor_op_errc::output_shape_mismatch);
+}
+
+TEST_CASE("add sums corresponding tensor elements")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto lhs = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto rhs = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto output = make_tensor(*context, dtype::f32, { 2, 3 });
+    write_floats(lhs, { 1.0F, -2.0F, 0.5F, 4.0F, -1.25F, 10.0F });
+    write_floats(rhs, { 2.0F, 3.0F, -0.5F, -4.0F, 1.0F, -2.0F });
+
+    auto added = add(*context, lhs, rhs, output);
+    REQUIRE(added.has_value());
+
+    const auto values = read_floats(output);
+    const std::vector<float> expected { 3.0F, 1.0F, 0.0F, 0.0F, -0.25F, 8.0F };
+    REQUIRE(values.size() == expected.size());
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        CHECK(values[index] == doctest::Approx(expected[index]));
+    }
+}
+
+TEST_CASE("add requires rank-two tensors")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    SUBCASE("lhs")
+    {
+        auto lhs = make_tensor(*context, dtype::f32, { 4 });
+        auto rhs = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 2 });
+
+        auto added = add(*context, lhs, rhs, output);
+        REQUIRE_FALSE(added.has_value());
+        CHECK(added.error() == tensor_op_errc::invalid_rank);
+    }
+
+    SUBCASE("rhs")
+    {
+        auto lhs = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto rhs = make_tensor(*context, dtype::f32, { 4 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 2 });
+
+        auto added = add(*context, lhs, rhs, output);
+        REQUIRE_FALSE(added.has_value());
+        CHECK(added.error() == tensor_op_errc::invalid_rank);
+    }
+
+    SUBCASE("output")
+    {
+        auto lhs = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto rhs = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto output = make_tensor(*context, dtype::f32, { 4 });
+
+        auto added = add(*context, lhs, rhs, output);
+        REQUIRE_FALSE(added.has_value());
+        CHECK(added.error() == tensor_op_errc::invalid_rank);
+    }
+}
+
+TEST_CASE("add requires f32 tensors")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    SUBCASE("lhs")
+    {
+        auto lhs = make_tensor(*context, dtype::bf16, { 2, 2 });
+        auto rhs = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 2 });
+
+        auto added = add(*context, lhs, rhs, output);
+        REQUIRE_FALSE(added.has_value());
+        CHECK(added.error() == tensor_op_errc::unsupported_dtype);
+    }
+
+    SUBCASE("rhs")
+    {
+        auto lhs = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto rhs = make_tensor(*context, dtype::bf16, { 2, 2 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 2 });
+
+        auto added = add(*context, lhs, rhs, output);
+        REQUIRE_FALSE(added.has_value());
+        CHECK(added.error() == tensor_op_errc::unsupported_dtype);
+    }
+
+    SUBCASE("output")
+    {
+        auto lhs = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto rhs = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto output = make_tensor(*context, dtype::bf16, { 2, 2 });
+
+        auto added = add(*context, lhs, rhs, output);
+        REQUIRE_FALSE(added.has_value());
+        CHECK(added.error() == tensor_op_errc::unsupported_dtype);
+    }
+}
+
+TEST_CASE("add requires matching input shapes")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto lhs = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto rhs = make_tensor(*context, dtype::f32, { 3, 2 });
+    auto output = make_tensor(*context, dtype::f32, { 2, 3 });
+
+    auto added = add(*context, lhs, rhs, output);
+    REQUIRE_FALSE(added.has_value());
+    CHECK(added.error() == tensor_op_errc::input_shape_mismatch);
+}
+
+TEST_CASE("add requires output to match the inputs")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto lhs = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto rhs = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto output = make_tensor(*context, dtype::f32, { 3, 2 });
+
+    auto added = add(*context, lhs, rhs, output);
+    REQUIRE_FALSE(added.has_value());
+    CHECK(added.error() == tensor_op_errc::output_shape_mismatch);
+}
+
+TEST_CASE("rope rotates split-half feature pairs for every head")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto input = make_tensor(*context, dtype::f32, { 2, 8 });
+    auto positions = make_tensor(*context, dtype::u32, { 2 });
+    auto output = make_tensor(*context, dtype::f32, { 2, 8 });
+    write_floats(input,
+                 { 1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F, 1.0F, 2.0F, 3.0F, 4.0F, 5.0F,
+                   6.0F, 7.0F, 8.0F });
+    write_u32(positions, { 0, 1 });
+
+    auto rotated = rope(*context, input, positions, 2, 10'000.0F, output);
+    REQUIRE(rotated.has_value());
+
+    const auto full_cosine = std::cos(1.0F);
+    const auto full_sine = std::sin(1.0F);
+    const auto slow_cosine = std::cos(0.01F);
+    const auto slow_sine = std::sin(0.01F);
+    const std::vector<float> expected {
+        1.0F,
+        2.0F,
+        3.0F,
+        4.0F,
+        5.0F,
+        6.0F,
+        7.0F,
+        8.0F,
+        1.0F * full_cosine - 3.0F * full_sine,
+        2.0F * slow_cosine - 4.0F * slow_sine,
+        3.0F * full_cosine + 1.0F * full_sine,
+        4.0F * slow_cosine + 2.0F * slow_sine,
+        5.0F * full_cosine - 7.0F * full_sine,
+        6.0F * slow_cosine - 8.0F * slow_sine,
+        7.0F * full_cosine + 5.0F * full_sine,
+        8.0F * slow_cosine + 6.0F * slow_sine,
+    };
+
+    const auto values = read_floats(output);
+    REQUIRE(values.size() == expected.size());
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        CHECK(values[index] == doctest::Approx(expected[index]).epsilon(1e-5));
+    }
+}
+
+TEST_CASE("rope requires rank-two activations and rank-one positions")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    SUBCASE("input")
+    {
+        auto input = make_tensor(*context, dtype::f32, { 8 });
+        auto positions = make_tensor(*context, dtype::u32, { 2 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 4 });
+
+        auto rotated = rope(*context, input, positions, 1, 10'000.0F, output);
+        REQUIRE_FALSE(rotated.has_value());
+        CHECK(rotated.error() == tensor_op_errc::invalid_rank);
+    }
+
+    SUBCASE("positions")
+    {
+        auto input = make_tensor(*context, dtype::f32, { 2, 4 });
+        auto positions = make_tensor(*context, dtype::u32, { 1, 2 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 4 });
+
+        auto rotated = rope(*context, input, positions, 1, 10'000.0F, output);
+        REQUIRE_FALSE(rotated.has_value());
+        CHECK(rotated.error() == tensor_op_errc::invalid_rank);
+    }
+
+    SUBCASE("output")
+    {
+        auto input = make_tensor(*context, dtype::f32, { 2, 4 });
+        auto positions = make_tensor(*context, dtype::u32, { 2 });
+        auto output = make_tensor(*context, dtype::f32, { 8 });
+
+        auto rotated = rope(*context, input, positions, 1, 10'000.0F, output);
+        REQUIRE_FALSE(rotated.has_value());
+        CHECK(rotated.error() == tensor_op_errc::invalid_rank);
+    }
+}
+
+TEST_CASE("rope requires f32 activations and u32 positions")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    SUBCASE("input")
+    {
+        auto input = make_tensor(*context, dtype::bf16, { 2, 4 });
+        auto positions = make_tensor(*context, dtype::u32, { 2 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 4 });
+
+        auto rotated = rope(*context, input, positions, 1, 10'000.0F, output);
+        REQUIRE_FALSE(rotated.has_value());
+        CHECK(rotated.error() == tensor_op_errc::unsupported_dtype);
+    }
+
+    SUBCASE("positions")
+    {
+        auto input = make_tensor(*context, dtype::f32, { 2, 4 });
+        auto positions = make_tensor(*context, dtype::i32, { 2 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 4 });
+
+        auto rotated = rope(*context, input, positions, 1, 10'000.0F, output);
+        REQUIRE_FALSE(rotated.has_value());
+        CHECK(rotated.error() == tensor_op_errc::unsupported_dtype);
+    }
+
+    SUBCASE("output")
+    {
+        auto input = make_tensor(*context, dtype::f32, { 2, 4 });
+        auto positions = make_tensor(*context, dtype::u32, { 2 });
+        auto output = make_tensor(*context, dtype::bf16, { 2, 4 });
+
+        auto rotated = rope(*context, input, positions, 1, 10'000.0F, output);
+        REQUIRE_FALSE(rotated.has_value());
+        CHECK(rotated.error() == tensor_op_errc::unsupported_dtype);
+    }
+}
+
+TEST_CASE("rope requires one position per activation row")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto input = make_tensor(*context, dtype::f32, { 2, 4 });
+    auto positions = make_tensor(*context, dtype::u32, { 1 });
+    auto output = make_tensor(*context, dtype::f32, { 2, 4 });
+
+    auto rotated = rope(*context, input, positions, 1, 10'000.0F, output);
+    REQUIRE_FALSE(rotated.has_value());
+    CHECK(rotated.error() == tensor_op_errc::position_count_mismatch);
+}
+
+TEST_CASE("rope requires a positive head count with even head dimensions")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    SUBCASE("zero head count")
+    {
+        auto input = make_tensor(*context, dtype::f32, { 2, 8 });
+        auto positions = make_tensor(*context, dtype::u32, { 2 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 8 });
+
+        auto rotated = rope(*context, input, positions, 0, 10'000.0F, output);
+        REQUIRE_FALSE(rotated.has_value());
+        CHECK(rotated.error() == tensor_op_errc::invalid_head_count);
+    }
+
+    SUBCASE("features not divisible by heads")
+    {
+        auto input = make_tensor(*context, dtype::f32, { 2, 8 });
+        auto positions = make_tensor(*context, dtype::u32, { 2 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 8 });
+
+        auto rotated = rope(*context, input, positions, 3, 10'000.0F, output);
+        REQUIRE_FALSE(rotated.has_value());
+        CHECK(rotated.error() == tensor_op_errc::invalid_head_dimension);
+    }
+
+    SUBCASE("odd head dimension")
+    {
+        auto input = make_tensor(*context, dtype::f32, { 2, 6 });
+        auto positions = make_tensor(*context, dtype::u32, { 2 });
+        auto output = make_tensor(*context, dtype::f32, { 2, 6 });
+
+        auto rotated = rope(*context, input, positions, 2, 10'000.0F, output);
+        REQUIRE_FALSE(rotated.has_value());
+        CHECK(rotated.error() == tensor_op_errc::invalid_head_dimension);
+    }
+}
+
+TEST_CASE("rope requires output to match the input")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto input = make_tensor(*context, dtype::f32, { 2, 8 });
+    auto positions = make_tensor(*context, dtype::u32, { 2 });
+    auto output = make_tensor(*context, dtype::f32, { 1, 16 });
+
+    auto rotated = rope(*context, input, positions, 2, 10'000.0F, output);
+    REQUIRE_FALSE(rotated.has_value());
+    CHECK(rotated.error() == tensor_op_errc::output_shape_mismatch);
+}
+
+TEST_CASE("rope requires a positive finite theta")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto input = make_tensor(*context, dtype::f32, { 2, 8 });
+    auto positions = make_tensor(*context, dtype::u32, { 2 });
+    auto output = make_tensor(*context, dtype::f32, { 2, 8 });
+    const std::vector<float> invalid_values {
+        0.0F,
+        -1.0F,
+        std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::quiet_NaN(),
+    };
+
+    for (const auto theta : invalid_values) {
+        auto rotated = rope(*context, input, positions, 2, theta, output);
+        REQUIRE_FALSE(rotated.has_value());
+        CHECK(rotated.error() == tensor_op_errc::invalid_rope_theta);
+    }
 }

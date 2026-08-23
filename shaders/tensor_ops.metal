@@ -153,3 +153,53 @@ silu_mul_f32(device const float* gate [[buffer(0)]],
 
     output[position] = silu * up[position];
 }
+
+kernel void
+add_f32(device const float* lhs [[buffer(0)]],
+        device const float* rhs [[buffer(1)]],
+        device float* output [[buffer(2)]],
+        constant uint& element_count [[buffer(3)]],
+        uint position [[thread_position_in_grid]])
+{
+    if (position >= element_count) {
+        return;
+    }
+
+    output[position] = lhs[position] + rhs[position];
+}
+
+kernel void
+rope_f32(device const float* input [[buffer(0)]],
+         device const uint* positions [[buffer(1)]],
+         device float* output [[buffer(2)]],
+         constant uint& row_count [[buffer(3)]],
+         constant uint& head_count [[buffer(4)]],
+         constant uint& head_dimension [[buffer(5)]],
+         constant float& theta [[buffer(6)]],
+         uint2 grid_position [[thread_position_in_grid]])
+{
+    const uint half_dimension = head_dimension / 2;
+    const uint pair_columns = head_count * half_dimension;
+    if (grid_position.x >= pair_columns || grid_position.y >= row_count) {
+        return;
+    }
+
+    const uint row = grid_position.y;
+    const uint head = grid_position.x / half_dimension;
+    const uint pair = grid_position.x % half_dimension;
+    const ulong head_offset =
+        (ulong(row) * ulong(head_count) + ulong(head)) * ulong(head_dimension);
+    const ulong first_index = head_offset + ulong(pair);
+    const ulong second_index = first_index + ulong(half_dimension);
+
+    const float exponent = -2.0F * float(pair) / float(head_dimension);
+    const float frequency = pow(theta, exponent);
+    const float angle = float(positions[row]) * frequency;
+    const float cosine = cos(angle);
+    const float sine = sin(angle);
+
+    const float first = input[first_index];
+    const float second = input[second_index];
+    output[first_index] = first * cosine - second * sine;
+    output[second_index] = second * cosine + first * sine;
+}

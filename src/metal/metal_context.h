@@ -57,6 +57,18 @@ private:
                                                  const metal_tensor& up,
                                                  metal_tensor& output);
 
+    friend result<void, tensor_op_errc> add(const metal_context& context,
+                                            const metal_tensor& lhs,
+                                            const metal_tensor& rhs,
+                                            metal_tensor& output);
+
+    friend result<void, tensor_op_errc> rope(const metal_context& context,
+                                             const metal_tensor& input,
+                                             const metal_tensor& positions,
+                                             std::size_t head_count,
+                                             float theta,
+                                             metal_tensor& output);
+
     struct implementation;
 
     explicit metal_context(std::unique_ptr<implementation> implementation) noexcept;
@@ -92,6 +104,19 @@ private:
                                                                   const metal_buffer& up,
                                                                   metal_buffer& output,
                                                                   std::size_t element_count) const;
+
+    [[nodiscard]] result<void, metal_error> dispatch_add_f32(const metal_buffer& lhs,
+                                                             const metal_buffer& rhs,
+                                                             metal_buffer& output,
+                                                             std::size_t element_count) const;
+
+    [[nodiscard]] result<void, metal_error> dispatch_rope_f32(const metal_buffer& input,
+                                                              const metal_buffer& positions,
+                                                              metal_buffer& output,
+                                                              std::size_t rows,
+                                                              std::size_t head_count,
+                                                              std::size_t head_dimension,
+                                                              float theta) const;
 
     std::unique_ptr<implementation> implementation_;
 };

@@ -47,12 +47,15 @@ TEST_CASE("dtype sizes are explicit and invalid values are rejected")
     auto f32_size = element_size(dtype::f32);
     auto bf16_size = element_size(dtype::bf16);
     auto i32_size = element_size(dtype::i32);
+    auto u32_size = element_size(dtype::u32);
     REQUIRE(f32_size.has_value());
     REQUIRE(bf16_size.has_value());
     REQUIRE(i32_size.has_value());
+    REQUIRE(u32_size.has_value());
     CHECK(*f32_size == 4);
     CHECK(*bf16_size == 2);
     CHECK(*i32_size == 4);
+    CHECK(*u32_size == 4);
 
     auto invalid = element_size(static_cast<dtype>(255));
     REQUIRE_FALSE(invalid.has_value());

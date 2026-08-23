@@ -224,4 +224,106 @@ silu_mul(const metal_context& context,
     return {};
 }
 
+result<void, tensor_op_errc>
+add(const metal_context& context,
+    const metal_tensor& lhs,
+    const metal_tensor& rhs,
+    metal_tensor& output)
+{
+    const auto& lhs_descriptor = lhs.descriptor();
+    const auto& rhs_descriptor = rhs.descriptor();
+    const auto& output_descriptor = output.descriptor();
+    const auto& lhs_shape = lhs_descriptor.shape();
+    const auto& rhs_shape = rhs_descriptor.shape();
+    const auto& output_shape = output_descriptor.shape();
+
+    if (lhs_shape.rank() != 2 || rhs_shape.rank() != 2 || output_shape.rank() != 2) {
+        return fail(tensor_op_errc::invalid_rank);
+    }
+
+    if (lhs_descriptor.type() != dtype::f32
+        || rhs_descriptor.type() != dtype::f32
+        || output_descriptor.type() != dtype::f32) {
+        return fail(tensor_op_errc::unsupported_dtype);
+    }
+
+    if (lhs_shape.dimensions()[0] != rhs_shape.dimensions()[0]
+        || lhs_shape.dimensions()[1] != rhs_shape.dimensions()[1]) {
+        return fail(tensor_op_errc::input_shape_mismatch);
+    }
+
+    if (output_shape.dimensions()[0] != lhs_shape.dimensions()[0]
+        || output_shape.dimensions()[1] != lhs_shape.dimensions()[1]) {
+        return fail(tensor_op_errc::output_shape_mismatch);
+    }
+
+    const auto dispatched = context.dispatch_add_f32(lhs.buffer(), rhs.buffer(), output.buffer(),
+                                                     lhs_shape.element_count());
+    if (!dispatched) {
+        return fail(tensor_op_errc::backend_failure);
+    }
+
+    return {};
+}
+
+result<void, tensor_op_errc>
+rope(const metal_context& context,
+     const metal_tensor& input,
+     const metal_tensor& positions,
+     std::size_t head_count,
+     float theta,
+     metal_tensor& output)
+{
+    const auto& input_shape = input.descriptor().shape();
+    const auto& position_shape = positions.descriptor().shape();
+    const auto& output_shape = output.descriptor().shape();
+
+    if (input_shape.rank() != 2 || position_shape.rank() != 1 || output_shape.rank() != 2) {
+        return fail(tensor_op_errc::invalid_rank);
+    }
+
+    if (input.descriptor().type() != dtype::f32
+        || positions.descriptor().type() != dtype::u32
+        || output.descriptor().type() != dtype::f32) {
+        return fail(tensor_op_errc::unsupported_dtype);
+    }
+
+    const auto rows = input_shape.dimensions()[0];
+    const auto feature_count = input_shape.dimensions()[1];
+
+    if (position_shape.dimensions()[0] != rows) {
+        return fail(tensor_op_errc::position_count_mismatch);
+    }
+
+    if (head_count == 0) {
+        return fail(tensor_op_errc::invalid_head_count);
+    }
+
+    if (feature_count % head_count != 0) {
+        return fail(tensor_op_errc::invalid_head_dimension);
+    }
+
+    const auto head_dimension = feature_count / head_count;
+    if (head_dimension % 2 != 0) {
+        return fail(tensor_op_errc::invalid_head_dimension);
+    }
+
+    if (output_shape.dimensions()[0] != rows || output_shape.dimensions()[1] != feature_count) {
+        return fail(tensor_op_errc::output_shape_mismatch);
+    }
+
+    if (!std::isfinite(theta) || theta <= 0.0F) {
+        return fail(tensor_op_errc::invalid_rope_theta);
+    }
+
+    const auto dispatched =
+        context.dispatch_rope_f32(input.buffer(), positions.buffer(), output.buffer(), rows,
+                                  head_count, head_dimension, theta);
+    if (!dispatched) {
+        return fail(tensor_op_errc::backend_failure);
+    }
+
+    return {};
+}
+
 } // namespace chibillm

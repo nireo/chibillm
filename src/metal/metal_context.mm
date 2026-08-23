@@ -48,6 +48,8 @@ struct metal_context::implementation {
     id<MTLComputePipelineState> embedding_bf16_pipeline;
     id<MTLComputePipelineState> rms_norm_bf16_pipeline;
     id<MTLComputePipelineState> silu_mul_f32_pipeline;
+    id<MTLComputePipelineState> add_f32_pipeline;
+    id<MTLComputePipelineState> rope_f32_pipeline;
     std::string device_name;
 };
 
@@ -197,6 +199,36 @@ metal_context::make(std::string_view shader_source)
                 message_from_error(pipeline_error, "failed to create the silu_mul_f32 pipeline")));
         }
 
+        id<MTLFunction> add_f32 = [library newFunctionWithName:@"add_f32"];
+        if (add_f32 == nil) {
+            return fail(make_error(metal_errc::shader_function_not_found,
+                                   "the Metal shader library does not contain add_f32"));
+        }
+
+        pipeline_error = nil;
+        id<MTLComputePipelineState> add_f32_pipeline =
+            [device newComputePipelineStateWithFunction:add_f32 error:&pipeline_error];
+        if (add_f32_pipeline == nil) {
+            return fail(make_error(
+                metal_errc::pipeline_creation_failed,
+                message_from_error(pipeline_error, "failed to create the add_f32 pipeline")));
+        }
+
+        id<MTLFunction> rope_f32 = [library newFunctionWithName:@"rope_f32"];
+        if (rope_f32 == nil) {
+            return fail(make_error(metal_errc::shader_function_not_found,
+                                   "the Metal shader library does not contain rope_f32"));
+        }
+
+        pipeline_error = nil;
+        id<MTLComputePipelineState> rope_f32_pipeline =
+            [device newComputePipelineStateWithFunction:rope_f32 error:&pipeline_error];
+        if (rope_f32_pipeline == nil) {
+            return fail(make_error(
+                metal_errc::pipeline_creation_failed,
+                message_from_error(pipeline_error, "failed to create the rope_f32 pipeline")));
+        }
+
         const char* device_name = device.name.UTF8String;
         auto implementation = std::make_unique<metal_context::implementation>();
         implementation->device = device;
@@ -207,6 +239,8 @@ metal_context::make(std::string_view shader_source)
         implementation->embedding_bf16_pipeline = embedding_bf16_pipeline;
         implementation->rms_norm_bf16_pipeline = rms_norm_bf16_pipeline;
         implementation->silu_mul_f32_pipeline = silu_mul_f32_pipeline;
+        implementation->add_f32_pipeline = add_f32_pipeline;
+        implementation->rope_f32_pipeline = rope_f32_pipeline;
         implementation->device_name = device_name == nullptr ? "unknown Metal device" : device_name;
 
         return metal_context { std::move(implementation) };
@@ -541,6 +575,130 @@ metal_context::dispatch_silu_mul_f32(const metal_buffer& gate,
 
         [encoder dispatchThreads:MTLSizeMake(element_count, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return fail(make_error(
+                metal_errc::execution_failed,
+                message_from_error(command_buffer.error, "Metal command execution failed")));
+        }
+
+        return {};
+    }
+}
+
+result<void, metal_error>
+metal_context::dispatch_add_f32(const metal_buffer& lhs,
+                                const metal_buffer& rhs,
+                                metal_buffer& output,
+                                std::size_t element_count) const
+{
+    @autoreleasepool {
+        if (element_count > std::numeric_limits<std::uint32_t>::max()) {
+            return fail(make_error(metal_errc::invalid_input,
+                                   "add element count exceeds the shader uint range"));
+        }
+
+        const auto shader_element_count = static_cast<std::uint32_t>(element_count);
+
+        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
+        if (command_buffer == nil) {
+            return fail(make_error(metal_errc::command_buffer_creation_failed,
+                                   "failed to create a Metal command buffer"));
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return fail(make_error(metal_errc::command_encoder_creation_failed,
+                                   "failed to create a Metal compute encoder"));
+        }
+
+        [encoder setComputePipelineState:implementation_->add_f32_pipeline];
+        [encoder setBuffer:lhs.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:rhs.implementation_->buffer offset:0 atIndex:1];
+        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:2];
+        [encoder setBytes:&shader_element_count length:sizeof(shader_element_count) atIndex:3];
+
+        constexpr std::size_t preferred_threadgroup_size = 256;
+        const auto threadgroup_size =
+            std::min(preferred_threadgroup_size,
+                     static_cast<std::size_t>(
+                         implementation_->add_f32_pipeline.maxTotalThreadsPerThreadgroup));
+
+        [encoder dispatchThreads:MTLSizeMake(element_count, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return fail(make_error(
+                metal_errc::execution_failed,
+                message_from_error(command_buffer.error, "Metal command execution failed")));
+        }
+
+        return {};
+    }
+}
+
+result<void, metal_error>
+metal_context::dispatch_rope_f32(const metal_buffer& input,
+                                 const metal_buffer& positions,
+                                 metal_buffer& output,
+                                 std::size_t rows,
+                                 std::size_t head_count,
+                                 std::size_t head_dimension,
+                                 float theta) const
+{
+    @autoreleasepool {
+        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
+        const auto pair_columns = head_count * (head_dimension / 2);
+        if (rows > max_shader_dimension
+            || head_count > max_shader_dimension
+            || head_dimension > max_shader_dimension
+            || pair_columns > max_shader_dimension) {
+            return fail(make_error(metal_errc::invalid_input,
+                                   "rope dimensions exceed the shader uint range"));
+        }
+
+        const auto shader_rows = static_cast<std::uint32_t>(rows);
+        const auto shader_head_count = static_cast<std::uint32_t>(head_count);
+        const auto shader_head_dimension = static_cast<std::uint32_t>(head_dimension);
+
+        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
+        if (command_buffer == nil) {
+            return fail(make_error(metal_errc::command_buffer_creation_failed,
+                                   "failed to create a Metal command buffer"));
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return fail(make_error(metal_errc::command_encoder_creation_failed,
+                                   "failed to create a Metal compute encoder"));
+        }
+
+        [encoder setComputePipelineState:implementation_->rope_f32_pipeline];
+        [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:positions.implementation_->buffer offset:0 atIndex:1];
+        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:2];
+        [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:3];
+        [encoder setBytes:&shader_head_count length:sizeof(shader_head_count) atIndex:4];
+        [encoder setBytes:&shader_head_dimension length:sizeof(shader_head_dimension) atIndex:5];
+        [encoder setBytes:&theta length:sizeof(theta) atIndex:6];
+
+        constexpr std::size_t preferred_threadgroup_dimension = 16;
+        const auto max_threads = static_cast<std::size_t>(
+            implementation_->rope_f32_pipeline.maxTotalThreadsPerThreadgroup);
+        const auto threadgroup_width = std::min(preferred_threadgroup_dimension, max_threads);
+        const auto threadgroup_height =
+            std::min(preferred_threadgroup_dimension, max_threads / threadgroup_width);
+
+        [encoder dispatchThreads:MTLSizeMake(pair_columns, rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
         [encoder endEncoding];
 
         [command_buffer commit];

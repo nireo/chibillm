@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include "metal/metal_context.h"
@@ -16,6 +17,10 @@ enum class tensor_op_errc : std::uint8_t {
     output_shape_mismatch,
     token_out_of_range,
     invalid_epsilon,
+    position_count_mismatch,
+    invalid_head_count,
+    invalid_head_dimension,
+    invalid_rope_theta,
     backend_failure,
 };
 
@@ -49,5 +54,19 @@ enum class tensor_op_errc : std::uint8_t {
                                                     const metal_tensor& gate,
                                                     const metal_tensor& up,
                                                     metal_tensor& output);
+
+// adds lhs and rhs elementwise into output.
+[[nodiscard]] result<void, tensor_op_errc> add(const metal_context& context,
+                                               const metal_tensor& lhs,
+                                               const metal_tensor& rhs,
+                                               metal_tensor& output);
+
+// applies qwen rotary positions to flattened attention heads.
+[[nodiscard]] result<void, tensor_op_errc> rope(const metal_context& context,
+                                                const metal_tensor& input,
+                                                const metal_tensor& positions,
+                                                std::size_t head_count,
+                                                float theta,
+                                                metal_tensor& output);
 
 } // namespace chibillm
