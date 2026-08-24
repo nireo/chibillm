@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "metal/metal_context.h"
+#include "metal/metal_kv_cache.h"
 #include "metal/metal_tensor.h"
 #include "result.h"
 
@@ -21,6 +22,10 @@ enum class tensor_op_errc : std::uint8_t {
     invalid_head_count,
     invalid_head_dimension,
     invalid_rope_theta,
+    cache_slot_count_mismatch,
+    cache_feature_count_mismatch,
+    cache_layer_out_of_range,
+    cache_slot_out_of_range,
     backend_failure,
 };
 
@@ -68,5 +73,13 @@ enum class tensor_op_errc : std::uint8_t {
                                                 std::size_t head_count,
                                                 float theta,
                                                 metal_tensor& output);
+
+// writes new f32 keys and values into physical cache slots for one layer.
+[[nodiscard]] result<void, tensor_op_errc> store_kv(const metal_context& context,
+                                                    const metal_tensor& keys,
+                                                    const metal_tensor& values,
+                                                    const metal_tensor& slot_mapping,
+                                                    std::size_t layer,
+                                                    metal_kv_cache& cache);
 
 } // namespace chibillm

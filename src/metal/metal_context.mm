@@ -50,6 +50,7 @@ struct metal_context::implementation {
     id<MTLComputePipelineState> silu_mul_f32_pipeline;
     id<MTLComputePipelineState> add_f32_pipeline;
     id<MTLComputePipelineState> rope_f32_pipeline;
+    id<MTLComputePipelineState> store_kv_f32_pipeline;
     std::string device_name;
 };
 
@@ -229,6 +230,21 @@ metal_context::make(std::string_view shader_source)
                 message_from_error(pipeline_error, "failed to create the rope_f32 pipeline")));
         }
 
+        id<MTLFunction> store_kv_f32 = [library newFunctionWithName:@"store_kv_f32"];
+        if (store_kv_f32 == nil) {
+            return fail(make_error(metal_errc::shader_function_not_found,
+                                   "the Metal shader library does not contain store_kv_f32"));
+        }
+
+        pipeline_error = nil;
+        id<MTLComputePipelineState> store_kv_f32_pipeline =
+            [device newComputePipelineStateWithFunction:store_kv_f32 error:&pipeline_error];
+        if (store_kv_f32_pipeline == nil) {
+            return fail(make_error(
+                metal_errc::pipeline_creation_failed,
+                message_from_error(pipeline_error, "failed to create the store_kv_f32 pipeline")));
+        }
+
         const char* device_name = device.name.UTF8String;
         auto implementation = std::make_unique<metal_context::implementation>();
         implementation->device = device;
@@ -241,6 +257,7 @@ metal_context::make(std::string_view shader_source)
         implementation->silu_mul_f32_pipeline = silu_mul_f32_pipeline;
         implementation->add_f32_pipeline = add_f32_pipeline;
         implementation->rope_f32_pipeline = rope_f32_pipeline;
+        implementation->store_kv_f32_pipeline = store_kv_f32_pipeline;
         implementation->device_name = device_name == nullptr ? "unknown Metal device" : device_name;
 
         return metal_context { std::move(implementation) };
@@ -698,6 +715,79 @@ metal_context::dispatch_rope_f32(const metal_buffer& input,
             std::min(preferred_threadgroup_dimension, max_threads / threadgroup_width);
 
         [encoder dispatchThreads:MTLSizeMake(pair_columns, rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return fail(make_error(
+                metal_errc::execution_failed,
+                message_from_error(command_buffer.error, "Metal command execution failed")));
+        }
+
+        return {};
+    }
+}
+
+result<void, metal_error>
+metal_context::dispatch_store_kv_f32(const metal_buffer& keys,
+                                     const metal_buffer& values,
+                                     const metal_buffer& slot_mapping,
+                                     metal_buffer& key_cache,
+                                     metal_buffer& value_cache,
+                                     std::size_t rows,
+                                     std::size_t feature_count,
+                                     std::size_t layer,
+                                     std::size_t slot_count) const
+{
+    @autoreleasepool {
+        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
+        if (rows > max_shader_dimension
+            || feature_count > max_shader_dimension
+            || layer > max_shader_dimension
+            || slot_count > max_shader_dimension) {
+            return fail(make_error(metal_errc::invalid_input,
+                                   "kv store dimensions exceed the shader uint range"));
+        }
+
+        const auto shader_rows = static_cast<std::uint32_t>(rows);
+        const auto shader_feature_count = static_cast<std::uint32_t>(feature_count);
+        const auto shader_layer = static_cast<std::uint32_t>(layer);
+        const auto shader_slot_count = static_cast<std::uint32_t>(slot_count);
+
+        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
+        if (command_buffer == nil) {
+            return fail(make_error(metal_errc::command_buffer_creation_failed,
+                                   "failed to create a Metal command buffer"));
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return fail(make_error(metal_errc::command_encoder_creation_failed,
+                                   "failed to create a Metal compute encoder"));
+        }
+
+        [encoder setComputePipelineState:implementation_->store_kv_f32_pipeline];
+        [encoder setBuffer:keys.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:values.implementation_->buffer offset:0 atIndex:1];
+        [encoder setBuffer:slot_mapping.implementation_->buffer offset:0 atIndex:2];
+        [encoder setBuffer:key_cache.implementation_->buffer offset:0 atIndex:3];
+        [encoder setBuffer:value_cache.implementation_->buffer offset:0 atIndex:4];
+        [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:5];
+        [encoder setBytes:&shader_feature_count length:sizeof(shader_feature_count) atIndex:6];
+        [encoder setBytes:&shader_layer length:sizeof(shader_layer) atIndex:7];
+        [encoder setBytes:&shader_slot_count length:sizeof(shader_slot_count) atIndex:8];
+
+        constexpr std::size_t preferred_threadgroup_dimension = 16;
+        const auto max_threads = static_cast<std::size_t>(
+            implementation_->store_kv_f32_pipeline.maxTotalThreadsPerThreadgroup);
+        const auto threadgroup_width = std::min(preferred_threadgroup_dimension, max_threads);
+        const auto threadgroup_height =
+            std::min(preferred_threadgroup_dimension, max_threads / threadgroup_width);
+
+        [encoder dispatchThreads:MTLSizeMake(feature_count, rows, 1)
             threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
         [encoder endEncoding];
 

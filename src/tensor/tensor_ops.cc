@@ -326,4 +326,64 @@ rope(const metal_context& context,
     return {};
 }
 
+result<void, tensor_op_errc>
+store_kv(const metal_context& context,
+         const metal_tensor& keys,
+         const metal_tensor& values,
+         const metal_tensor& slot_mapping,
+         std::size_t layer,
+         metal_kv_cache& cache)
+{
+    const auto& key_shape = keys.descriptor().shape();
+    const auto& value_shape = values.descriptor().shape();
+    const auto& slot_shape = slot_mapping.descriptor().shape();
+
+    if (key_shape.rank() != 2 || value_shape.rank() != 2 || slot_shape.rank() != 1) {
+        return fail(tensor_op_errc::invalid_rank);
+    }
+
+    if (keys.descriptor().type() != dtype::f32
+        || values.descriptor().type() != dtype::f32
+        || slot_mapping.descriptor().type() != dtype::u32) {
+        return fail(tensor_op_errc::unsupported_dtype);
+    }
+
+    const auto rows = key_shape.dimensions()[0];
+    const auto feature_count = key_shape.dimensions()[1];
+    if (value_shape.dimensions()[0] != rows || value_shape.dimensions()[1] != feature_count) {
+        return fail(tensor_op_errc::input_shape_mismatch);
+    }
+
+    if (slot_shape.dimensions()[0] != rows) {
+        return fail(tensor_op_errc::cache_slot_count_mismatch);
+    }
+
+    if (feature_count != cache.elements_per_token()) {
+        return fail(tensor_op_errc::cache_feature_count_mismatch);
+    }
+
+    if (layer >= cache.layer_count()) {
+        return fail(tensor_op_errc::cache_layer_out_of_range);
+    }
+
+    const auto slot_count = cache.block_count() * cache.block_size();
+    const auto slot_bytes = slot_mapping.buffer().bytes();
+    for (std::size_t row = 0; row < rows; ++row) {
+        std::uint32_t slot = 0;
+        std::memcpy(&slot, slot_bytes.data() + row * sizeof(slot), sizeof(slot));
+        if (slot >= slot_count) {
+            return fail(tensor_op_errc::cache_slot_out_of_range);
+        }
+    }
+
+    const auto dispatched = context.dispatch_store_kv_f32(
+        keys.buffer(), values.buffer(), slot_mapping.buffer(), cache.keys().buffer(),
+        cache.values().buffer(), rows, feature_count, layer, slot_count);
+    if (!dispatched) {
+        return fail(tensor_op_errc::backend_failure);
+    }
+
+    return {};
+}
+
 } // namespace chibillm

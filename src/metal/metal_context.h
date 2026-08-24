@@ -12,6 +12,7 @@
 namespace chibillm {
 
 class metal_tensor;
+class metal_kv_cache;
 enum class tensor_op_errc : std::uint8_t;
 
 // owns the metal device, queue, shader library, and compute pipelines.
@@ -69,6 +70,13 @@ private:
                                              float theta,
                                              metal_tensor& output);
 
+    friend result<void, tensor_op_errc> store_kv(const metal_context& context,
+                                                 const metal_tensor& keys,
+                                                 const metal_tensor& values,
+                                                 const metal_tensor& slot_mapping,
+                                                 std::size_t layer,
+                                                 metal_kv_cache& cache);
+
     struct implementation;
 
     explicit metal_context(std::unique_ptr<implementation> implementation) noexcept;
@@ -117,6 +125,16 @@ private:
                                                               std::size_t head_count,
                                                               std::size_t head_dimension,
                                                               float theta) const;
+
+    [[nodiscard]] result<void, metal_error> dispatch_store_kv_f32(const metal_buffer& keys,
+                                                                  const metal_buffer& values,
+                                                                  const metal_buffer& slot_mapping,
+                                                                  metal_buffer& key_cache,
+                                                                  metal_buffer& value_cache,
+                                                                  std::size_t rows,
+                                                                  std::size_t feature_count,
+                                                                  std::size_t layer,
+                                                                  std::size_t slot_count) const;
 
     std::unique_ptr<implementation> implementation_;
 };

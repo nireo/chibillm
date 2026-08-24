@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "metal/metal_context.h"
+#include "metal/metal_kv_cache.h"
 #include "metal/metal_tensor.h"
 #include "tensor/bf16.h"
 #include "tensor/dtype.h"
@@ -26,10 +27,12 @@ using chibillm::embedding_lookup;
 using chibillm::linear;
 using chibillm::matmul;
 using chibillm::metal_context;
+using chibillm::metal_kv_cache;
 using chibillm::metal_tensor;
 using chibillm::rms_norm;
 using chibillm::rope;
 using chibillm::silu_mul;
+using chibillm::store_kv;
 using chibillm::tensor_descriptor;
 using chibillm::tensor_op_errc;
 using chibillm::tensor_shape;
@@ -108,6 +111,21 @@ read_floats(const metal_tensor& tensor)
     REQUIRE(tensor.buffer().size_bytes() == values.size() * sizeof(float));
     std::memcpy(values.data(), tensor.buffer().bytes().data(), tensor.buffer().size_bytes());
     return values;
+}
+
+metal_kv_cache
+make_kv_cache(const metal_context& context)
+{
+    auto cache = metal_kv_cache::make(context,
+                                      {
+                                          .layer_count = 2,
+                                          .block_count = 2,
+                                          .block_size = 2,
+                                          .kv_head_count = 1,
+                                          .head_dimension = 2,
+                                      });
+    REQUIRE(cache.has_value());
+    return std::move(*cache);
 }
 
 } // namespace
@@ -1090,5 +1108,167 @@ TEST_CASE("rope requires a positive finite theta")
         auto rotated = rope(*context, input, positions, 2, theta, output);
         REQUIRE_FALSE(rotated.has_value());
         CHECK(rotated.error() == tensor_op_errc::invalid_rope_theta);
+    }
+}
+
+TEST_CASE("kv cache store writes rows into selected physical slots" * doctest::skip())
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+    auto cache = make_kv_cache(*context);
+
+    auto keys = make_tensor(*context, dtype::f32, { 2, 2 });
+    auto values = make_tensor(*context, dtype::f32, { 2, 2 });
+    auto slots = make_tensor(*context, dtype::u32, { 2 });
+    write_floats(keys, { 1.0F, 2.0F, 3.0F, 4.0F });
+    write_floats(values, { 5.0F, 6.0F, 7.0F, 8.0F });
+    write_u32(slots, { 1, 3 });
+    write_floats(cache.keys(), std::vector<float>(16, -1.0F));
+    write_floats(cache.values(), std::vector<float>(16, -1.0F));
+
+    auto stored = store_kv(*context, keys, values, slots, 1, cache);
+    REQUIRE(stored.has_value());
+
+    CHECK(read_floats(cache.keys())
+          == std::vector<float> { -1.0F, -1.0F, -1.0F, -1.0F, -1.0F, -1.0F, -1.0F, -1.0F, -1.0F,
+                                  -1.0F, 1.0F, 2.0F, -1.0F, -1.0F, 3.0F, 4.0F });
+    CHECK(read_floats(cache.values())
+          == std::vector<float> { -1.0F, -1.0F, -1.0F, -1.0F, -1.0F, -1.0F, -1.0F, -1.0F, -1.0F,
+                                  -1.0F, 5.0F, 6.0F, -1.0F, -1.0F, 7.0F, 8.0F });
+}
+
+TEST_CASE("kv cache store requires rank-two inputs and rank-one slots")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    SUBCASE("keys")
+    {
+        auto cache = make_kv_cache(*context);
+        auto keys = make_tensor(*context, dtype::f32, { 4 });
+        auto values = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto slots = make_tensor(*context, dtype::u32, { 2 });
+        CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
+              == tensor_op_errc::invalid_rank);
+    }
+
+    SUBCASE("values")
+    {
+        auto cache = make_kv_cache(*context);
+        auto keys = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto values = make_tensor(*context, dtype::f32, { 4 });
+        auto slots = make_tensor(*context, dtype::u32, { 2 });
+        CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
+              == tensor_op_errc::invalid_rank);
+    }
+
+    SUBCASE("slots")
+    {
+        auto cache = make_kv_cache(*context);
+        auto keys = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto values = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto slots = make_tensor(*context, dtype::u32, { 1, 2 });
+        CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
+              == tensor_op_errc::invalid_rank);
+    }
+}
+
+TEST_CASE("kv cache store requires f32 inputs and u32 slots")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    SUBCASE("keys")
+    {
+        auto cache = make_kv_cache(*context);
+        auto keys = make_tensor(*context, dtype::bf16, { 2, 2 });
+        auto values = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto slots = make_tensor(*context, dtype::u32, { 2 });
+        CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
+              == tensor_op_errc::unsupported_dtype);
+    }
+
+    SUBCASE("values")
+    {
+        auto cache = make_kv_cache(*context);
+        auto keys = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto values = make_tensor(*context, dtype::bf16, { 2, 2 });
+        auto slots = make_tensor(*context, dtype::u32, { 2 });
+        CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
+              == tensor_op_errc::unsupported_dtype);
+    }
+
+    SUBCASE("slots")
+    {
+        auto cache = make_kv_cache(*context);
+        auto keys = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto values = make_tensor(*context, dtype::f32, { 2, 2 });
+        auto slots = make_tensor(*context, dtype::i32, { 2 });
+        CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
+              == tensor_op_errc::unsupported_dtype);
+    }
+}
+
+TEST_CASE("kv cache store requires matching key and value shapes")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+    auto cache = make_kv_cache(*context);
+    auto keys = make_tensor(*context, dtype::f32, { 2, 2 });
+    auto values = make_tensor(*context, dtype::f32, { 1, 2 });
+    auto slots = make_tensor(*context, dtype::u32, { 2 });
+
+    CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
+          == tensor_op_errc::input_shape_mismatch);
+}
+
+TEST_CASE("kv cache store requires one slot per input row")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+    auto cache = make_kv_cache(*context);
+    auto keys = make_tensor(*context, dtype::f32, { 2, 2 });
+    auto values = make_tensor(*context, dtype::f32, { 2, 2 });
+    auto slots = make_tensor(*context, dtype::u32, { 1 });
+
+    CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
+          == tensor_op_errc::cache_slot_count_mismatch);
+}
+
+TEST_CASE("kv cache store requires cache-sized rows")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+    auto cache = make_kv_cache(*context);
+    auto keys = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto values = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto slots = make_tensor(*context, dtype::u32, { 2 });
+
+    CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
+          == tensor_op_errc::cache_feature_count_mismatch);
+}
+
+TEST_CASE("kv cache store rejects invalid layers and slots")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+    auto keys = make_tensor(*context, dtype::f32, { 2, 2 });
+    auto values = make_tensor(*context, dtype::f32, { 2, 2 });
+
+    SUBCASE("layer")
+    {
+        auto cache = make_kv_cache(*context);
+        auto slots = make_tensor(*context, dtype::u32, { 2 });
+        CHECK(store_kv(*context, keys, values, slots, 2, cache).error()
+              == tensor_op_errc::cache_layer_out_of_range);
+    }
+
+    SUBCASE("slot")
+    {
+        auto cache = make_kv_cache(*context);
+        auto slots = make_tensor(*context, dtype::u32, { 2 });
+        write_u32(slots, { 0, 4 });
+        CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
+              == tensor_op_errc::cache_slot_out_of_range);
     }
 }
