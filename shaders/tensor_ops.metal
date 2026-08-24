@@ -227,8 +227,10 @@ store_kv_f32(device const float* keys [[buffer(0)]],
     const ulong row = position.y;
     const ulong feature = position.x;
 
-    const ulong input_index = row * feature_count + feature;
-    const ulong cache_index = (layer * slot_count + slot) * feature_count + feature;
+    const ulong input_index = row * ulong(feature_count) + feature;
+    const ulong cache_index = (ulong(layer) * ulong(slot_count) + ulong(slot))
+            * ulong(feature_count)
+        + feature;
 
     key_cache[cache_index] = keys[input_index];
     value_cache[cache_index] = values[input_index];
