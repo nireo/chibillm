@@ -7,18 +7,21 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "inference_engine.h"
 #include "metal/metal_context.h"
 #include "metal/metal_kv_cache.h"
 #include "model_format/safetensors.h"
 #include "qwen/qwen_config.h"
 #include "qwen/qwen_embedding.h"
 #include "qwen/qwen_layer.h"
+#include "qwen/qwen_model_runner.h"
 #include "qwen/qwen_output.h"
 #include "qwen/qwen_weights.h"
 #include "safetensors_test_support.h"
@@ -35,6 +38,7 @@ using chibillm::normalize_qwen_qk;
 using chibillm::project_qwen_qkv;
 using chibillm::qwen_attention_metadata;
 using chibillm::qwen_config;
+using chibillm::qwen_model_runner;
 using chibillm::qwen_weights_errc;
 using chibillm::run_qwen_attention;
 using chibillm::run_qwen_layers;
@@ -115,6 +119,63 @@ write_weights(std::vector<tensor_spec> tensors, std::string filename)
         value = static_cast<std::byte>(std::to_integer<unsigned int>(value) + 1);
     }
     return temporary_file(std::move(filename), header, data);
+}
+
+class temporary_model_directory {
+public:
+    temporary_model_directory()
+        : path_(std::filesystem::temp_directory_path() / "chibillm_qwen_runner_model")
+    {
+        std::error_code ignored;
+        std::filesystem::remove_all(path_, ignored);
+        REQUIRE(std::filesystem::create_directory(path_));
+    }
+
+    ~temporary_model_directory()
+    {
+        std::error_code ignored;
+        std::filesystem::remove_all(path_, ignored);
+    }
+
+    [[nodiscard]] const std::filesystem::path&
+    path() const noexcept
+    {
+        return path_;
+    }
+
+private:
+    std::filesystem::path path_;
+};
+
+void
+write_config(const std::filesystem::path& path, const qwen_config& config)
+{
+    const nlohmann::json json {
+        { "model_type", "qwen3" },
+        { "hidden_act", "silu" },
+        { "torch_dtype", "bfloat16" },
+        { "attention_bias", false },
+        { "use_sliding_window", false },
+        { "sliding_window", nullptr },
+        { "rope_scaling", nullptr },
+        { "vocab_size", config.vocabulary_size },
+        { "hidden_size", config.hidden_size },
+        { "intermediate_size", config.intermediate_size },
+        { "num_hidden_layers", config.layer_count },
+        { "num_attention_heads", config.query_head_count },
+        { "num_key_value_heads", config.kv_head_count },
+        { "head_dim", config.head_dimension },
+        { "max_position_embeddings", config.max_position_embeddings },
+        { "rms_norm_eps", config.rms_epsilon },
+        { "rope_theta", config.rope_theta },
+        { "bos_token_id", config.bos_token_id },
+        { "eos_token_id", config.eos_token_id },
+        { "tie_word_embeddings", config.tie_word_embeddings },
+    };
+    std::ofstream output(path);
+    REQUIRE(output.good());
+    output << json;
+    REQUIRE(output.good());
 }
 
 std::string
@@ -312,6 +373,65 @@ TEST_CASE("Qwen output selects requested rows and samples their largest logits")
     auto invalid = sample_qwen_greedy(*context, config, *weights, *hidden_states, invalid_indices);
     REQUIRE_FALSE(invalid.has_value());
     CHECK(invalid.error() == chibillm::qwen_output_errc::logits_index_out_of_range);
+}
+
+TEST_CASE("Qwen model runner executes a flattened multi-sequence batch")
+{
+    const auto config = test_config();
+    temporary_model_directory model_directory;
+    write_config(model_directory.path() / "config.json", config);
+    auto weights_file =
+        write_weights(expected_tensors(config), "chibillm_qwen_runner_model/model.safetensors");
+
+    auto runner = qwen_model_runner::make(model_directory.path(), load_shader_source(), 3, 2);
+    REQUIRE(runner.has_value());
+    CHECK(runner->config().vocabulary_size == config.vocabulary_size);
+
+    auto engine = chibillm::inference_engine::make(
+        {
+            .max_sequences = 2,
+            .max_batch_tokens = 4,
+            .kv_block_count = 3,
+            .kv_block_size = 2,
+            .eos_token = config.eos_token_id,
+        },
+        *runner);
+    auto first = chibillm::seq::make(
+        10, { 1, 2, 3 }, { .temperature = 1.0F, .max_new_tokens = 2, .ignore_eos = false }, 2);
+    auto second = chibillm::seq::make(
+        20, { 4 }, { .temperature = 1.0F, .max_new_tokens = 2, .ignore_eos = false }, 2);
+    REQUIRE(engine.has_value());
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    REQUIRE(engine->add(std::move(*first)).has_value());
+    REQUIRE(engine->add(std::move(*second)).has_value());
+    while (!engine->is_finished()) {
+        REQUIRE(engine->step().has_value());
+    }
+    const auto* first_result = engine->find_sequence(10);
+    const auto* second_result = engine->find_sequence(20);
+    REQUIRE(first_result != nullptr);
+    REQUIRE(second_result != nullptr);
+    CHECK(std::ranges::equal(first_result->completion_tokens(),
+                             std::vector<chibillm::token_id> { 0, 0 }));
+    CHECK(std::ranges::equal(second_result->completion_tokens(),
+                             std::vector<chibillm::token_id> { 0, 0 }));
+
+    const chibillm::model_batch invalid {
+        .id = 2,
+        .phase = chibillm::batch_phase::decode,
+        .kv_block_size = 2,
+        .tokens = { 1 },
+        .positions = { 0 },
+        .items = { { .id = 10,
+                     .token_offset = 0,
+                     .token_count = 1,
+                     .logits_index = 0,
+                     .block_table = { 3 } } },
+    };
+    auto rejected = runner->execute(invalid);
+    REQUIRE_FALSE(rejected.has_value());
+    CHECK(rejected.error() == chibillm::model_runner_errc::inconsistent_batch);
 }
 
 TEST_CASE("Qwen layer input produces normalized query key and value projections")
