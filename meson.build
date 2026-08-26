@@ -26,6 +26,11 @@ doctest_dep = dependency(
   fallback: ['doctest', 'doctest_dep'],
 )
 
+nlohmann_json_dep = dependency(
+  'nlohmann_json',
+  fallback: ['nlohmann_json', 'nlohmann_json_dep'],
+)
+
 chibillm_core = static_library(
   'chibillm_core',
   [
@@ -49,6 +54,14 @@ chibillm_metal = static_library(
   ],
   include_directories: src_include,
   dependencies: metal_framework_dep,
+  install: false,
+)
+
+chibillm_qwen = static_library(
+  'chibillm_qwen',
+  'src/qwen/qwen_config.cc',
+  include_directories: src_include,
+  dependencies: nlohmann_json_dep,
   install: false,
 )
 
@@ -102,6 +115,29 @@ chibillm_inference_engine_tests = executable(
 )
 
 test('chibillm inference engine tests', chibillm_inference_engine_tests)
+
+qwen_config_fixture_path = join_paths(
+  meson.project_source_root(),
+  'tests',
+  'fixtures',
+  'qwen3_0_6b_config.json',
+)
+
+chibillm_qwen_config_tests = executable(
+  'chibillm_qwen_config_tests',
+  'tests/qwen_config_test.cc',
+  include_directories: src_include,
+  cpp_args: [
+    '-DQWEN_CONFIG_FIXTURE_PATH="' + qwen_config_fixture_path + '"',
+  ],
+  dependencies: [
+    doctest_dep,
+    nlohmann_json_dep,
+  ],
+  link_with: chibillm_qwen,
+)
+
+test('chibillm qwen config tests', chibillm_qwen_config_tests)
 
 metal_shader_path = join_paths(
   meson.project_source_root(),
