@@ -69,6 +69,7 @@ chibillm_qwen = static_library(
   'chibillm_qwen',
   [
     'src/qwen/qwen_config.cc',
+    'src/qwen/qwen_embedding.cc',
     'src/qwen/qwen_weights.cc',
   ],
   include_directories: src_include,

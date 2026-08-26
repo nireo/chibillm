@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -14,9 +15,13 @@
 #include "metal/metal_context.h"
 #include "model_format/safetensors.h"
 #include "qwen/qwen_config.h"
+#include "qwen/qwen_embedding.h"
 #include "qwen/qwen_weights.h"
 #include "safetensors_test_support.h"
+#include "tensor/bf16.h"
 
+using chibillm::bf16;
+using chibillm::embed_qwen_tokens;
 using chibillm::load_qwen_weights;
 using chibillm::metal_context;
 using chibillm::qwen_config;
@@ -191,4 +196,38 @@ TEST_CASE("Qwen weights are loaded into resident Metal tensors")
     const auto first_layer_input_norm = weights->layers[0].input_norm.buffer().bytes();
     CHECK(std::all_of(first_layer_input_norm.begin(), first_layer_input_norm.end(),
                       [](std::byte byte) { return byte == std::byte { 4 }; }));
+}
+
+TEST_CASE("Qwen token embedding produces hidden-state rows")
+{
+    const auto config = test_config();
+    auto file = write_weights(expected_tensors(config), "chibillm_qwen_embedding.safetensors");
+    auto safetensors = safetensors_file::open(file.path());
+    REQUIRE(safetensors.has_value());
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+    auto weights = load_qwen_weights(*context, *safetensors, config);
+    REQUIRE(weights.has_value());
+
+    std::vector<std::uint16_t> embedding_bits;
+    for (std::size_t token = 0; token < config.vocabulary_size; ++token) {
+        for (std::size_t feature = 0; feature < config.hidden_size; ++feature) {
+            embedding_bits.push_back(
+                bf16::from_float(static_cast<float>(token * 10 + feature)).bits());
+        }
+    }
+    std::memcpy(weights->token_embedding.buffer().bytes().data(), embedding_bits.data(),
+                embedding_bits.size() * sizeof(std::uint16_t));
+
+    const std::vector<chibillm::token_id> tokens { 2, 0 };
+    auto hidden_states = embed_qwen_tokens(*context, *weights, tokens);
+    REQUIRE(hidden_states.has_value());
+    CHECK(std::ranges::equal(hidden_states->descriptor().shape().dimensions(),
+                             std::vector<std::size_t> { 2, config.hidden_size }));
+
+    std::vector<float> values(hidden_states->descriptor().element_count());
+    std::memcpy(values.data(), hidden_states->buffer().bytes().data(),
+                hidden_states->buffer().size_bytes());
+    const std::vector<float> expected { 20.0F, 21.0F, 22.0F, 23.0F, 0.0F, 1.0F, 2.0F, 3.0F };
+    CHECK(values == expected);
 }
