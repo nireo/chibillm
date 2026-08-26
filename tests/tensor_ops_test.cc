@@ -29,6 +29,7 @@ using chibillm::matmul;
 using chibillm::metal_context;
 using chibillm::metal_kv_cache;
 using chibillm::metal_tensor;
+using chibillm::paged_attention;
 using chibillm::rms_norm;
 using chibillm::rope;
 using chibillm::silu_mul;
@@ -1270,5 +1271,265 @@ TEST_CASE("kv cache store rejects invalid layers and slots")
         write_u32(slots, { 0, 4 });
         CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
               == tensor_op_errc::cache_slot_out_of_range);
+    }
+}
+
+TEST_CASE("paged attention follows block tables and shares kv heads")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+    auto cache = make_kv_cache(*context);
+
+    write_floats(cache.keys(),
+                 { 1.0F, 1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+                   0.0F, 0.0F, 0.0F });
+    write_floats(cache.values(),
+                 { 30.0F, 3.0F, 0.0F, 0.0F, 10.0F, 1.0F, 20.0F, 2.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+                   0.0F, 0.0F, 0.0F });
+
+    auto queries = make_tensor(*context, dtype::f32, { 1, 4 });
+    auto positions = make_tensor(*context, dtype::u32, { 1 });
+    auto block_table = make_tensor(*context, dtype::u32, { 2 });
+    auto table_offsets = make_tensor(*context, dtype::u32, { 1 });
+    auto table_lengths = make_tensor(*context, dtype::u32, { 1 });
+    auto output = make_tensor(*context, dtype::f32, { 1, 4 });
+    write_floats(queries, { 1.0F, 0.0F, 0.0F, 1.0F });
+    write_u32(positions, { 2 });
+    write_u32(block_table, { 1, 0 });
+    write_u32(table_offsets, { 0 });
+    write_u32(table_lengths, { 2 });
+
+    auto attended = paged_attention(*context, queries, positions, block_table, table_offsets,
+                                    table_lengths, 0, 2, cache, output);
+    REQUIRE(attended.has_value());
+
+    const auto exponential = std::exp(1.0F / std::sqrt(2.0F));
+    const auto denominator = 2.0F * exponential + 1.0F;
+    const std::vector<float> expected {
+        (40.0F * exponential + 20.0F) / denominator,
+        (4.0F * exponential + 2.0F) / denominator,
+        (10.0F + 50.0F * exponential) / denominator,
+        (1.0F + 5.0F * exponential) / denominator,
+    };
+
+    const auto result = read_floats(output);
+    REQUIRE(result.size() == expected.size());
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        CHECK(result[index] == doctest::Approx(expected[index]).epsilon(1e-5));
+    }
+}
+
+TEST_CASE("paged attention requires tensor ranks and dtypes")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    SUBCASE("rank")
+    {
+        auto cache = make_kv_cache(*context);
+        auto queries = make_tensor(*context, dtype::f32, { 2 });
+        auto positions = make_tensor(*context, dtype::u32, { 1 });
+        auto table = make_tensor(*context, dtype::u32, { 1 });
+        auto offsets = make_tensor(*context, dtype::u32, { 1 });
+        auto lengths = make_tensor(*context, dtype::u32, { 1 });
+        auto output = make_tensor(*context, dtype::f32, { 1, 2 });
+        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
+                              output)
+                  .error()
+              == tensor_op_errc::invalid_rank);
+    }
+
+    SUBCASE("dtype")
+    {
+        auto cache = make_kv_cache(*context);
+        auto queries = make_tensor(*context, dtype::f32, { 1, 2 });
+        auto positions = make_tensor(*context, dtype::u32, { 1 });
+        auto table = make_tensor(*context, dtype::i32, { 1 });
+        auto offsets = make_tensor(*context, dtype::u32, { 1 });
+        auto lengths = make_tensor(*context, dtype::u32, { 1 });
+        auto output = make_tensor(*context, dtype::f32, { 1, 2 });
+        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
+                              output)
+                  .error()
+              == tensor_op_errc::unsupported_dtype);
+    }
+}
+
+TEST_CASE("paged attention requires one metadata entry per query row")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+    auto cache = make_kv_cache(*context);
+    auto queries = make_tensor(*context, dtype::f32, { 2, 2 });
+    auto table = make_tensor(*context, dtype::u32, { 1 });
+    auto output = make_tensor(*context, dtype::f32, { 2, 2 });
+
+    SUBCASE("positions")
+    {
+        auto positions = make_tensor(*context, dtype::u32, { 1 });
+        auto offsets = make_tensor(*context, dtype::u32, { 2 });
+        auto lengths = make_tensor(*context, dtype::u32, { 2 });
+        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
+                              output)
+                  .error()
+              == tensor_op_errc::position_count_mismatch);
+    }
+
+    SUBCASE("block tables")
+    {
+        auto positions = make_tensor(*context, dtype::u32, { 2 });
+        auto offsets = make_tensor(*context, dtype::u32, { 1 });
+        auto lengths = make_tensor(*context, dtype::u32, { 2 });
+        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
+                              output)
+                  .error()
+              == tensor_op_errc::block_table_metadata_count_mismatch);
+    }
+}
+
+TEST_CASE("paged attention validates query heads against the cache")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+    auto positions = make_tensor(*context, dtype::u32, { 1 });
+    auto table = make_tensor(*context, dtype::u32, { 1 });
+    auto offsets = make_tensor(*context, dtype::u32, { 1 });
+    auto lengths = make_tensor(*context, dtype::u32, { 1 });
+
+    SUBCASE("zero query heads")
+    {
+        auto cache = make_kv_cache(*context);
+        auto queries = make_tensor(*context, dtype::f32, { 1, 2 });
+        auto output = make_tensor(*context, dtype::f32, { 1, 2 });
+        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 0, cache,
+                              output)
+                  .error()
+              == tensor_op_errc::invalid_head_count);
+    }
+
+    SUBCASE("query features")
+    {
+        auto cache = make_kv_cache(*context);
+        auto queries = make_tensor(*context, dtype::f32, { 1, 5 });
+        auto output = make_tensor(*context, dtype::f32, { 1, 5 });
+        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 2, cache,
+                              output)
+                  .error()
+              == tensor_op_errc::invalid_head_dimension);
+    }
+
+    SUBCASE("head dimension")
+    {
+        auto cache = make_kv_cache(*context);
+        auto queries = make_tensor(*context, dtype::f32, { 1, 3 });
+        auto output = make_tensor(*context, dtype::f32, { 1, 3 });
+        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
+                              output)
+                  .error()
+              == tensor_op_errc::cache_head_dimension_mismatch);
+    }
+
+    SUBCASE("grouped query mapping")
+    {
+        auto cache_result = metal_kv_cache::make(*context,
+                                                 {
+                                                     .layer_count = 1,
+                                                     .block_count = 1,
+                                                     .block_size = 1,
+                                                     .kv_head_count = 2,
+                                                     .head_dimension = 2,
+                                                 });
+        REQUIRE(cache_result.has_value());
+        auto cache = std::move(*cache_result);
+        auto queries = make_tensor(*context, dtype::f32, { 1, 6 });
+        auto output = make_tensor(*context, dtype::f32, { 1, 6 });
+        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 3, cache,
+                              output)
+                  .error()
+              == tensor_op_errc::invalid_kv_head_mapping);
+    }
+}
+
+TEST_CASE("paged attention validates output and layer")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+    auto queries = make_tensor(*context, dtype::f32, { 1, 2 });
+    auto positions = make_tensor(*context, dtype::u32, { 1 });
+    auto table = make_tensor(*context, dtype::u32, { 1 });
+    auto offsets = make_tensor(*context, dtype::u32, { 1 });
+    auto lengths = make_tensor(*context, dtype::u32, { 1 });
+
+    SUBCASE("output")
+    {
+        auto cache = make_kv_cache(*context);
+        auto output = make_tensor(*context, dtype::f32, { 2, 1 });
+        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
+                              output)
+                  .error()
+              == tensor_op_errc::output_shape_mismatch);
+    }
+
+    SUBCASE("layer")
+    {
+        auto cache = make_kv_cache(*context);
+        auto output = make_tensor(*context, dtype::f32, { 1, 2 });
+        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 2, 1, cache,
+                              output)
+                  .error()
+              == tensor_op_errc::cache_layer_out_of_range);
+    }
+}
+
+TEST_CASE("paged attention validates block table ranges and ids")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+    auto queries = make_tensor(*context, dtype::f32, { 1, 2 });
+    auto positions = make_tensor(*context, dtype::u32, { 1 });
+    auto offsets = make_tensor(*context, dtype::u32, { 1 });
+    auto lengths = make_tensor(*context, dtype::u32, { 1 });
+    auto output = make_tensor(*context, dtype::f32, { 1, 2 });
+
+    SUBCASE("missing required block")
+    {
+        auto cache = make_kv_cache(*context);
+        auto table = make_tensor(*context, dtype::u32, { 1 });
+        write_u32(positions, { 2 });
+        write_u32(offsets, { 0 });
+        write_u32(lengths, { 1 });
+        write_u32(table, { 0 });
+        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
+                              output)
+                  .error()
+              == tensor_op_errc::block_table_range_out_of_bounds);
+    }
+
+    SUBCASE("range outside flattened table")
+    {
+        auto cache = make_kv_cache(*context);
+        auto table = make_tensor(*context, dtype::u32, { 2 });
+        write_u32(positions, { 0 });
+        write_u32(offsets, { 1 });
+        write_u32(lengths, { 2 });
+        write_u32(table, { 0, 1 });
+        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
+                              output)
+                  .error()
+              == tensor_op_errc::block_table_range_out_of_bounds);
+    }
+
+    SUBCASE("physical block")
+    {
+        auto cache = make_kv_cache(*context);
+        auto table = make_tensor(*context, dtype::u32, { 1 });
+        write_u32(positions, { 0 });
+        write_u32(offsets, { 0 });
+        write_u32(lengths, { 1 });
+        write_u32(table, { 2 });
+        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
+                              output)
+                  .error()
+              == tensor_op_errc::cache_block_out_of_range);
     }
 }

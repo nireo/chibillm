@@ -77,6 +77,17 @@ private:
                                                  std::size_t layer,
                                                  metal_kv_cache& cache);
 
+    friend result<void, tensor_op_errc> paged_attention(const metal_context& context,
+                                                        const metal_tensor& queries,
+                                                        const metal_tensor& positions,
+                                                        const metal_tensor& block_table,
+                                                        const metal_tensor& block_table_offsets,
+                                                        const metal_tensor& block_table_lengths,
+                                                        std::size_t layer,
+                                                        std::size_t query_head_count,
+                                                        const metal_kv_cache& cache,
+                                                        metal_tensor& output);
+
     struct implementation;
 
     explicit metal_context(std::unique_ptr<implementation> implementation) noexcept;
@@ -135,6 +146,24 @@ private:
                                                                   std::size_t feature_count,
                                                                   std::size_t layer,
                                                                   std::size_t slot_count) const;
+
+    [[nodiscard]] result<void, metal_error>
+    dispatch_paged_attention_f32(const metal_buffer& queries,
+                                 const metal_buffer& positions,
+                                 const metal_buffer& block_table,
+                                 const metal_buffer& block_table_offsets,
+                                 const metal_buffer& block_table_lengths,
+                                 const metal_buffer& key_cache,
+                                 const metal_buffer& value_cache,
+                                 metal_buffer& output,
+                                 std::size_t rows,
+                                 std::size_t query_head_count,
+                                 std::size_t kv_head_count,
+                                 std::size_t head_dimension,
+                                 std::size_t block_size,
+                                 std::size_t slot_count,
+                                 std::size_t layer,
+                                 std::size_t block_table_entry_count) const;
 
     std::unique_ptr<implementation> implementation_;
 };

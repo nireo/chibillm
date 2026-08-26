@@ -51,6 +51,7 @@ struct metal_context::implementation {
     id<MTLComputePipelineState> add_f32_pipeline;
     id<MTLComputePipelineState> rope_f32_pipeline;
     id<MTLComputePipelineState> store_kv_f32_pipeline;
+    id<MTLComputePipelineState> paged_attention_f32_pipeline;
     std::string device_name;
 };
 
@@ -245,6 +246,23 @@ metal_context::make(std::string_view shader_source)
                 message_from_error(pipeline_error, "failed to create the store_kv_f32 pipeline")));
         }
 
+        id<MTLFunction> paged_attention_f32 = [library newFunctionWithName:@"paged_attention_f32"];
+        if (paged_attention_f32 == nil) {
+            return fail(
+                make_error(metal_errc::shader_function_not_found,
+                           "the Metal shader library does not contain paged_attention_f32"));
+        }
+
+        pipeline_error = nil;
+        id<MTLComputePipelineState> paged_attention_f32_pipeline =
+            [device newComputePipelineStateWithFunction:paged_attention_f32 error:&pipeline_error];
+        if (paged_attention_f32_pipeline == nil) {
+            return fail(make_error(
+                metal_errc::pipeline_creation_failed,
+                message_from_error(pipeline_error,
+                                   "failed to create the paged_attention_f32 pipeline")));
+        }
+
         const char* device_name = device.name.UTF8String;
         auto implementation = std::make_unique<metal_context::implementation>();
         implementation->device = device;
@@ -258,6 +276,7 @@ metal_context::make(std::string_view shader_source)
         implementation->add_f32_pipeline = add_f32_pipeline;
         implementation->rope_f32_pipeline = rope_f32_pipeline;
         implementation->store_kv_f32_pipeline = store_kv_f32_pipeline;
+        implementation->paged_attention_f32_pipeline = paged_attention_f32_pipeline;
         implementation->device_name = device_name == nullptr ? "unknown Metal device" : device_name;
 
         return metal_context { std::move(implementation) };
@@ -789,6 +808,108 @@ metal_context::dispatch_store_kv_f32(const metal_buffer& keys,
 
         [encoder dispatchThreads:MTLSizeMake(feature_count, rows, 1)
             threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
+        [encoder endEncoding];
+
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return fail(make_error(
+                metal_errc::execution_failed,
+                message_from_error(command_buffer.error, "Metal command execution failed")));
+        }
+
+        return {};
+    }
+}
+
+result<void, metal_error>
+metal_context::dispatch_paged_attention_f32(const metal_buffer& queries,
+                                            const metal_buffer& positions,
+                                            const metal_buffer& block_table,
+                                            const metal_buffer& block_table_offsets,
+                                            const metal_buffer& block_table_lengths,
+                                            const metal_buffer& key_cache,
+                                            const metal_buffer& value_cache,
+                                            metal_buffer& output,
+                                            std::size_t rows,
+                                            std::size_t query_head_count,
+                                            std::size_t kv_head_count,
+                                            std::size_t head_dimension,
+                                            std::size_t block_size,
+                                            std::size_t slot_count,
+                                            std::size_t layer,
+                                            std::size_t block_table_entry_count) const
+{
+    @autoreleasepool {
+        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
+        if (rows > max_shader_dimension
+            || query_head_count > max_shader_dimension
+            || kv_head_count > max_shader_dimension
+            || head_dimension > max_shader_dimension
+            || block_size > max_shader_dimension
+            || slot_count > max_shader_dimension
+            || layer > max_shader_dimension
+            || block_table_entry_count > max_shader_dimension) {
+            return fail(make_error(metal_errc::invalid_input,
+                                   "paged attention dimensions exceed the shader uint range"));
+        }
+
+        const auto max_threads = static_cast<std::size_t>(
+            implementation_->paged_attention_f32_pipeline.maxTotalThreadsPerThreadgroup);
+        if (head_dimension > max_threads) {
+            return fail(make_error(metal_errc::invalid_input,
+                                   "attention head dimension exceeds the threadgroup limit"));
+        }
+
+        const auto shader_rows = static_cast<std::uint32_t>(rows);
+        const auto shader_query_head_count = static_cast<std::uint32_t>(query_head_count);
+        const auto shader_kv_head_count = static_cast<std::uint32_t>(kv_head_count);
+        const auto shader_head_dimension = static_cast<std::uint32_t>(head_dimension);
+        const auto shader_block_size = static_cast<std::uint32_t>(block_size);
+        const auto shader_slot_count = static_cast<std::uint32_t>(slot_count);
+        const auto shader_layer = static_cast<std::uint32_t>(layer);
+        const auto shader_block_table_entry_count =
+            static_cast<std::uint32_t>(block_table_entry_count);
+
+        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
+        if (command_buffer == nil) {
+            return fail(make_error(metal_errc::command_buffer_creation_failed,
+                                   "failed to create a Metal command buffer"));
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return fail(make_error(metal_errc::command_encoder_creation_failed,
+                                   "failed to create a Metal compute encoder"));
+        }
+
+        [encoder setComputePipelineState:implementation_->paged_attention_f32_pipeline];
+        [encoder setBuffer:queries.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:positions.implementation_->buffer offset:0 atIndex:1];
+        [encoder setBuffer:block_table.implementation_->buffer offset:0 atIndex:2];
+        [encoder setBuffer:block_table_offsets.implementation_->buffer offset:0 atIndex:3];
+        [encoder setBuffer:block_table_lengths.implementation_->buffer offset:0 atIndex:4];
+        [encoder setBuffer:key_cache.implementation_->buffer offset:0 atIndex:5];
+        [encoder setBuffer:value_cache.implementation_->buffer offset:0 atIndex:6];
+        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:7];
+        [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:8];
+        [encoder setBytes:&shader_query_head_count
+                   length:sizeof(shader_query_head_count)
+                  atIndex:9];
+        [encoder setBytes:&shader_kv_head_count length:sizeof(shader_kv_head_count) atIndex:10];
+        [encoder setBytes:&shader_head_dimension length:sizeof(shader_head_dimension) atIndex:11];
+        [encoder setBytes:&shader_block_size length:sizeof(shader_block_size) atIndex:12];
+        [encoder setBytes:&shader_slot_count length:sizeof(shader_slot_count) atIndex:13];
+        [encoder setBytes:&shader_layer length:sizeof(shader_layer) atIndex:14];
+        [encoder setBytes:&shader_block_table_entry_count
+                   length:sizeof(shader_block_table_entry_count)
+                  atIndex:15];
+        [encoder setThreadgroupMemoryLength:head_dimension * sizeof(float) atIndex:0];
+        [encoder setThreadgroupMemoryLength:4 * sizeof(float) atIndex:1];
+
+        [encoder dispatchThreadgroups:MTLSizeMake(query_head_count, rows, 1)
+                threadsPerThreadgroup:MTLSizeMake(head_dimension, 1, 1)];
         [encoder endEncoding];
 
         [command_buffer commit];
