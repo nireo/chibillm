@@ -31,6 +31,14 @@ nlohmann_json_dep = dependency(
   fallback: ['nlohmann_json', 'nlohmann_json_dep'],
 )
 
+chibillm_model_format = static_library(
+  'chibillm_model_format',
+  'src/model_format/safetensors.cc',
+  include_directories: src_include,
+  dependencies: nlohmann_json_dep,
+  install: false,
+)
+
 chibillm_core = static_library(
   'chibillm_core',
   [
@@ -59,9 +67,13 @@ chibillm_metal = static_library(
 
 chibillm_qwen = static_library(
   'chibillm_qwen',
-  'src/qwen/qwen_config.cc',
+  [
+    'src/qwen/qwen_config.cc',
+    'src/qwen/qwen_weights.cc',
+  ],
   include_directories: src_include,
   dependencies: nlohmann_json_dep,
+  link_with: chibillm_model_format,
   install: false,
 )
 
@@ -138,6 +150,41 @@ chibillm_qwen_config_tests = executable(
 )
 
 test('chibillm qwen config tests', chibillm_qwen_config_tests)
+
+chibillm_safetensors_tests = executable(
+  'chibillm_safetensors_tests',
+  'tests/safetensors_test.cc',
+  include_directories: [
+    src_include,
+    include_directories('tests'),
+  ],
+  dependencies: [
+    doctest_dep,
+    nlohmann_json_dep,
+  ],
+  link_with: chibillm_model_format,
+)
+
+test('chibillm safetensors tests', chibillm_safetensors_tests)
+
+chibillm_qwen_weights_tests = executable(
+  'chibillm_qwen_weights_tests',
+  'tests/qwen_weights_test.cc',
+  include_directories: [
+    src_include,
+    include_directories('tests'),
+  ],
+  dependencies: [
+    doctest_dep,
+    nlohmann_json_dep,
+  ],
+  link_with: [
+    chibillm_model_format,
+    chibillm_qwen,
+  ],
+)
+
+test('chibillm qwen weights tests', chibillm_qwen_weights_tests)
 
 metal_shader_path = join_paths(
   meson.project_source_root(),
