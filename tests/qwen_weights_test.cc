@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <fstream>
@@ -16,6 +17,7 @@
 #include "model_format/safetensors.h"
 #include "qwen/qwen_config.h"
 #include "qwen/qwen_embedding.h"
+#include "qwen/qwen_layer.h"
 #include "qwen/qwen_weights.h"
 #include "safetensors_test_support.h"
 #include "tensor/bf16.h"
@@ -24,6 +26,8 @@ using chibillm::bf16;
 using chibillm::embed_qwen_tokens;
 using chibillm::load_qwen_weights;
 using chibillm::metal_context;
+using chibillm::metal_tensor;
+using chibillm::project_qwen_qkv;
 using chibillm::qwen_config;
 using chibillm::qwen_weights_errc;
 using chibillm::safetensors_file;
@@ -108,6 +112,29 @@ load_shader_source()
 {
     std::ifstream input(CHIBILLM_SHADER_PATH);
     return { std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>() };
+}
+
+void
+write_bf16(metal_tensor& tensor, const std::vector<float>& values)
+{
+    std::vector<std::uint16_t> bits;
+    bits.reserve(values.size());
+    for (const auto value : values) {
+        bits.push_back(bf16::from_float(value).bits());
+    }
+    REQUIRE(tensor.buffer().size_bytes() == bits.size() * sizeof(std::uint16_t));
+    std::memcpy(tensor.buffer().bytes().data(), bits.data(), tensor.buffer().size_bytes());
+}
+
+void
+check_floats(const metal_tensor& tensor, const std::vector<float>& expected)
+{
+    std::vector<float> values(tensor.descriptor().element_count());
+    REQUIRE(values.size() == expected.size());
+    std::memcpy(values.data(), tensor.buffer().bytes().data(), tensor.buffer().size_bytes());
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        CHECK(values[index] == doctest::Approx(expected[index]));
+    }
 }
 
 } // namespace
@@ -230,4 +257,43 @@ TEST_CASE("Qwen token embedding produces hidden-state rows")
                 hidden_states->buffer().size_bytes());
     const std::vector<float> expected { 20.0F, 21.0F, 22.0F, 23.0F, 0.0F, 1.0F, 2.0F, 3.0F };
     CHECK(values == expected);
+}
+
+TEST_CASE("Qwen layer input produces normalized query key and value projections")
+{
+    const auto config = test_config();
+    auto file = write_weights(expected_tensors(config), "chibillm_qwen_qkv.safetensors");
+    auto safetensors = safetensors_file::open(file.path());
+    REQUIRE(safetensors.has_value());
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+    auto weights = load_qwen_weights(*context, *safetensors, config);
+    REQUIRE(weights.has_value());
+
+    std::vector<float> embeddings(config.vocabulary_size * config.hidden_size, 0.0F);
+    embeddings[4] = 1.0F;
+    embeddings[5] = 2.0F;
+    embeddings[6] = 3.0F;
+    embeddings[7] = 4.0F;
+    write_bf16(weights->token_embedding, embeddings);
+    write_bf16(weights->layers[0].input_norm, { 1.0F, 1.0F, 1.0F, 1.0F });
+    write_bf16(weights->layers[0].query,
+               { 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F,
+                 0.0F, 1.0F });
+    write_bf16(weights->layers[0].key, { 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F });
+    write_bf16(weights->layers[0].value, { 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F });
+
+    const std::vector<chibillm::token_id> tokens { 1 };
+    auto hidden_states = embed_qwen_tokens(*context, *weights, tokens);
+    REQUIRE(hidden_states.has_value());
+    auto qkv = project_qwen_qkv(*context, config, weights->layers[0], *hidden_states);
+    REQUIRE(qkv.has_value());
+
+    const auto scale = 1.0F / std::sqrt(7.5F + config.rms_epsilon);
+    const std::vector<float> expected_query { scale, 2.0F * scale, 3.0F * scale, 4.0F * scale };
+    const std::vector<float> expected_key { scale, 2.0F * scale };
+    const std::vector<float> expected_value { 3.0F * scale, 4.0F * scale };
+    check_floats(qkv->query, expected_query);
+    check_floats(qkv->key, expected_key);
+    check_floats(qkv->value, expected_value);
 }
