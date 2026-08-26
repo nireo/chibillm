@@ -73,7 +73,10 @@ chibillm_qwen = static_library(
   ],
   include_directories: src_include,
   dependencies: nlohmann_json_dep,
-  link_with: chibillm_model_format,
+  link_with: [
+    chibillm_model_format,
+    chibillm_metal,
+  ],
   install: false,
 )
 
@@ -167,6 +170,12 @@ chibillm_safetensors_tests = executable(
 
 test('chibillm safetensors tests', chibillm_safetensors_tests)
 
+metal_shader_path = join_paths(
+  meson.project_source_root(),
+  'shaders',
+  'tensor_ops.metal',
+)
+
 chibillm_qwen_weights_tests = executable(
   'chibillm_qwen_weights_tests',
   'tests/qwen_weights_test.cc',
@@ -174,23 +183,22 @@ chibillm_qwen_weights_tests = executable(
     src_include,
     include_directories('tests'),
   ],
+  cpp_args: [
+    '-DCHIBILLM_SHADER_PATH="' + metal_shader_path + '"',
+  ],
   dependencies: [
     doctest_dep,
+    metal_framework_dep,
     nlohmann_json_dep,
   ],
   link_with: [
     chibillm_model_format,
+    chibillm_metal,
     chibillm_qwen,
   ],
 )
 
 test('chibillm qwen weights tests', chibillm_qwen_weights_tests)
-
-metal_shader_path = join_paths(
-  meson.project_source_root(),
-  'shaders',
-  'tensor_ops.metal',
-)
 
 chibillm_metal_tests = executable(
   'chibillm_metal_tests',

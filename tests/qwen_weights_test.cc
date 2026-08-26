@@ -3,16 +3,22 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstddef>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "metal/metal_context.h"
 #include "model_format/safetensors.h"
 #include "qwen/qwen_config.h"
 #include "qwen/qwen_weights.h"
 #include "safetensors_test_support.h"
 
+using chibillm::load_qwen_weights;
+using chibillm::metal_context;
 using chibillm::qwen_config;
 using chibillm::qwen_weights_errc;
 using chibillm::safetensors_file;
@@ -81,11 +87,22 @@ write_weights(std::vector<tensor_spec> tensors, std::string filename)
 {
     nlohmann::json header;
     std::vector<std::byte> data;
+    std::byte value { 1 };
     for (auto& tensor : tensors) {
+        const auto begin = data.size();
         safetensors_test::add_tensor(header, data, std::move(tensor.name), std::move(tensor.dtype),
                                      std::move(tensor.shape));
+        std::fill(data.begin() + static_cast<std::ptrdiff_t>(begin), data.end(), value);
+        value = static_cast<std::byte>(std::to_integer<unsigned int>(value) + 1);
     }
     return temporary_file(std::move(filename), header, data);
+}
+
+std::string
+load_shader_source()
+{
+    std::ifstream input(CHIBILLM_SHADER_PATH);
+    return { std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>() };
 }
 
 } // namespace
@@ -145,4 +162,33 @@ TEST_CASE("Qwen weight validation reports incompatible manifests")
         CHECK(validate_qwen_weights(*weights, config).error()
               == qwen_weights_errc::unexpected_tensor_count);
     }
+}
+
+TEST_CASE("Qwen weights are loaded into resident Metal tensors")
+{
+    const auto config = test_config();
+    auto file = write_weights(expected_tensors(config), "chibillm_qwen_weights_load.safetensors");
+    auto safetensors = safetensors_file::open(file.path());
+    REQUIRE(safetensors.has_value());
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto weights = load_qwen_weights(*context, *safetensors, config);
+    REQUIRE(weights.has_value());
+    CHECK(weights->layers.size() == config.layer_count);
+    const std::vector<std::size_t> embedding_shape { config.vocabulary_size, config.hidden_size };
+    CHECK(std::ranges::equal(weights->token_embedding.descriptor().shape().dimensions(),
+                             embedding_shape));
+    const std::vector<std::size_t> query_shape { config.query_width(), config.hidden_size };
+    CHECK(std::ranges::equal(weights->layers[0].query.descriptor().shape().dimensions(),
+                             query_shape));
+
+    const auto embedding = weights->token_embedding.buffer().bytes();
+    REQUIRE_FALSE(embedding.empty());
+    CHECK(std::all_of(embedding.begin(), embedding.end(),
+                      [](std::byte byte) { return byte == std::byte { 1 }; }));
+
+    const auto first_layer_input_norm = weights->layers[0].input_norm.buffer().bytes();
+    CHECK(std::all_of(first_layer_input_norm.begin(), first_layer_input_norm.end(),
+                      [](std::byte byte) { return byte == std::byte { 4 }; }));
 }
