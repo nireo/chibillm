@@ -4,8 +4,6 @@
 #include <vector>
 
 #include "tensor/dtype.h"
-#include "tensor/tensor_descriptor.h"
-#include "tensor/tensor_shape.h"
 
 namespace chibillm {
 
@@ -28,30 +26,22 @@ metal_kv_cache::make(const metal_context& context, kv_cache_config config)
         return fail(kv_cache_errc::invalid_head_dimension);
     }
 
-    auto shape = tensor_shape::make({
-        config.layer_count,
-        config.block_count,
-        config.block_size,
-        config.kv_head_count,
-        config.head_dimension,
-    });
-    if (!shape) {
-        return fail(kv_cache_errc::layout_size_overflow);
-    }
-
-    auto descriptor = tensor_descriptor::make(dtype::f32, std::move(*shape));
-    if (!descriptor) {
-        return fail(kv_cache_errc::layout_size_overflow);
-    }
-
-    auto keys = metal_tensor::make(context, *descriptor);
+    std::vector<std::size_t> dimensions {
+        config.layer_count,   config.block_count,    config.block_size,
+        config.kv_head_count, config.head_dimension,
+    };
+    auto keys = metal_tensor::make(context, dtype::f32, dimensions);
     if (!keys) {
-        return fail(kv_cache_errc::allocation_failed);
+        return fail(keys.error() == metal_tensor_errc::invalid_descriptor
+                        ? kv_cache_errc::layout_size_overflow
+                        : kv_cache_errc::allocation_failed);
     }
 
-    auto values = metal_tensor::make(context, std::move(*descriptor));
+    auto values = metal_tensor::make(context, dtype::f32, std::move(dimensions));
     if (!values) {
-        return fail(kv_cache_errc::allocation_failed);
+        return fail(values.error() == metal_tensor_errc::invalid_descriptor
+                        ? kv_cache_errc::layout_size_overflow
+                        : kv_cache_errc::allocation_failed);
     }
 
     return metal_kv_cache {

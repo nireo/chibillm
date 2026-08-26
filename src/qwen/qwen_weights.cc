@@ -100,17 +100,11 @@ load_tensor(const metal_context& context, const safetensors_file& file, std::str
         return fail(qwen_weights_errc::missing_tensor);
     }
 
-    auto shape = tensor_shape::make(info->shape);
-    if (!shape) {
-        return fail(qwen_weights_errc::tensor_creation_failed);
-    }
-    auto descriptor = tensor_descriptor::make(dtype::bf16, std::move(*shape));
-    if (!descriptor) {
-        return fail(qwen_weights_errc::tensor_creation_failed);
-    }
-    auto tensor = metal_tensor::make(context, std::move(*descriptor));
+    auto tensor = metal_tensor::make(context, dtype::bf16, info->shape);
     if (!tensor) {
-        return fail(qwen_weights_errc::metal_allocation_failed);
+        return fail(tensor.error() == metal_tensor_errc::invalid_descriptor
+                        ? qwen_weights_errc::tensor_creation_failed
+                        : qwen_weights_errc::metal_allocation_failed);
     }
     if (!file.read(name, tensor->buffer().bytes())) {
         return fail(qwen_weights_errc::tensor_read_failed);

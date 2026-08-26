@@ -16,9 +16,7 @@
 #include "metal/metal_tensor.h"
 #include "tensor/bf16.h"
 #include "tensor/dtype.h"
-#include "tensor/tensor_descriptor.h"
 #include "tensor/tensor_ops.h"
-#include "tensor/tensor_shape.h"
 
 using chibillm::add;
 using chibillm::bf16;
@@ -34,9 +32,7 @@ using chibillm::rms_norm;
 using chibillm::rope;
 using chibillm::silu_mul;
 using chibillm::store_kv;
-using chibillm::tensor_descriptor;
 using chibillm::tensor_op_errc;
-using chibillm::tensor_shape;
 
 namespace {
 
@@ -53,13 +49,7 @@ load_shader_source()
 metal_tensor
 make_tensor(const metal_context& context, dtype type, std::vector<std::size_t> dimensions)
 {
-    auto shape = tensor_shape::make(std::move(dimensions));
-    REQUIRE(shape.has_value());
-
-    auto descriptor = tensor_descriptor::make(type, std::move(*shape));
-    REQUIRE(descriptor.has_value());
-
-    auto tensor = metal_tensor::make(context, std::move(*descriptor));
+    auto tensor = metal_tensor::make(context, type, std::move(dimensions));
     REQUIRE(tensor.has_value());
     return std::move(*tensor);
 }

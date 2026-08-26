@@ -19,6 +19,7 @@
 #include "qwen/qwen_config.h"
 #include "qwen/qwen_embedding.h"
 #include "qwen/qwen_layer.h"
+#include "qwen/qwen_output.h"
 #include "qwen/qwen_weights.h"
 #include "safetensors_test_support.h"
 #include "tensor/bf16.h"
@@ -39,6 +40,7 @@ using chibillm::run_qwen_attention;
 using chibillm::run_qwen_layers;
 using chibillm::run_qwen_mlp;
 using chibillm::safetensors_file;
+using chibillm::sample_qwen_greedy;
 using chibillm::validate_qwen_weights;
 using safetensors_test::temporary_file;
 
@@ -272,6 +274,44 @@ TEST_CASE("Qwen token embedding produces hidden-state rows")
                 hidden_states->buffer().size_bytes());
     const std::vector<float> expected { 20.0F, 21.0F, 22.0F, 23.0F, 0.0F, 1.0F, 2.0F, 3.0F };
     CHECK(values == expected);
+}
+
+TEST_CASE("Qwen output selects requested rows and samples their largest logits")
+{
+    const auto config = test_config();
+    auto file = write_weights(expected_tensors(config), "chibillm_qwen_output.safetensors");
+    auto safetensors = safetensors_file::open(file.path());
+    REQUIRE(safetensors.has_value());
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+    auto weights = load_qwen_weights(*context, *safetensors, config);
+    REQUIRE(weights.has_value());
+
+    std::vector<float> embeddings(config.vocabulary_size * config.hidden_size, 0.0F);
+    embeddings[0] = 1.0F;
+    embeddings[5] = 1.0F;
+    embeddings[10] = 1.0F;
+    write_bf16(weights->token_embedding, embeddings);
+    write_bf16(weights->final_norm, std::vector<float>(config.hidden_size, 1.0F));
+
+    std::vector<float> output(config.vocabulary_size * config.hidden_size, 0.0F);
+    output[3 * config.hidden_size] = 2.0F;
+    output[5 * config.hidden_size + 2] = 2.0F;
+    write_bf16(weights->output, output);
+
+    const std::vector<chibillm::token_id> input_tokens { 0, 1, 2 };
+    auto hidden_states = embed_qwen_tokens(*context, *weights, input_tokens);
+    REQUIRE(hidden_states.has_value());
+
+    const std::vector<std::size_t> logits_indices { 2, 0 };
+    auto sampled = sample_qwen_greedy(*context, config, *weights, *hidden_states, logits_indices);
+    REQUIRE(sampled.has_value());
+    CHECK(*sampled == std::vector<chibillm::token_id> { 5, 3 });
+
+    const std::vector<std::size_t> invalid_indices { input_tokens.size() };
+    auto invalid = sample_qwen_greedy(*context, config, *weights, *hidden_states, invalid_indices);
+    REQUIRE_FALSE(invalid.has_value());
+    CHECK(invalid.error() == chibillm::qwen_output_errc::logits_index_out_of_range);
 }
 
 TEST_CASE("Qwen layer input produces normalized query key and value projections")

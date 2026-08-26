@@ -5,27 +5,25 @@
 #include <vector>
 
 #include "tensor/dtype.h"
-#include "tensor/tensor_descriptor.h"
 #include "tensor/tensor_ops.h"
-#include "tensor/tensor_shape.h"
 
 namespace chibillm {
 namespace {
 
+qwen_layer_errc
+tensor_error(metal_tensor_errc error)
+{
+    return error == metal_tensor_errc::invalid_descriptor
+        ? qwen_layer_errc::tensor_creation_failed
+        : qwen_layer_errc::metal_allocation_failed;
+}
+
 result<metal_tensor, qwen_layer_errc>
 make_tensor(const metal_context& context, dtype type, std::vector<std::size_t> dimensions)
 {
-    auto shape = tensor_shape::make(std::move(dimensions));
-    if (!shape) {
-        return fail(qwen_layer_errc::tensor_creation_failed);
-    }
-    auto descriptor = tensor_descriptor::make(type, std::move(*shape));
-    if (!descriptor) {
-        return fail(qwen_layer_errc::tensor_creation_failed);
-    }
-    auto tensor = metal_tensor::make(context, std::move(*descriptor));
+    auto tensor = metal_tensor::make(context, type, std::move(dimensions));
     if (!tensor) {
-        return fail(qwen_layer_errc::metal_allocation_failed);
+        return fail(tensor_error(tensor.error()));
     }
     return std::move(*tensor);
 }
