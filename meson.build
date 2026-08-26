@@ -73,6 +73,7 @@ chibillm_qwen = static_library(
     'src/qwen/qwen_layer.cc',
     'src/qwen/qwen_model_runner.cc',
     'src/qwen/qwen_output.cc',
+    'src/qwen/qwen_tokenizer.cc',
     'src/qwen/qwen_weights.cc',
   ],
   include_directories: src_include,
@@ -89,7 +90,15 @@ executable(
   'chibillm',
   'src/main.cpp',
   include_directories: src_include,
-  link_with: chibillm_core,
+  cpp_args: [
+    '-DCHIBILLM_SHADER_PATH="' + join_paths(
+      meson.project_source_root(),
+      'shaders',
+      'tensor_ops.metal',
+    ) + '"',
+  ],
+  dependencies: metal_framework_dep,
+  link_with: chibillm_qwen,
   install: true,
 )
 
@@ -158,6 +167,20 @@ chibillm_qwen_config_tests = executable(
 )
 
 test('chibillm qwen config tests', chibillm_qwen_config_tests)
+
+chibillm_qwen_tokenizer_tests = executable(
+  'chibillm_qwen_tokenizer_tests',
+  'tests/qwen_tokenizer_test.cc',
+  include_directories: src_include,
+  dependencies: [
+    doctest_dep,
+    metal_framework_dep,
+    nlohmann_json_dep,
+  ],
+  link_with: chibillm_qwen,
+)
+
+test('chibillm qwen tokenizer tests', chibillm_qwen_tokenizer_tests)
 
 chibillm_safetensors_tests = executable(
   'chibillm_safetensors_tests',
