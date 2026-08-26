@@ -27,6 +27,7 @@ using chibillm::embed_qwen_tokens;
 using chibillm::load_qwen_weights;
 using chibillm::metal_context;
 using chibillm::metal_tensor;
+using chibillm::normalize_qwen_qk;
 using chibillm::project_qwen_qkv;
 using chibillm::qwen_config;
 using chibillm::qwen_weights_errc;
@@ -282,6 +283,8 @@ TEST_CASE("Qwen layer input produces normalized query key and value projections"
                  0.0F, 1.0F });
     write_bf16(weights->layers[0].key, { 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F });
     write_bf16(weights->layers[0].value, { 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F });
+    write_bf16(weights->layers[0].query_norm, { 1.0F, 1.0F });
+    write_bf16(weights->layers[0].key_norm, { 1.0F, 1.0F });
 
     const std::vector<chibillm::token_id> tokens { 1 };
     auto hidden_states = embed_qwen_tokens(*context, *weights, tokens);
@@ -296,4 +299,19 @@ TEST_CASE("Qwen layer input produces normalized query key and value projections"
     check_floats(qkv->query, expected_query);
     check_floats(qkv->key, expected_key);
     check_floats(qkv->value, expected_value);
+
+    auto normalized = normalize_qwen_qk(*context, config, weights->layers[0], std::move(*qkv));
+    REQUIRE(normalized.has_value());
+    const auto normalize_pair = [&](float first, float second) {
+        const auto inverse_rms =
+            1.0F / std::sqrt((first * first + second * second) / 2.0F + config.rms_epsilon);
+        return std::vector<float> { first * inverse_rms, second * inverse_rms };
+    };
+    const auto first_query_head = normalize_pair(scale, 2.0F * scale);
+    const auto second_query_head = normalize_pair(3.0F * scale, 4.0F * scale);
+    check_floats(
+        normalized->query,
+        { first_query_head[0], first_query_head[1], second_query_head[0], second_query_head[1] });
+    check_floats(normalized->key, first_query_head);
+    check_floats(normalized->value, expected_value);
 }

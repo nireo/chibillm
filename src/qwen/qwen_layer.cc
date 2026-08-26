@@ -85,4 +85,36 @@ project_qwen_qkv(const metal_context& context,
     return qwen_qkv { std::move(*query), std::move(*key), std::move(*value) };
 }
 
+result<qwen_qkv, qwen_layer_errc>
+normalize_qwen_qk(const metal_context& context,
+                  const qwen_config& config,
+                  const qwen_layer_weights& weights,
+                  qwen_qkv qkv)
+{
+    const auto& query_shape = qkv.query.descriptor().shape();
+    if (query_shape.rank() != 2) {
+        return fail(qwen_layer_errc::invalid_input);
+    }
+
+    const auto rows = query_shape.dimensions()[0];
+    auto query = make_tensor(context, rows, config.query_width());
+    auto key = make_tensor(context, rows, config.kv_width());
+    if (!query)
+        return fail(query.error());
+    if (!key)
+        return fail(key.error());
+
+    auto operation =
+        rms_norm_heads(context, qkv.query, weights.query_norm, config.rms_epsilon, *query);
+    if (!operation) {
+        return fail(operation_error(operation.error()));
+    }
+    operation = rms_norm_heads(context, qkv.key, weights.key_norm, config.rms_epsilon, *key);
+    if (!operation) {
+        return fail(operation_error(operation.error()));
+    }
+
+    return qwen_qkv { std::move(*query), std::move(*key), std::move(qkv.value) };
+}
+
 } // namespace chibillm

@@ -59,6 +59,13 @@ enum class tensor_op_errc : std::uint8_t {
                                                     float epsilon,
                                                     metal_tensor& output);
 
+// normalizes each contiguous head using one shared head-dimension weight.
+[[nodiscard]] result<void, tensor_op_errc> rms_norm_heads(const metal_context& context,
+                                                          const metal_tensor& input,
+                                                          const metal_tensor& weight,
+                                                          float epsilon,
+                                                          metal_tensor& output);
+
 // applies silu to gate and multiplies it elementwise by up.
 [[nodiscard]] result<void, tensor_op_errc> silu_mul(const metal_context& context,
                                                     const metal_tensor& gate,

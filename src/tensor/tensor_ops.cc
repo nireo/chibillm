@@ -184,6 +184,50 @@ rms_norm(const metal_context& context,
 }
 
 result<void, tensor_op_errc>
+rms_norm_heads(const metal_context& context,
+               const metal_tensor& input,
+               const metal_tensor& weight,
+               float epsilon,
+               metal_tensor& output)
+{
+    const auto& input_shape = input.descriptor().shape();
+    const auto& weight_shape = weight.descriptor().shape();
+    const auto& output_shape = output.descriptor().shape();
+
+    if (input_shape.rank() != 2 || weight_shape.rank() != 1 || output_shape.rank() != 2) {
+        return fail(tensor_op_errc::invalid_rank);
+    }
+    if (input.descriptor().type() != dtype::f32
+        || weight.descriptor().type() != dtype::bf16
+        || output.descriptor().type() != dtype::f32) {
+        return fail(tensor_op_errc::unsupported_dtype);
+    }
+    if (input_shape.dimensions()[0] != output_shape.dimensions()[0]
+        || input_shape.dimensions()[1] != output_shape.dimensions()[1]) {
+        return fail(tensor_op_errc::output_shape_mismatch);
+    }
+
+    const auto rows = input_shape.dimensions()[0];
+    const auto width = input_shape.dimensions()[1];
+    const auto head_dimension = weight_shape.dimensions()[0];
+    if (width % head_dimension != 0) {
+        return fail(tensor_op_errc::invalid_head_dimension);
+    }
+    if (!std::isfinite(epsilon) || epsilon <= 0.0F) {
+        return fail(tensor_op_errc::invalid_epsilon);
+    }
+
+    const auto head_count = width / head_dimension;
+    const auto dispatched =
+        context.dispatch_rms_norm_bf16(input.buffer(), weight.buffer(), output.buffer(),
+                                       rows * head_count, head_dimension, epsilon);
+    if (!dispatched) {
+        return fail(tensor_op_errc::backend_failure);
+    }
+    return {};
+}
+
+result<void, tensor_op_errc>
 silu_mul(const metal_context& context,
          const metal_tensor& gate,
          const metal_tensor& up,

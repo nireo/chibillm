@@ -53,6 +53,12 @@ private:
                                                  float epsilon,
                                                  metal_tensor& output);
 
+    friend result<void, tensor_op_errc> rms_norm_heads(const metal_context& context,
+                                                       const metal_tensor& input,
+                                                       const metal_tensor& weight,
+                                                       float epsilon,
+                                                       metal_tensor& output);
+
     friend result<void, tensor_op_errc> silu_mul(const metal_context& context,
                                                  const metal_tensor& gate,
                                                  const metal_tensor& up,

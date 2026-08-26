@@ -28,4 +28,9 @@ struct qwen_qkv {
                                                                  const qwen_layer_weights& weights,
                                                                  const metal_tensor& hidden_states);
 
+[[nodiscard]] result<qwen_qkv, qwen_layer_errc> normalize_qwen_qk(const metal_context& context,
+                                                                  const qwen_config& config,
+                                                                  const qwen_layer_weights& weights,
+                                                                  qwen_qkv qkv);
+
 } // namespace chibillm
