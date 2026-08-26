@@ -18,6 +18,8 @@ build/chibillm /path/to/qwen-model
 ```
 
 Inside the chat, use `/reset` to clear conversation history and `/quit` to exit.
+After each response, a `[perf]` line reports time to first token, approximate prefill
+throughput, decode throughput, and total generation time.
 
 Run the tests with:
 

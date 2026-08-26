@@ -1,7 +1,9 @@
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
 #include <span>
@@ -45,7 +47,15 @@ enum class chat_errc {
     generation_failed
 };
 
-result<std::string, chat_errc>
+struct generation_result {
+    std::string text;
+    std::size_t prompt_tokens;
+    std::size_t output_tokens;
+    double time_to_first_token;
+    double total_time;
+};
+
+result<generation_result, chat_errc>
 generate(chibillm::qwen_model_runner& runner,
          const qwen_tokenizer& tokenizer,
          std::span<const chat_message> history)
@@ -71,6 +81,7 @@ generate(chibillm::qwen_model_runner& runner,
         return chibillm::fail(chat_errc::generation_failed);
     }
 
+    const auto prompt_tokens = prompt->size();
     const auto token_budget = std::min(max_new_tokens, max_context_tokens - prompt->size());
     auto sequence = chibillm::seq::make(1, std::move(*prompt),
                                         {
@@ -82,21 +93,64 @@ generate(chibillm::qwen_model_runner& runner,
     if (!sequence || !engine->add(std::move(*sequence))) {
         return chibillm::fail(chat_errc::generation_failed);
     }
+
+    using clock = std::chrono::steady_clock;
+    const auto started = clock::now();
+    auto first_token = started;
+    bool produced_token = false;
     while (!engine->is_finished()) {
         if (!engine->step()) {
             return chibillm::fail(chat_errc::generation_failed);
         }
+        const auto* current = engine->find_sequence(1);
+        if (!produced_token && current != nullptr && current->completion_token_count() != 0) {
+            first_token = clock::now();
+            produced_token = true;
+        }
     }
+    const auto finished_at = clock::now();
 
     const auto* finished = engine->find_sequence(1);
-    if (finished == nullptr) {
+    if (finished == nullptr || !produced_token) {
         return chibillm::fail(chat_errc::generation_failed);
     }
     auto response = tokenizer.decode(finished->completion_tokens());
     if (!response) {
         return chibillm::fail(chat_errc::generation_failed);
     }
-    return std::move(*response);
+    return generation_result {
+        .text = std::move(*response),
+        .prompt_tokens = prompt_tokens,
+        .output_tokens = finished->completion_token_count(),
+        .time_to_first_token = std::chrono::duration<double>(first_token - started).count(),
+        .total_time = std::chrono::duration<double>(finished_at - started).count(),
+    };
+}
+
+void
+print_performance(const generation_result& result)
+{
+    const auto prefill_rate = result.prompt_tokens / result.time_to_first_token;
+    const auto decode_tokens = result.output_tokens - 1;
+    const auto decode_time = result.total_time - result.time_to_first_token;
+    const auto decode_rate = decode_time > 0.0 ? decode_tokens / decode_time : 0.0;
+
+    std::cerr
+        << std::fixed
+        << std::setprecision(2)
+        << "[perf] prompt "
+        << result.prompt_tokens
+        << " tok | output "
+        << result.output_tokens
+        << " tok | first "
+        << result.time_to_first_token
+        << " s | prefill "
+        << prefill_rate
+        << " tok/s | decode "
+        << decode_rate
+        << " tok/s | total "
+        << result.total_time
+        << " s\n";
 }
 
 std::string
@@ -127,12 +181,21 @@ main(int argc, char** argv)
         std::cerr << "failed to load Metal shaders\n";
         return 1;
     }
+    const auto load_started = std::chrono::steady_clock::now();
     auto runner =
         qwen_model_runner::make(model_directory, shader_source, kv_block_count, kv_block_size);
     if (!runner) {
         std::cerr << "failed to load Qwen from " << model_directory << '\n';
         return 1;
     }
+    const auto load_time =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - load_started).count();
+    std::cerr
+        << std::fixed
+        << std::setprecision(2)
+        << "[perf] model loaded in "
+        << load_time
+        << " s\n";
 
     std::vector<chat_message> history;
     std::cout << "chibillm chat — /reset clears history, /quit exits\n";
@@ -162,8 +225,9 @@ main(int argc, char** argv)
             continue;
         }
 
-        std::cout << "qwen> " << *response << '\n';
-        history.push_back({ "assistant", std::move(*response) });
+        std::cout << "qwen> " << response->text << '\n';
+        print_performance(*response);
+        history.push_back({ "assistant", std::move(response->text) });
     }
     return 0;
 }
