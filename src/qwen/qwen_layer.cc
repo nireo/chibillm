@@ -1,6 +1,8 @@
 #include "qwen/qwen_layer.h"
 
+#include <cstring>
 #include <utility>
+#include <vector>
 
 #include "tensor/dtype.h"
 #include "tensor/tensor_descriptor.h"
@@ -11,13 +13,13 @@ namespace chibillm {
 namespace {
 
 result<metal_tensor, qwen_layer_errc>
-make_tensor(const metal_context& context, std::size_t rows, std::size_t columns)
+make_tensor(const metal_context& context, dtype type, std::vector<std::size_t> dimensions)
 {
-    auto shape = tensor_shape::make({ rows, columns });
+    auto shape = tensor_shape::make(std::move(dimensions));
     if (!shape) {
         return fail(qwen_layer_errc::tensor_creation_failed);
     }
-    auto descriptor = tensor_descriptor::make(dtype::f32, std::move(*shape));
+    auto descriptor = tensor_descriptor::make(type, std::move(*shape));
     if (!descriptor) {
         return fail(qwen_layer_errc::tensor_creation_failed);
     }
@@ -51,10 +53,10 @@ project_qwen_qkv(const metal_context& context,
     }
 
     const auto rows = shape.dimensions()[0];
-    auto normalized = make_tensor(context, rows, config.hidden_size);
-    auto query = make_tensor(context, rows, config.query_width());
-    auto key = make_tensor(context, rows, config.kv_width());
-    auto value = make_tensor(context, rows, config.kv_width());
+    auto normalized = make_tensor(context, dtype::f32, { rows, config.hidden_size });
+    auto query = make_tensor(context, dtype::f32, { rows, config.query_width() });
+    auto key = make_tensor(context, dtype::f32, { rows, config.kv_width() });
+    auto value = make_tensor(context, dtype::f32, { rows, config.kv_width() });
     if (!normalized)
         return fail(normalized.error());
     if (!query)
@@ -97,8 +99,8 @@ normalize_qwen_qk(const metal_context& context,
     }
 
     const auto rows = query_shape.dimensions()[0];
-    auto query = make_tensor(context, rows, config.query_width());
-    auto key = make_tensor(context, rows, config.kv_width());
+    auto query = make_tensor(context, dtype::f32, { rows, config.query_width() });
+    auto key = make_tensor(context, dtype::f32, { rows, config.kv_width() });
     if (!query)
         return fail(query.error());
     if (!key)
@@ -110,6 +112,42 @@ normalize_qwen_qk(const metal_context& context,
         return fail(operation_error(operation.error()));
     }
     operation = rms_norm_heads(context, qkv.key, weights.key_norm, config.rms_epsilon, *key);
+    if (!operation) {
+        return fail(operation_error(operation.error()));
+    }
+
+    return qwen_qkv { std::move(*query), std::move(*key), std::move(qkv.value) };
+}
+
+result<qwen_qkv, qwen_layer_errc>
+apply_qwen_rope(const metal_context& context,
+                const qwen_config& config,
+                qwen_qkv qkv,
+                std::span<const std::uint32_t> positions)
+{
+    if (positions.empty()) {
+        return fail(qwen_layer_errc::invalid_input);
+    }
+
+    const auto rows = positions.size();
+    auto position_tensor = make_tensor(context, dtype::u32, { rows });
+    auto query = make_tensor(context, dtype::f32, { rows, config.query_width() });
+    auto key = make_tensor(context, dtype::f32, { rows, config.kv_width() });
+    if (!position_tensor)
+        return fail(position_tensor.error());
+    if (!query)
+        return fail(query.error());
+    if (!key)
+        return fail(key.error());
+
+    std::memcpy(position_tensor->buffer().bytes().data(), positions.data(), positions.size_bytes());
+    auto operation = rope(context, qkv.query, *position_tensor, config.query_head_count,
+                          config.rope_theta, *query);
+    if (!operation) {
+        return fail(operation_error(operation.error()));
+    }
+    operation =
+        rope(context, qkv.key, *position_tensor, config.kv_head_count, config.rope_theta, *key);
     if (!operation) {
         return fail(operation_error(operation.error()));
     }

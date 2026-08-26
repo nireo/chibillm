@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 
 #include "metal/metal_context.h"
 #include "metal/metal_tensor.h"
@@ -32,5 +33,11 @@ struct qwen_qkv {
                                                                   const qwen_config& config,
                                                                   const qwen_layer_weights& weights,
                                                                   qwen_qkv qkv);
+
+[[nodiscard]] result<qwen_qkv, qwen_layer_errc>
+apply_qwen_rope(const metal_context& context,
+                const qwen_config& config,
+                qwen_qkv qkv,
+                std::span<const std::uint32_t> positions);
 
 } // namespace chibillm

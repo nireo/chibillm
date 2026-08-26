@@ -22,6 +22,7 @@
 #include "safetensors_test_support.h"
 #include "tensor/bf16.h"
 
+using chibillm::apply_qwen_rope;
 using chibillm::bf16;
 using chibillm::embed_qwen_tokens;
 using chibillm::load_qwen_weights;
@@ -314,4 +315,21 @@ TEST_CASE("Qwen layer input produces normalized query key and value projections"
         { first_query_head[0], first_query_head[1], second_query_head[0], second_query_head[1] });
     check_floats(normalized->key, first_query_head);
     check_floats(normalized->value, expected_value);
+
+    const std::vector<std::uint32_t> positions { 1 };
+    auto rotated = apply_qwen_rope(*context, config, std::move(*normalized), positions);
+    REQUIRE(rotated.has_value());
+    const auto rotate_pair = [](const std::vector<float>& pair) {
+        const auto cosine = std::cos(1.0F);
+        const auto sine = std::sin(1.0F);
+        return std::vector<float> { pair[0] * cosine - pair[1] * sine,
+                                    pair[1] * cosine + pair[0] * sine };
+    };
+    const auto first_rotated_head = rotate_pair(first_query_head);
+    const auto second_rotated_head = rotate_pair(second_query_head);
+    check_floats(rotated->query,
+                 { first_rotated_head[0], first_rotated_head[1], second_rotated_head[0],
+                   second_rotated_head[1] });
+    check_floats(rotated->key, first_rotated_head);
+    check_floats(rotated->value, expected_value);
 }
