@@ -126,37 +126,36 @@ load_layer(const metal_context& context, const safetensors_file& file, std::size
     };
 
     auto input_norm = load("input_layernorm.weight");
-    auto post_attention_norm = load("post_attention_layernorm.weight");
-    auto query_norm = load("self_attn.q_norm.weight");
-    auto key_norm = load("self_attn.k_norm.weight");
-    auto query = load("self_attn.q_proj.weight");
-    auto key = load("self_attn.k_proj.weight");
-    auto value = load("self_attn.v_proj.weight");
-    auto attention_output = load("self_attn.o_proj.weight");
-    auto mlp_gate = load("mlp.gate_proj.weight");
-    auto mlp_up = load("mlp.up_proj.weight");
-    auto mlp_down = load("mlp.down_proj.weight");
-
     if (!input_norm)
         return fail(input_norm.error());
+    auto post_attention_norm = load("post_attention_layernorm.weight");
     if (!post_attention_norm)
         return fail(post_attention_norm.error());
+    auto query_norm = load("self_attn.q_norm.weight");
     if (!query_norm)
         return fail(query_norm.error());
+    auto key_norm = load("self_attn.k_norm.weight");
     if (!key_norm)
         return fail(key_norm.error());
+    auto query = load("self_attn.q_proj.weight");
     if (!query)
         return fail(query.error());
+    auto key = load("self_attn.k_proj.weight");
     if (!key)
         return fail(key.error());
+    auto value = load("self_attn.v_proj.weight");
     if (!value)
         return fail(value.error());
+    auto attention_output = load("self_attn.o_proj.weight");
     if (!attention_output)
         return fail(attention_output.error());
+    auto mlp_gate = load("mlp.gate_proj.weight");
     if (!mlp_gate)
         return fail(mlp_gate.error());
+    auto mlp_up = load("mlp.up_proj.weight");
     if (!mlp_up)
         return fail(mlp_up.error());
+    auto mlp_down = load("mlp.down_proj.weight");
     if (!mlp_down)
         return fail(mlp_down.error());
 
@@ -223,12 +222,12 @@ load_qwen_weights(const metal_context& context,
     }
 
     auto token_embedding = load_tensor(context, file, "model.embed_tokens.weight");
-    auto final_norm = load_tensor(context, file, "model.norm.weight");
-    auto output = load_tensor(context, file, "lm_head.weight");
     if (!token_embedding)
         return fail(token_embedding.error());
+    auto final_norm = load_tensor(context, file, "model.norm.weight");
     if (!final_norm)
         return fail(final_norm.error());
+    auto output = load_tensor(context, file, "lm_head.weight");
     if (!output)
         return fail(output.error());
 

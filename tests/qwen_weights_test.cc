@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "metal/metal_context.h"
+#include "metal/metal_kv_cache.h"
 #include "model_format/safetensors.h"
 #include "qwen/qwen_config.h"
 #include "qwen/qwen_embedding.h"
@@ -27,11 +28,16 @@ using chibillm::bf16;
 using chibillm::embed_qwen_tokens;
 using chibillm::load_qwen_weights;
 using chibillm::metal_context;
+using chibillm::metal_kv_cache;
 using chibillm::metal_tensor;
 using chibillm::normalize_qwen_qk;
 using chibillm::project_qwen_qkv;
+using chibillm::qwen_attention_metadata;
 using chibillm::qwen_config;
 using chibillm::qwen_weights_errc;
+using chibillm::run_qwen_attention;
+using chibillm::run_qwen_layers;
+using chibillm::run_qwen_mlp;
 using chibillm::safetensors_file;
 using chibillm::validate_qwen_weights;
 using safetensors_test::temporary_file;
@@ -126,6 +132,13 @@ write_bf16(metal_tensor& tensor, const std::vector<float>& values)
     }
     REQUIRE(tensor.buffer().size_bytes() == bits.size() * sizeof(std::uint16_t));
     std::memcpy(tensor.buffer().bytes().data(), bits.data(), tensor.buffer().size_bytes());
+}
+
+void
+write_f32(metal_tensor& tensor, const std::vector<float>& values)
+{
+    REQUIRE(tensor.buffer().size_bytes() == values.size() * sizeof(float));
+    std::memcpy(tensor.buffer().bytes().data(), values.data(), tensor.buffer().size_bytes());
 }
 
 void
@@ -286,6 +299,9 @@ TEST_CASE("Qwen layer input produces normalized query key and value projections"
     write_bf16(weights->layers[0].value, { 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F });
     write_bf16(weights->layers[0].query_norm, { 1.0F, 1.0F });
     write_bf16(weights->layers[0].key_norm, { 1.0F, 1.0F });
+    write_bf16(weights->layers[0].attention_output,
+               { 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F,
+                 0.0F, 1.0F });
 
     const std::vector<chibillm::token_id> tokens { 1 };
     auto hidden_states = embed_qwen_tokens(*context, *weights, tokens);
@@ -332,4 +348,124 @@ TEST_CASE("Qwen layer input produces normalized query key and value projections"
                    second_rotated_head[1] });
     check_floats(rotated->key, first_rotated_head);
     check_floats(rotated->value, expected_value);
+
+    auto cache_result = metal_kv_cache::make(*context,
+                                             {
+                                                 .layer_count = config.layer_count,
+                                                 .block_count = 2,
+                                                 .block_size = 1,
+                                                 .kv_head_count = config.kv_head_count,
+                                                 .head_dimension = config.head_dimension,
+                                             });
+    REQUIRE(cache_result.has_value());
+    auto cache = std::move(*cache_result);
+    write_f32(cache.keys(), std::vector<float>(cache.element_count(), 0.0F));
+    std::vector<float> cached_values(cache.element_count(), 0.0F);
+    cached_values[0] = expected_value[0];
+    cached_values[1] = expected_value[1];
+    write_f32(cache.values(), cached_values);
+
+    const std::vector<std::uint32_t> slots { 1 };
+    const std::vector<std::uint32_t> block_table { 0, 1 };
+    const std::vector<std::uint32_t> table_offsets { 0 };
+    const std::vector<std::uint32_t> table_lengths { 2 };
+    auto attention_residual = run_qwen_attention(*context, config, weights->layers[0], 0,
+                                                 *hidden_states, std::move(*rotated),
+                                                 qwen_attention_metadata {
+                                                     .positions = positions,
+                                                     .slots = slots,
+                                                     .block_table = block_table,
+                                                     .block_table_offsets = table_offsets,
+                                                     .block_table_lengths = table_lengths,
+                                                 },
+                                                 cache);
+    REQUIRE(attention_residual.has_value());
+    const std::vector<float> attention_expected {
+        1.0F + expected_value[0],
+        2.0F + expected_value[1],
+        3.0F + expected_value[0],
+        4.0F + expected_value[1],
+    };
+    check_floats(*attention_residual, attention_expected);
+
+    write_bf16(weights->layers[0].post_attention_norm, { 1.0F, 1.0F, 1.0F, 1.0F });
+    std::vector<float> gate_weights(config.intermediate_size * config.hidden_size, 0.0F);
+    std::vector<float> up_weights(config.intermediate_size * config.hidden_size, 0.0F);
+    std::vector<float> down_weights(config.hidden_size * config.intermediate_size, 0.0F);
+    gate_weights[0] = 1.0F;
+    up_weights[1] = 1.0F;
+    down_weights[0] = 1.0F;
+    write_bf16(weights->layers[0].mlp_gate, gate_weights);
+    write_bf16(weights->layers[0].mlp_up, up_weights);
+    write_bf16(weights->layers[0].mlp_down, down_weights);
+
+    auto mlp_output = run_qwen_mlp(*context, config, weights->layers[0], *attention_residual);
+    REQUIRE(mlp_output.has_value());
+    auto mlp_expected = attention_expected;
+    float mean_square = 0.0F;
+    for (const auto value : attention_expected) {
+        mean_square += value * value;
+    }
+    mean_square /= static_cast<float>(attention_expected.size());
+    const auto mlp_scale = 1.0F / std::sqrt(mean_square + config.rms_epsilon);
+    const auto gate = attention_expected[0] * mlp_scale;
+    const auto up = attention_expected[1] * mlp_scale;
+    mlp_expected[0] += (gate / (1.0F + std::exp(-gate))) * up;
+    check_floats(*mlp_output, mlp_expected);
+
+    for (auto& layer : weights->layers) {
+        write_bf16(layer.input_norm, std::vector<float>(config.hidden_size, 1.0F));
+        write_bf16(layer.query_norm, std::vector<float>(config.head_dimension, 1.0F));
+        write_bf16(layer.key_norm, std::vector<float>(config.head_dimension, 1.0F));
+        write_bf16(layer.query, std::vector<float>(layer.query.descriptor().element_count(), 0.0F));
+        write_bf16(layer.key, std::vector<float>(layer.key.descriptor().element_count(), 0.0F));
+        write_bf16(layer.value, { 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F });
+        write_bf16(layer.attention_output,
+                   { 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F,
+                     0.0F, 0.0F, 1.0F });
+        write_bf16(layer.post_attention_norm, std::vector<float>(config.hidden_size, 0.0F));
+    }
+
+    auto loop_cache_result = metal_kv_cache::make(*context,
+                                                  {
+                                                      .layer_count = config.layer_count,
+                                                      .block_count = 1,
+                                                      .block_size = 1,
+                                                      .kv_head_count = config.kv_head_count,
+                                                      .head_dimension = config.head_dimension,
+                                                  });
+    REQUIRE(loop_cache_result.has_value());
+    auto loop_cache = std::move(*loop_cache_result);
+    const std::vector<std::uint32_t> loop_positions { 0 };
+    const std::vector<std::uint32_t> loop_slots { 0 };
+    const std::vector<std::uint32_t> loop_table { 0 };
+    const std::vector<std::uint32_t> loop_offsets { 0 };
+    const std::vector<std::uint32_t> loop_lengths { 1 };
+    auto layer_output = run_qwen_layers(*context, config, *weights, std::move(*hidden_states),
+                                        qwen_attention_metadata {
+                                            .positions = loop_positions,
+                                            .slots = loop_slots,
+                                            .block_table = loop_table,
+                                            .block_table_offsets = loop_offsets,
+                                            .block_table_lengths = loop_lengths,
+                                        },
+                                        loop_cache);
+    REQUIRE(layer_output.has_value());
+
+    std::vector<float> layer_expected { 1.0F, 2.0F, 3.0F, 4.0F };
+    for (std::size_t layer = 0; layer < config.layer_count; ++layer) {
+        const auto rms = std::sqrt((layer_expected[0] * layer_expected[0]
+                                    + layer_expected[1] * layer_expected[1]
+                                    + layer_expected[2] * layer_expected[2]
+                                    + layer_expected[3] * layer_expected[3])
+                                       / 4.0F
+                                   + config.rms_epsilon);
+        const auto first = layer_expected[0] / rms;
+        const auto second = layer_expected[1] / rms;
+        layer_expected[0] += first;
+        layer_expected[1] += second;
+        layer_expected[2] += first;
+        layer_expected[3] += second;
+    }
+    check_floats(*layer_output, layer_expected);
 }

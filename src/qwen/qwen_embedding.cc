@@ -43,10 +43,10 @@ embed_qwen_tokens(const metal_context& context,
 
     const auto hidden_size = weights.token_embedding.descriptor().shape().dimensions()[1];
     auto token_ids = make_tensor(context, dtype::i32, { tokens.size() });
-    auto output = make_tensor(context, dtype::f32, { tokens.size(), hidden_size });
     if (!token_ids) {
         return fail(token_ids.error());
     }
+    auto output = make_tensor(context, dtype::f32, { tokens.size(), hidden_size });
     if (!output) {
         return fail(output.error());
     }
