@@ -5,8 +5,11 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <string>
 #include <utility>
 
@@ -62,6 +65,11 @@ struct metal_buffer::implementation {
 };
 
 struct metal_context::implementation {
+    struct profile_stats {
+        std::size_t calls = 0;
+        double gpu_seconds = 0.0;
+    };
+
     id<MTLDevice> device;
     id<MTLCommandQueue> command_queue;
     id<MTLLibrary> shader_library;
@@ -83,13 +91,16 @@ struct metal_context::implementation {
     id<MTLCommandBuffer> pass_command_buffer;
     id<MTLComputeCommandEncoder> pass_encoder;
     std::string device_name;
+    bool profiling_enabled = false;
+    std::map<std::string, profile_stats> profile;
 
     // what one dispatch encodes into; see definition below.
     struct dispatch_frame;
 
     [[nodiscard]] result<dispatch_frame, metal_error> open_dispatch_encoder();
     [[nodiscard]] result<void, metal_error>
-    complete_dispatch_encoder(const dispatch_frame& frame);
+    complete_dispatch_encoder(const dispatch_frame& frame, std::string_view profile_name = {});
+    void dump_profile() const noexcept;
 };
 
 // what a dispatch needs to encode one kernel. command_buffer is nil when the
@@ -104,7 +115,7 @@ struct metal_context::implementation::dispatch_frame {
 result<metal_context::implementation::dispatch_frame, metal_error>
 metal_context::implementation::open_dispatch_encoder()
 {
-    if (pass_encoder != nil) {
+    if (pass_encoder != nil && !profiling_enabled) {
         return dispatch_frame { nil, pass_encoder };
     }
 
@@ -126,7 +137,8 @@ metal_context::implementation::open_dispatch_encoder()
 // closes out one dispatch. Standalone frames commit and wait as before; kernels
 // appended to an open pass are finished later by end_compute_pass().
 result<void, metal_error>
-metal_context::implementation::complete_dispatch_encoder(const dispatch_frame& frame)
+metal_context::implementation::complete_dispatch_encoder(const dispatch_frame& frame,
+                                                         std::string_view profile_name)
 {
     if (frame.command_buffer == nil) {
         return {};
@@ -142,7 +154,27 @@ metal_context::implementation::complete_dispatch_encoder(const dispatch_frame& f
             message_from_error(frame.command_buffer.error, "Metal command execution failed")));
     }
 
+    if (profiling_enabled && !profile_name.empty()) {
+        auto& stats = profile[std::string(profile_name)];
+        ++stats.calls;
+        stats.gpu_seconds += frame.command_buffer.GPUEndTime - frame.command_buffer.GPUStartTime;
+    }
+
     return {};
+}
+
+void
+metal_context::implementation::dump_profile() const noexcept
+{
+    if (!profiling_enabled) {
+        return;
+    }
+    for (const auto& [name, stats] : profile) {
+        const auto total_ms = stats.gpu_seconds * 1000.0;
+        std::fprintf(stderr,
+                     "[metal-profile] %-28s calls=%zu total_ms=%.3f avg_us=%.3f\n",
+                     name.c_str(), stats.calls, total_ms, total_ms * 1000.0 / stats.calls);
+    }
 }
 
 metal_buffer::metal_buffer(std::unique_ptr<implementation> implementation) noexcept
@@ -424,6 +456,7 @@ metal_context::make(std::string_view shader_source)
         implementation->store_kv_f32_pipeline = store_kv_f32_pipeline;
         implementation->paged_attention_f32_pipeline = paged_attention_f32_pipeline;
         implementation->device_name = device_name == nullptr ? "unknown Metal device" : device_name;
+        implementation->profiling_enabled = std::getenv("CHIBILLM_PROFILE_METAL") != nullptr;
 
         return metal_context { std::move(implementation) };
     }
@@ -437,7 +470,12 @@ metal_context::metal_context(metal_context&&) noexcept = default;
 
 metal_context& metal_context::operator=(metal_context&&) noexcept = default;
 
-metal_context::~metal_context() = default;
+metal_context::~metal_context()
+{
+    if (implementation_) {
+        implementation_->dump_profile();
+    }
+}
 
 std::string_view
 metal_context::device_name() const noexcept
@@ -582,7 +620,7 @@ metal_context::dispatch_matmul(const metal_buffer& lhs,
         [encoder dispatchThreads:MTLSizeMake(columns, rows, 1)
             threadsPerThreadgroup:adaptive_2d_threadgroup_size(
                                       implementation_->matmul_f32_pipeline, columns, rows)];
-        return implementation_->complete_dispatch_encoder(*opened);
+        return implementation_->complete_dispatch_encoder(*opened, "matmul");
     }
 }
 
@@ -659,7 +697,11 @@ metal_context::dispatch_linear_bf16(const metal_buffer& input,
                                           output_features,
                                           rows)];
         }
-        return implementation_->complete_dispatch_encoder(*opened);
+        const auto profile_name = rows != 1 ? "linear_prefill"
+            : output_features > 10'000 ? "linear_decode_vocab"
+            : input_features > output_features ? "linear_decode_contract"
+                                               : "linear_decode_square";
+        return implementation_->complete_dispatch_encoder(*opened, profile_name);
     }
 }
 
@@ -747,7 +789,10 @@ metal_context::dispatch_linear_split_bf16(const metal_buffer& input,
                                           rows)];
         }
 
-        return implementation_->complete_dispatch_encoder(*opened);
+        const auto profile_name = rows != 1 ? "linear_split_prefill"
+            : total_width > input_features * 4 ? "linear_split_decode_wide"
+                                               : "linear_split_decode_qkv";
+        return implementation_->complete_dispatch_encoder(*opened, profile_name);
     }
 }
 
@@ -786,7 +831,7 @@ metal_context::dispatch_embedding_bf16(const metal_buffer& token_ids,
                                       implementation_->embedding_bf16_pipeline,
                                       hidden_size,
                                       token_count)];
-        return implementation_->complete_dispatch_encoder(*opened);
+        return implementation_->complete_dispatch_encoder(*opened, "embedding");
     }
 }
 
@@ -829,7 +874,8 @@ metal_context::dispatch_rms_norm_bf16(const metal_buffer& input,
 
         [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
-        return implementation_->complete_dispatch_encoder(*opened);
+        const auto profile_name = hidden_size <= 256 ? "rms_norm_heads" : "rms_norm_hidden";
+        return implementation_->complete_dispatch_encoder(*opened, profile_name);
     }
 }
 
@@ -867,7 +913,7 @@ metal_context::dispatch_silu_mul_f32(const metal_buffer& gate,
 
         [encoder dispatchThreads:MTLSizeMake(element_count, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
-        return implementation_->complete_dispatch_encoder(*opened);
+        return implementation_->complete_dispatch_encoder(*opened, "silu_mul");
     }
 }
 
@@ -905,7 +951,7 @@ metal_context::dispatch_add_f32(const metal_buffer& lhs,
 
         [encoder dispatchThreads:MTLSizeMake(element_count, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
-        return implementation_->complete_dispatch_encoder(*opened);
+        return implementation_->complete_dispatch_encoder(*opened, "add");
     }
 }
 
@@ -951,7 +997,7 @@ metal_context::dispatch_rope_f32(const metal_buffer& input,
         [encoder dispatchThreads:MTLSizeMake(pair_columns, rows, 1)
             threadsPerThreadgroup:adaptive_2d_threadgroup_size(
                                       implementation_->rope_f32_pipeline, pair_columns, rows)];
-        return implementation_->complete_dispatch_encoder(*opened);
+        return implementation_->complete_dispatch_encoder(*opened, "rope");
     }
 }
 
@@ -1003,7 +1049,7 @@ metal_context::dispatch_store_kv_f32(const metal_buffer& keys,
                                       implementation_->store_kv_f32_pipeline,
                                       feature_count,
                                       rows)];
-        return implementation_->complete_dispatch_encoder(*opened);
+        return implementation_->complete_dispatch_encoder(*opened, "store_kv");
     }
 }
 
@@ -1088,7 +1134,8 @@ metal_context::dispatch_paged_attention_f32(const metal_buffer& queries,
 
         [encoder dispatchThreadgroups:MTLSizeMake(query_head_count, rows, 1)
                 threadsPerThreadgroup:MTLSizeMake(head_dimension, 1, 1)];
-        return implementation_->complete_dispatch_encoder(*opened);
+        return implementation_->complete_dispatch_encoder(
+            *opened, rows == 1 ? "paged_attention_decode" : "paged_attention_prefill");
     }
 }
 
