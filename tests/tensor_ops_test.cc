@@ -1338,6 +1338,52 @@ TEST_CASE("paged attention follows block tables and shares kv heads")
     }
 }
 
+TEST_CASE("paged attention combines multiple context chunks")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+    auto cache_result = metal_kv_cache::make(*context,
+                                             {
+                                                 .layer_count = 1,
+                                                 .block_count = 9,
+                                                 .block_size = 16,
+                                                 .kv_head_count = 1,
+                                                 .head_dimension = 2,
+                                             });
+    REQUIRE(cache_result.has_value());
+    auto cache = std::move(*cache_result);
+
+    write_floats(cache.keys(), std::vector<float>(cache.element_count(), 0.0F));
+    std::vector<float> values;
+    values.reserve(cache.element_count());
+    for (std::size_t token = 0; token < 144; ++token) {
+        values.push_back(static_cast<float>(token));
+        values.push_back(static_cast<float>(token * 2));
+    }
+    write_floats(cache.values(), values);
+
+    auto queries = make_tensor(*context, dtype::f32, { 1, 2 });
+    auto positions = make_tensor(*context, dtype::u32, { 1 });
+    auto block_table = make_tensor(*context, dtype::u32, { 9 });
+    auto table_offsets = make_tensor(*context, dtype::u32, { 1 });
+    auto table_lengths = make_tensor(*context, dtype::u32, { 1 });
+    auto output = make_tensor(*context, dtype::f32, { 1, 2 });
+    write_floats(queries, { 1.0F, 1.0F });
+    write_u32(positions, { 128 });
+    write_u32(block_table, { 0, 1, 2, 3, 4, 5, 6, 7, 8 });
+    write_u32(table_offsets, { 0 });
+    write_u32(table_lengths, { 9 });
+
+    auto attended = paged_attention(*context, queries, positions, block_table, table_offsets,
+                                    table_lengths, 0, 1, cache, output);
+    REQUIRE(attended.has_value());
+
+    const auto result = read_floats(output);
+    REQUIRE(result.size() == 2);
+    CHECK(result[0] == doctest::Approx(64.0F).epsilon(1e-5));
+    CHECK(result[1] == doctest::Approx(128.0F).epsilon(1e-5));
+}
+
 TEST_CASE("paged attention requires tensor ranks and dtypes")
 {
     auto context = metal_context::make(load_shader_source());

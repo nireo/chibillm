@@ -374,9 +374,12 @@ paged_attention_f32(device const float* queries [[buffer(0)]],
     constant uint& slot_count [[buffer(13)]],
     constant uint& layer [[buffer(14)]],
     constant uint& block_table_entry_count [[buffer(15)]],
+    constant uint& simdgroup_count [[buffer(16)]],
     threadgroup float* score_scratch [[threadgroup(0)]],
     threadgroup float* softmax_state [[threadgroup(1)]],
     uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint3 threadgroup_position [[threadgroup_position_in_grid]])
 {
     // one threadgroup owns one [query row, query head]. Each thread owns one
@@ -433,16 +436,18 @@ paged_attention_f32(device const float* queries [[buffer(0)]],
             * ulong(head_dimension);
         const ulong cache_index = cache_base + ulong(thread_index);
 
-        // cooperatively form q dot k: every thread writes one q_i * k_i.
-        score_scratch[thread_index] = query_feature * key_cache[cache_index];
+        // Reduce each SIMD group's contiguous slice of q dot k in registers.
+        const float partial_score = simd_sum(query_feature * key_cache[cache_index]);
+        if (lane == 0) {
+            score_scratch[simdgroup] = partial_score;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // this correctness-first reduction is serial. A parallel reduction can
-        // replace it later without changing the surrounding attention logic.
+        // Only the few SIMD-group partials remain for the shared softmax state.
         if (thread_index == 0) {
             float score = 0.0F;
-            for (uint feature = 0; feature < head_dimension; ++feature) {
-                score += score_scratch[feature];
+            for (uint group = 0; group < simdgroup_count; ++group) {
+                score += score_scratch[group];
             }
             score *= attention_scale;
 
@@ -473,4 +478,176 @@ paged_attention_f32(device const float* queries [[buffer(0)]],
 
     // normalizing the weighted-value numerator produces this output feature.
     output[query_base + ulong(thread_index)] = value_accumulator / softmax_state[1];
+}
+
+kernel void
+paged_attention_partial_f32(device const float* queries [[buffer(0)]],
+    device const uint* positions [[buffer(1)]],
+    device const uint* block_table [[buffer(2)]],
+    device const uint* block_table_offsets [[buffer(3)]],
+    device const uint* block_table_lengths [[buffer(4)]],
+    device const float* key_cache [[buffer(5)]],
+    device const float* value_cache [[buffer(6)]],
+    device float* partials [[buffer(7)]],
+    constant uint& row_count [[buffer(8)]],
+    constant uint& query_head_count [[buffer(9)]],
+    constant uint& kv_head_count [[buffer(10)]],
+    constant uint& head_dimension [[buffer(11)]],
+    constant uint& block_size [[buffer(12)]],
+    constant uint& slot_count [[buffer(13)]],
+    constant uint& layer [[buffer(14)]],
+    constant uint& block_table_entry_count [[buffer(15)]],
+    constant uint& simdgroup_count [[buffer(16)]],
+    constant uint& chunk_size [[buffer(17)]],
+    constant uint& chunk_count [[buffer(18)]],
+    threadgroup float* score_scratch [[threadgroup(0)]],
+    threadgroup float* softmax_state [[threadgroup(1)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]])
+{
+    const uint query_head = threadgroup_position.x % query_head_count;
+    const uint chunk = threadgroup_position.x / query_head_count;
+    const uint row = threadgroup_position.y;
+    if (chunk >= chunk_count || row >= row_count || thread_index >= head_dimension) {
+        return;
+    }
+
+    const uint query_position = positions[row];
+    const uint table_offset = block_table_offsets[row];
+    const uint table_length = block_table_lengths[row];
+    const uint last_logical_block = query_position / block_size;
+    if (table_offset > block_table_entry_count
+        || table_length > block_table_entry_count - table_offset
+        || last_logical_block >= table_length) {
+        return;
+    }
+
+    const uint chunk_begin = chunk * chunk_size;
+    const uint chunk_end = min(query_position + 1, chunk_begin + chunk_size);
+    const ulong partial_base =
+        ((ulong(row) * ulong(query_head_count) + ulong(query_head)) * ulong(chunk_count)
+            + ulong(chunk))
+        * ulong(head_dimension + 2);
+    if (chunk_begin >= chunk_end) {
+        if (thread_index == 0) {
+            partials[partial_base] = -INFINITY;
+            partials[partial_base + 1] = 0.0F;
+        }
+        partials[partial_base + 2 + ulong(thread_index)] = 0.0F;
+        return;
+    }
+
+    const uint kv_group_size = query_head_count / kv_head_count;
+    const uint kv_head = query_head / kv_group_size;
+    const ulong query_base =
+        (ulong(row) * ulong(query_head_count) + ulong(query_head)) * ulong(head_dimension);
+    const float query_feature = queries[query_base + ulong(thread_index)];
+
+    if (thread_index == 0) {
+        softmax_state[0] = -INFINITY;
+        softmax_state[1] = 0.0F;
+        softmax_state[2] = 0.0F;
+        softmax_state[3] = 0.0F;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float value_accumulator = 0.0F;
+    const float attention_scale = rsqrt(float(head_dimension));
+    for (uint token_position = chunk_begin; token_position < chunk_end; ++token_position) {
+        const uint logical_block = token_position / block_size;
+        const uint token_offset = token_position % block_size;
+        const uint physical_block = block_table[table_offset + logical_block];
+        const uint slot = physical_block * block_size + token_offset;
+        const ulong cache_base =
+            ((ulong(layer) * ulong(slot_count) + ulong(slot)) * ulong(kv_head_count)
+                + ulong(kv_head))
+            * ulong(head_dimension);
+        const ulong cache_index = cache_base + ulong(thread_index);
+
+        const float partial_score = simd_sum(query_feature * key_cache[cache_index]);
+        if (lane == 0) {
+            score_scratch[simdgroup] = partial_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (thread_index == 0) {
+            float score = 0.0F;
+            for (uint group = 0; group < simdgroup_count; ++group) {
+                score += score_scratch[group];
+            }
+            score *= attention_scale;
+
+            const float old_max = softmax_state[0];
+            const float new_max = max(old_max, score);
+            const float accumulator_rescale = exp(old_max - new_max);
+            const float value_weight = exp(score - new_max);
+            softmax_state[0] = new_max;
+            softmax_state[1] = softmax_state[1] * accumulator_rescale + value_weight;
+            softmax_state[2] = accumulator_rescale;
+            softmax_state[3] = value_weight;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        value_accumulator = value_accumulator * softmax_state[2]
+            + value_cache[cache_index] * softmax_state[3];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (thread_index == 0) {
+        partials[partial_base] = softmax_state[0];
+        partials[partial_base + 1] = softmax_state[1];
+    }
+    partials[partial_base + 2 + ulong(thread_index)] = value_accumulator;
+}
+
+kernel void
+paged_attention_reduce_f32(device const float* partials [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& row_count [[buffer(2)]],
+    constant uint& query_head_count [[buffer(3)]],
+    constant uint& head_dimension [[buffer(4)]],
+    constant uint& chunk_count [[buffer(5)]],
+    threadgroup float* chunk_scales [[threadgroup(0)]],
+    threadgroup float* softmax_state [[threadgroup(1)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]])
+{
+    const uint query_head = threadgroup_position.x;
+    const uint row = threadgroup_position.y;
+    if (query_head >= query_head_count || row >= row_count
+        || thread_index >= head_dimension) {
+        return;
+    }
+
+    const ulong head_base =
+        (ulong(row) * ulong(query_head_count) + ulong(query_head)) * ulong(chunk_count)
+        * ulong(head_dimension + 2);
+    if (thread_index == 0) {
+        float global_max = -INFINITY;
+        for (uint chunk = 0; chunk < chunk_count; ++chunk) {
+            const ulong base = head_base + ulong(chunk) * ulong(head_dimension + 2);
+            global_max = max(global_max, partials[base]);
+        }
+
+        float denominator = 0.0F;
+        for (uint chunk = 0; chunk < chunk_count; ++chunk) {
+            const ulong base = head_base + ulong(chunk) * ulong(head_dimension + 2);
+            const float scale = exp(partials[base] - global_max);
+            chunk_scales[chunk] = scale;
+            denominator += partials[base + 1] * scale;
+        }
+        softmax_state[0] = denominator;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float accumulator = 0.0F;
+    for (uint chunk = 0; chunk < chunk_count; ++chunk) {
+        const ulong base = head_base + ulong(chunk) * ulong(head_dimension + 2);
+        accumulator += partials[base + 2 + ulong(thread_index)] * chunk_scales[chunk];
+    }
+    const ulong output_index =
+        (ulong(row) * ulong(query_head_count) + ulong(query_head)) * ulong(head_dimension)
+        + ulong(thread_index);
+    output[output_index] = accumulator / softmax_state[0];
 }

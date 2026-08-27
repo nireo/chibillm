@@ -24,7 +24,7 @@ using chibillm::result;
 constexpr std::size_t kv_block_count = 64;
 constexpr std::size_t kv_block_size = 16;
 constexpr std::size_t max_context_tokens = kv_block_count * kv_block_size;
-constexpr std::size_t max_new_tokens = 64;
+constexpr std::size_t max_new_tokens = 512;
 
 struct chat_message {
     std::string role;

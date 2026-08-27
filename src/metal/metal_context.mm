@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <string>
@@ -85,6 +86,8 @@ struct metal_context::implementation {
     id<MTLComputePipelineState> rope_f32_pipeline;
     id<MTLComputePipelineState> store_kv_f32_pipeline;
     id<MTLComputePipelineState> paged_attention_f32_pipeline;
+    id<MTLComputePipelineState> paged_attention_partial_f32_pipeline;
+    id<MTLComputePipelineState> paged_attention_reduce_f32_pipeline;
     // one open "pass" collects many dispatches into a single command buffer.
     // nil when no pass is open. Accessed by const dispatches through the shallow
     // constness of the owning unique_ptr (pointer constness, not pointee).
@@ -438,6 +441,42 @@ metal_context::make(std::string_view shader_source)
                                    "failed to create the paged_attention_f32 pipeline")));
         }
 
+        id<MTLFunction> paged_attention_partial_f32 =
+            [library newFunctionWithName:@"paged_attention_partial_f32"];
+        if (paged_attention_partial_f32 == nil) {
+            return fail(make_error(
+                metal_errc::shader_function_not_found,
+                "the Metal shader library does not contain paged_attention_partial_f32"));
+        }
+        pipeline_error = nil;
+        id<MTLComputePipelineState> paged_attention_partial_f32_pipeline =
+            [device newComputePipelineStateWithFunction:paged_attention_partial_f32
+                                                  error:&pipeline_error];
+        if (paged_attention_partial_f32_pipeline == nil) {
+            return fail(make_error(
+                metal_errc::pipeline_creation_failed,
+                message_from_error(pipeline_error,
+                                   "failed to create paged_attention_partial_f32 pipeline")));
+        }
+
+        id<MTLFunction> paged_attention_reduce_f32 =
+            [library newFunctionWithName:@"paged_attention_reduce_f32"];
+        if (paged_attention_reduce_f32 == nil) {
+            return fail(make_error(
+                metal_errc::shader_function_not_found,
+                "the Metal shader library does not contain paged_attention_reduce_f32"));
+        }
+        pipeline_error = nil;
+        id<MTLComputePipelineState> paged_attention_reduce_f32_pipeline =
+            [device newComputePipelineStateWithFunction:paged_attention_reduce_f32
+                                                  error:&pipeline_error];
+        if (paged_attention_reduce_f32_pipeline == nil) {
+            return fail(make_error(
+                metal_errc::pipeline_creation_failed,
+                message_from_error(pipeline_error,
+                                   "failed to create paged_attention_reduce_f32 pipeline")));
+        }
+
         const char* device_name = device.name.UTF8String;
         auto implementation = std::make_unique<metal_context::implementation>();
         implementation->device = device;
@@ -455,6 +494,9 @@ metal_context::make(std::string_view shader_source)
         implementation->rope_f32_pipeline = rope_f32_pipeline;
         implementation->store_kv_f32_pipeline = store_kv_f32_pipeline;
         implementation->paged_attention_f32_pipeline = paged_attention_f32_pipeline;
+        implementation->paged_attention_partial_f32_pipeline =
+            paged_attention_partial_f32_pipeline;
+        implementation->paged_attention_reduce_f32_pipeline = paged_attention_reduce_f32_pipeline;
         implementation->device_name = device_name == nullptr ? "unknown Metal device" : device_name;
         implementation->profiling_enabled = std::getenv("CHIBILLM_PROFILE_METAL") != nullptr;
 
@@ -1101,6 +1143,100 @@ metal_context::dispatch_paged_attention_f32(const metal_buffer& queries,
         const auto shader_layer = static_cast<std::uint32_t>(layer);
         const auto shader_block_table_entry_count =
             static_cast<std::uint32_t>(block_table_entry_count);
+        const auto simd_width = static_cast<std::size_t>(
+            implementation_->paged_attention_f32_pipeline.threadExecutionWidth);
+        const auto shader_simdgroup_count =
+            static_cast<std::uint32_t>((head_dimension - 1) / simd_width + 1);
+
+        constexpr std::size_t attention_chunk_size = 64;
+        constexpr std::uint32_t chunked_attention_min_tokens = 128;
+        std::uint32_t decode_position = 0;
+        if (rows == 1) {
+            std::memcpy(&decode_position, positions.bytes().data(), sizeof(decode_position));
+        }
+        const auto chunk_count = rows == 1
+            ? (static_cast<std::size_t>(decode_position) / attention_chunk_size + 1)
+            : 1;
+
+        if (chunk_count > 1 && decode_position >= chunked_attention_min_tokens - 1) {
+            const auto partial_stride = head_dimension + 2;
+            constexpr auto max_size = std::numeric_limits<std::size_t>::max();
+            if (query_head_count > max_size / chunk_count
+                || query_head_count * chunk_count > max_size / partial_stride
+                || query_head_count * chunk_count * partial_stride > max_size / sizeof(float)) {
+                return fail(make_error(metal_errc::invalid_input,
+                                       "paged attention partial buffer size overflows"));
+            }
+            const auto partial_size_bytes =
+                query_head_count * chunk_count * partial_stride * sizeof(float);
+            auto partials = make_shared_buffer(partial_size_bytes);
+            if (!partials) {
+                return fail(partials.error());
+            }
+
+            const auto shader_chunk_size =
+                static_cast<std::uint32_t>(attention_chunk_size);
+            const auto shader_chunk_count = static_cast<std::uint32_t>(chunk_count);
+            auto opened = implementation_->open_dispatch_encoder();
+            if (!opened) {
+                return fail(opened.error());
+            }
+            id<MTLComputeCommandEncoder> encoder = opened->encoder;
+
+            [encoder setComputePipelineState:implementation_->paged_attention_partial_f32_pipeline];
+            [encoder setBuffer:queries.implementation_->buffer offset:0 atIndex:0];
+            [encoder setBuffer:positions.implementation_->buffer offset:0 atIndex:1];
+            [encoder setBuffer:block_table.implementation_->buffer offset:0 atIndex:2];
+            [encoder setBuffer:block_table_offsets.implementation_->buffer offset:0 atIndex:3];
+            [encoder setBuffer:block_table_lengths.implementation_->buffer offset:0 atIndex:4];
+            [encoder setBuffer:key_cache.implementation_->buffer offset:0 atIndex:5];
+            [encoder setBuffer:value_cache.implementation_->buffer offset:0 atIndex:6];
+            [encoder setBuffer:partials->implementation_->buffer offset:0 atIndex:7];
+            [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:8];
+            [encoder setBytes:&shader_query_head_count
+                       length:sizeof(shader_query_head_count)
+                      atIndex:9];
+            [encoder setBytes:&shader_kv_head_count
+                       length:sizeof(shader_kv_head_count)
+                      atIndex:10];
+            [encoder setBytes:&shader_head_dimension
+                       length:sizeof(shader_head_dimension)
+                      atIndex:11];
+            [encoder setBytes:&shader_block_size length:sizeof(shader_block_size) atIndex:12];
+            [encoder setBytes:&shader_slot_count length:sizeof(shader_slot_count) atIndex:13];
+            [encoder setBytes:&shader_layer length:sizeof(shader_layer) atIndex:14];
+            [encoder setBytes:&shader_block_table_entry_count
+                       length:sizeof(shader_block_table_entry_count)
+                      atIndex:15];
+            [encoder setBytes:&shader_simdgroup_count
+                       length:sizeof(shader_simdgroup_count)
+                      atIndex:16];
+            [encoder setBytes:&shader_chunk_size length:sizeof(shader_chunk_size) atIndex:17];
+            [encoder setBytes:&shader_chunk_count length:sizeof(shader_chunk_count) atIndex:18];
+            [encoder setThreadgroupMemoryLength:head_dimension * sizeof(float) atIndex:0];
+            [encoder setThreadgroupMemoryLength:4 * sizeof(float) atIndex:1];
+            [encoder dispatchThreadgroups:MTLSizeMake(query_head_count * chunk_count, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(head_dimension, 1, 1)];
+
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [encoder setComputePipelineState:implementation_->paged_attention_reduce_f32_pipeline];
+            [encoder setBuffer:partials->implementation_->buffer offset:0 atIndex:0];
+            [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:1];
+            [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:2];
+            [encoder setBytes:&shader_query_head_count
+                       length:sizeof(shader_query_head_count)
+                      atIndex:3];
+            [encoder setBytes:&shader_head_dimension
+                       length:sizeof(shader_head_dimension)
+                      atIndex:4];
+            [encoder setBytes:&shader_chunk_count length:sizeof(shader_chunk_count) atIndex:5];
+            [encoder setThreadgroupMemoryLength:chunk_count * sizeof(float) atIndex:0];
+            [encoder setThreadgroupMemoryLength:sizeof(float) atIndex:1];
+            [encoder dispatchThreadgroups:MTLSizeMake(query_head_count, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(head_dimension, 1, 1)];
+            return implementation_->complete_dispatch_encoder(
+                *opened, "paged_attention_chunked_decode");
+        }
 
         auto opened = implementation_->open_dispatch_encoder();
         if (!opened) {
@@ -1129,6 +1265,9 @@ metal_context::dispatch_paged_attention_f32(const metal_buffer& queries,
         [encoder setBytes:&shader_block_table_entry_count
                    length:sizeof(shader_block_table_entry_count)
                   atIndex:15];
+        [encoder setBytes:&shader_simdgroup_count
+                   length:sizeof(shader_simdgroup_count)
+                  atIndex:16];
         [encoder setThreadgroupMemoryLength:head_dimension * sizeof(float) atIndex:0];
         [encoder setThreadgroupMemoryLength:4 * sizeof(float) atIndex:1];
 
