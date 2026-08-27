@@ -5,13 +5,14 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace chibillm {
@@ -37,24 +38,34 @@ message_from_error(NSError* error, std::string_view fallback)
     return message == nullptr ? std::string(fallback) : std::string(message);
 }
 
+bool
+environment_flag(const char* name, bool default_value)
+{
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return default_value;
+    }
+    return std::string_view(value) != "0"
+        && std::string_view(value) != "false"
+        && std::string_view(value) != "off";
+}
+
 MTLSize
 adaptive_2d_threadgroup_size(id<MTLComputePipelineState> pipeline,
                              std::size_t grid_width,
                              std::size_t grid_height)
 {
     if (grid_height == 1) {
-        const auto simd_width =
-            static_cast<std::size_t>(pipeline.threadExecutionWidth);
+        const auto simd_width = static_cast<std::size_t>(pipeline.threadExecutionWidth);
         return MTLSizeMake(std::min(simd_width, grid_width), 1, 1);
     }
 
     constexpr std::size_t preferred_threadgroup_dimension = 16;
-    const auto max_threads =
-        static_cast<std::size_t>(pipeline.maxTotalThreadsPerThreadgroup);
+    const auto max_threads = static_cast<std::size_t>(pipeline.maxTotalThreadsPerThreadgroup);
     const auto threadgroup_width =
         std::min({ preferred_threadgroup_dimension, max_threads, grid_width });
-    const auto threadgroup_height = std::min(
-        { preferred_threadgroup_dimension, max_threads / threadgroup_width, grid_height });
+    const auto threadgroup_height =
+        std::min({ preferred_threadgroup_dimension, max_threads / threadgroup_width, grid_height });
 
     return MTLSizeMake(threadgroup_width, threadgroup_height, 1);
 }
@@ -77,6 +88,7 @@ struct metal_context::implementation {
     id<MTLComputePipelineState> matmul_f32_pipeline;
     id<MTLComputePipelineState> linear_bf16_pipeline;
     id<MTLComputePipelineState> linear_bf16_decode_pipeline;
+    id<MTLComputePipelineState> linear_bf16_tensorops_pipeline;
     id<MTLComputePipelineState> linear_split_bf16_pipeline;
     id<MTLComputePipelineState> linear_split_bf16_decode_pipeline;
     id<MTLComputePipelineState> embedding_bf16_pipeline;
@@ -95,6 +107,7 @@ struct metal_context::implementation {
     id<MTLComputeCommandEncoder> pass_encoder;
     std::string device_name;
     bool profiling_enabled = false;
+    bool tensorops_enabled = false;
     std::map<std::string, profile_stats> profile;
 
     // what one dispatch encodes into; see definition below.
@@ -174,8 +187,7 @@ metal_context::implementation::dump_profile() const noexcept
     }
     for (const auto& [name, stats] : profile) {
         const auto total_ms = stats.gpu_seconds * 1000.0;
-        std::fprintf(stderr,
-                     "[metal-profile] %-28s calls=%zu total_ms=%.3f avg_us=%.3f\n",
+        std::fprintf(stderr, "[metal-profile] %-28s calls=%zu total_ms=%.3f avg_us=%.3f\n",
                      name.c_str(), stats.calls, total_ms, total_ms * 1000.0 / stats.calls);
     }
 }
@@ -241,10 +253,32 @@ metal_context::make(std::string_view shader_source)
         }
 
         NSError* library_error = nil;
-        id<MTLLibrary> library = [device newLibraryWithSource:source
-                                                      options:nil
-                                                        error:&library_error];
+        id<MTLLibrary> library = nil;
+        bool compiled_metal4 = false;
+        const bool tensorops_requested = environment_flag("CHIBILLM_TENSOROPS", true);
+        if (@available(macOS 26.0, *)) {
+            if (tensorops_requested && [device supportsFamily:MTLGPUFamilyApple10]) {
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                options.languageVersion = MTLLanguageVersion4_0;
+                options.preprocessorMacros = @{@"CHIBILLM_ENABLE_TENSOROPS" : @1};
+                library = [device newLibraryWithSource:source options:options error:&library_error];
+                compiled_metal4 = library != nil;
+                if (library == nil && std::getenv("CHIBILLM_TENSOROPS") != nullptr) {
+                    const char* error_message = library_error.localizedDescription.UTF8String;
+                    std::fprintf(
+                        stderr, "[metal] TensorOps shader unavailable, using legacy kernels: %s\n",
+                        error_message == nullptr ? "unknown compilation error" : error_message);
+                }
+            }
+        }
         if (library == nil) {
+            library_error = nil;
+            library = [device newLibraryWithSource:source options:nil error:&library_error];
+        }
+        if (library == nil) {
+            const char* error_message = library_error.localizedDescription.UTF8String;
+            std::fprintf(stderr, "[metal] failed to compile legacy shader library: %s\n",
+                         error_message == nullptr ? "unknown compilation error" : error_message);
             return fail(make_error(
                 metal_errc::shader_library_creation_failed,
                 message_from_error(library_error, "failed to compile the Metal shader library")));
@@ -280,22 +314,38 @@ metal_context::make(std::string_view shader_source)
                 message_from_error(pipeline_error, "failed to create the linear_bf16 pipeline")));
         }
 
-        id<MTLFunction> linear_bf16_decode =
-            [library newFunctionWithName:@"linear_bf16_decode"];
+        id<MTLFunction> linear_bf16_decode = [library newFunctionWithName:@"linear_bf16_decode"];
         if (linear_bf16_decode == nil) {
-            return fail(make_error(
-                metal_errc::shader_function_not_found,
-                "the Metal shader library does not contain linear_bf16_decode"));
+            return fail(make_error(metal_errc::shader_function_not_found,
+                                   "the Metal shader library does not contain linear_bf16_decode"));
         }
 
         pipeline_error = nil;
         id<MTLComputePipelineState> linear_bf16_decode_pipeline =
             [device newComputePipelineStateWithFunction:linear_bf16_decode error:&pipeline_error];
         if (linear_bf16_decode_pipeline == nil) {
-            return fail(make_error(
-                metal_errc::pipeline_creation_failed,
-                message_from_error(pipeline_error,
-                                   "failed to create the linear_bf16_decode pipeline")));
+            return fail(
+                make_error(metal_errc::pipeline_creation_failed,
+                           message_from_error(pipeline_error,
+                                              "failed to create the linear_bf16_decode pipeline")));
+        }
+
+        id<MTLComputePipelineState> linear_bf16_tensorops_pipeline = nil;
+        if (compiled_metal4) {
+            id<MTLFunction> linear_bf16_tensorops =
+                [library newFunctionWithName:@"linear_bf16_tensorops"];
+            if (linear_bf16_tensorops != nil) {
+                pipeline_error = nil;
+                MTLComputePipelineDescriptor* descriptor =
+                    [[MTLComputePipelineDescriptor alloc] init];
+                descriptor.computeFunction = linear_bf16_tensorops;
+                descriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+                linear_bf16_tensorops_pipeline =
+                    [device newComputePipelineStateWithDescriptor:descriptor
+                                                          options:0
+                                                       reflection:nil
+                                                            error:&pipeline_error];
+            }
         }
 
         id<MTLFunction> linear_split_bf16 = [library newFunctionWithName:@"linear_split_bf16"];
@@ -317,9 +367,9 @@ metal_context::make(std::string_view shader_source)
         id<MTLFunction> linear_split_bf16_decode =
             [library newFunctionWithName:@"linear_split_bf16_decode"];
         if (linear_split_bf16_decode == nil) {
-            return fail(make_error(
-                metal_errc::shader_function_not_found,
-                "the Metal shader library does not contain linear_split_bf16_decode"));
+            return fail(
+                make_error(metal_errc::shader_function_not_found,
+                           "the Metal shader library does not contain linear_split_bf16_decode"));
         }
 
         pipeline_error = nil;
@@ -462,9 +512,9 @@ metal_context::make(std::string_view shader_source)
         id<MTLFunction> paged_attention_reduce_f32 =
             [library newFunctionWithName:@"paged_attention_reduce_f32"];
         if (paged_attention_reduce_f32 == nil) {
-            return fail(make_error(
-                metal_errc::shader_function_not_found,
-                "the Metal shader library does not contain paged_attention_reduce_f32"));
+            return fail(
+                make_error(metal_errc::shader_function_not_found,
+                           "the Metal shader library does not contain paged_attention_reduce_f32"));
         }
         pipeline_error = nil;
         id<MTLComputePipelineState> paged_attention_reduce_f32_pipeline =
@@ -485,6 +535,7 @@ metal_context::make(std::string_view shader_source)
         implementation->matmul_f32_pipeline = matmul_f32_pipeline;
         implementation->linear_bf16_pipeline = linear_bf16_pipeline;
         implementation->linear_bf16_decode_pipeline = linear_bf16_decode_pipeline;
+        implementation->linear_bf16_tensorops_pipeline = linear_bf16_tensorops_pipeline;
         implementation->linear_split_bf16_pipeline = linear_split_bf16_pipeline;
         implementation->linear_split_bf16_decode_pipeline = linear_split_bf16_decode_pipeline;
         implementation->embedding_bf16_pipeline = embedding_bf16_pipeline;
@@ -494,11 +545,11 @@ metal_context::make(std::string_view shader_source)
         implementation->rope_f32_pipeline = rope_f32_pipeline;
         implementation->store_kv_f32_pipeline = store_kv_f32_pipeline;
         implementation->paged_attention_f32_pipeline = paged_attention_f32_pipeline;
-        implementation->paged_attention_partial_f32_pipeline =
-            paged_attention_partial_f32_pipeline;
+        implementation->paged_attention_partial_f32_pipeline = paged_attention_partial_f32_pipeline;
         implementation->paged_attention_reduce_f32_pipeline = paged_attention_reduce_f32_pipeline;
         implementation->device_name = device_name == nullptr ? "unknown Metal device" : device_name;
         implementation->profiling_enabled = std::getenv("CHIBILLM_PROFILE_METAL") != nullptr;
+        implementation->tensorops_enabled = linear_bf16_tensorops_pipeline != nil;
 
         return metal_context { std::move(implementation) };
     }
@@ -660,8 +711,8 @@ metal_context::dispatch_matmul(const metal_buffer& lhs,
         [encoder setBytes:&shader_columns length:sizeof(shader_columns) atIndex:5];
 
         [encoder dispatchThreads:MTLSizeMake(columns, rows, 1)
-            threadsPerThreadgroup:adaptive_2d_threadgroup_size(
-                                      implementation_->matmul_f32_pipeline, columns, rows)];
+            threadsPerThreadgroup:adaptive_2d_threadgroup_size(implementation_->matmul_f32_pipeline,
+                                                               columns, rows)];
         return implementation_->complete_dispatch_encoder(*opened, "matmul");
     }
 }
@@ -693,22 +744,35 @@ metal_context::dispatch_linear_bf16(const metal_buffer& input,
         }
         id<MTLComputeCommandEncoder> encoder = opened->encoder;
 
-        const auto pipeline = rows == 1 ? implementation_->linear_bf16_decode_pipeline
-                                        : implementation_->linear_bf16_pipeline;
+        const bool use_tensorops = implementation_->tensorops_enabled && rows > 1;
+        const auto pipeline = use_tensorops ? implementation_->linear_bf16_tensorops_pipeline
+            : rows == 1                     ? implementation_->linear_bf16_decode_pipeline
+                                            : implementation_->linear_bf16_pipeline;
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
         [encoder setBuffer:weight.implementation_->buffer offset:0 atIndex:1];
         [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:2];
-        if (rows == 1) {
+        if (use_tensorops) {
+            [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:3];
+            [encoder setBytes:&shader_input_features
+                       length:sizeof(shader_input_features)
+                      atIndex:4];
+            [encoder setBytes:&shader_output_features
+                       length:sizeof(shader_output_features)
+                      atIndex:5];
+            const auto simd_width = static_cast<std::size_t>(pipeline.threadExecutionWidth);
+            [encoder
+                 dispatchThreadgroups:MTLSizeMake((output_features + 63) / 64, (rows + 63) / 64, 1)
+                threadsPerThreadgroup:MTLSizeMake(4 * simd_width, 1, 1)];
+        } else if (rows == 1) {
             const auto simd_width = static_cast<std::size_t>(pipeline.threadExecutionWidth);
             constexpr std::size_t preferred_thread_count = 256;
-            auto thread_count = std::min(
-                preferred_thread_count,
-                static_cast<std::size_t>(pipeline.maxTotalThreadsPerThreadgroup));
+            auto thread_count =
+                std::min(preferred_thread_count,
+                         static_cast<std::size_t>(pipeline.maxTotalThreadsPerThreadgroup));
             thread_count -= thread_count % simd_width;
             const auto outputs_per_threadgroup = thread_count / simd_width;
-            const auto threadgroup_count =
-                (output_features - 1) / outputs_per_threadgroup + 1;
+            const auto threadgroup_count = (output_features - 1) / outputs_per_threadgroup + 1;
             const auto shader_outputs_per_threadgroup =
                 static_cast<std::uint32_t>(outputs_per_threadgroup);
             const auto shader_simd_width = static_cast<std::uint32_t>(simd_width);
@@ -735,14 +799,14 @@ metal_context::dispatch_linear_bf16(const metal_buffer& input,
                       atIndex:5];
             [encoder dispatchThreads:MTLSizeMake(output_features, rows, 1)
                 threadsPerThreadgroup:adaptive_2d_threadgroup_size(
-                                          implementation_->linear_bf16_pipeline,
-                                          output_features,
+                                          implementation_->linear_bf16_pipeline, output_features,
                                           rows)];
         }
-        const auto profile_name = rows != 1 ? "linear_prefill"
-            : output_features > 10'000 ? "linear_decode_vocab"
-            : input_features > output_features ? "linear_decode_contract"
-                                               : "linear_decode_square";
+        const auto profile_name = use_tensorops ? "linear_tensorops"
+            : rows != 1                         ? "linear_prefill"
+            : output_features > 10'000          ? "linear_decode_vocab"
+            : input_features > output_features  ? "linear_decode_contract"
+                                                : "linear_decode_square";
         return implementation_->complete_dispatch_encoder(*opened, profile_name);
     }
 }
@@ -779,20 +843,47 @@ metal_context::dispatch_linear_split_bf16(const metal_buffer& input,
         }
         id<MTLComputeCommandEncoder> encoder = opened->encoder;
 
-        const auto pipeline = rows == 1 ? implementation_->linear_split_bf16_decode_pipeline
-                                        : implementation_->linear_split_bf16_pipeline;
+        const bool use_tensorops = implementation_->tensorops_enabled && rows > 1;
+        const auto pipeline = use_tensorops ? implementation_->linear_bf16_tensorops_pipeline
+            : rows == 1                     ? implementation_->linear_split_bf16_decode_pipeline
+                                            : implementation_->linear_split_bf16_pipeline;
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:weight.implementation_->buffer offset:0 atIndex:1];
-        for (std::size_t i = 0; i < outputs.size(); ++i) {
-            [encoder setBuffer:outputs[i]->implementation_->buffer offset:0 atIndex:2 + i];
+        if (use_tensorops) {
+            [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:3];
+            [encoder setBytes:&shader_input_features
+                       length:sizeof(shader_input_features)
+                      atIndex:4];
+            const auto simd_width = static_cast<std::size_t>(pipeline.threadExecutionWidth);
+            std::size_t weight_row_offset = 0;
+            for (std::size_t i = 0; i < outputs.size(); ++i) {
+                if (widths[i] == 0) {
+                    continue;
+                }
+                const auto weight_offset_bytes =
+                    weight_row_offset * input_features * sizeof(std::uint16_t);
+                [encoder setBuffer:weight.implementation_->buffer
+                            offset:weight_offset_bytes
+                           atIndex:1];
+                [encoder setBuffer:outputs[i]->implementation_->buffer offset:0 atIndex:2];
+                [encoder setBytes:&shader_widths[i] length:sizeof(shader_widths[i]) atIndex:5];
+                [encoder
+                     dispatchThreadgroups:MTLSizeMake((widths[i] + 63) / 64, (rows + 63) / 64, 1)
+                    threadsPerThreadgroup:MTLSizeMake(4 * simd_width, 1, 1)];
+                weight_row_offset += widths[i];
+            }
+        } else {
+            [encoder setBuffer:weight.implementation_->buffer offset:0 atIndex:1];
+            for (std::size_t i = 0; i < outputs.size(); ++i) {
+                [encoder setBuffer:outputs[i]->implementation_->buffer offset:0 atIndex:2 + i];
+            }
         }
-        if (rows == 1) {
+        if (!use_tensorops && rows == 1) {
             const auto simd_width = static_cast<std::size_t>(pipeline.threadExecutionWidth);
             constexpr std::size_t preferred_thread_count = 256;
-            auto thread_count = std::min(
-                preferred_thread_count,
-                static_cast<std::size_t>(pipeline.maxTotalThreadsPerThreadgroup));
+            auto thread_count =
+                std::min(preferred_thread_count,
+                         static_cast<std::size_t>(pipeline.maxTotalThreadsPerThreadgroup));
             thread_count -= thread_count % simd_width;
             const auto outputs_per_threadgroup = thread_count / simd_width;
             const auto threadgroup_count = (total_width - 1) / outputs_per_threadgroup + 1;
@@ -804,9 +895,7 @@ metal_context::dispatch_linear_split_bf16(const metal_buffer& input,
                        length:sizeof(shader_input_features)
                       atIndex:5];
             for (std::size_t i = 0; i < shader_widths.size(); ++i) {
-                [encoder setBytes:&shader_widths[i]
-                           length:sizeof(shader_widths[i])
-                          atIndex:6 + i];
+                [encoder setBytes:&shader_widths[i] length:sizeof(shader_widths[i]) atIndex:6 + i];
             }
             [encoder setBytes:&shader_outputs_per_threadgroup
                        length:sizeof(shader_outputs_per_threadgroup)
@@ -814,26 +903,24 @@ metal_context::dispatch_linear_split_bf16(const metal_buffer& input,
             [encoder setBytes:&shader_simd_width length:sizeof(shader_simd_width) atIndex:10];
             [encoder dispatchThreadgroups:MTLSizeMake(threadgroup_count, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
-        } else {
+        } else if (!use_tensorops) {
             [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:5];
             [encoder setBytes:&shader_input_features
                        length:sizeof(shader_input_features)
                       atIndex:6];
             for (std::size_t i = 0; i < shader_widths.size(); ++i) {
-                [encoder setBytes:&shader_widths[i]
-                           length:sizeof(shader_widths[i])
-                          atIndex:7 + i];
+                [encoder setBytes:&shader_widths[i] length:sizeof(shader_widths[i]) atIndex:7 + i];
             }
             [encoder dispatchThreads:MTLSizeMake(total_width, rows, 1)
                 threadsPerThreadgroup:adaptive_2d_threadgroup_size(
-                                          implementation_->linear_split_bf16_pipeline,
-                                          total_width,
+                                          implementation_->linear_split_bf16_pipeline, total_width,
                                           rows)];
         }
 
-        const auto profile_name = rows != 1 ? "linear_split_prefill"
-            : total_width > input_features * 4 ? "linear_split_decode_wide"
-                                               : "linear_split_decode_qkv";
+        const auto profile_name = use_tensorops ? "linear_split_tensorops"
+            : rows != 1                         ? "linear_split_prefill"
+            : total_width > input_features * 4  ? "linear_split_decode_wide"
+                                                : "linear_split_decode_qkv";
         return implementation_->complete_dispatch_encoder(*opened, profile_name);
     }
 }
@@ -870,8 +957,7 @@ metal_context::dispatch_embedding_bf16(const metal_buffer& token_ids,
 
         [encoder dispatchThreads:MTLSizeMake(hidden_size, token_count, 1)
             threadsPerThreadgroup:adaptive_2d_threadgroup_size(
-                                      implementation_->embedding_bf16_pipeline,
-                                      hidden_size,
+                                      implementation_->embedding_bf16_pipeline, hidden_size,
                                       token_count)];
         return implementation_->complete_dispatch_encoder(*opened, "embedding");
     }
@@ -1037,8 +1123,8 @@ metal_context::dispatch_rope_f32(const metal_buffer& input,
         [encoder setBytes:&theta length:sizeof(theta) atIndex:6];
 
         [encoder dispatchThreads:MTLSizeMake(pair_columns, rows, 1)
-            threadsPerThreadgroup:adaptive_2d_threadgroup_size(
-                                      implementation_->rope_f32_pipeline, pair_columns, rows)];
+            threadsPerThreadgroup:adaptive_2d_threadgroup_size(implementation_->rope_f32_pipeline,
+                                                               pair_columns, rows)];
         return implementation_->complete_dispatch_encoder(*opened, "rope");
     }
 }
@@ -1088,9 +1174,7 @@ metal_context::dispatch_store_kv_f32(const metal_buffer& keys,
 
         [encoder dispatchThreads:MTLSizeMake(feature_count, rows, 1)
             threadsPerThreadgroup:adaptive_2d_threadgroup_size(
-                                      implementation_->store_kv_f32_pipeline,
-                                      feature_count,
-                                      rows)];
+                                      implementation_->store_kv_f32_pipeline, feature_count, rows)];
         return implementation_->complete_dispatch_encoder(*opened, "store_kv");
     }
 }
@@ -1154,9 +1238,8 @@ metal_context::dispatch_paged_attention_f32(const metal_buffer& queries,
         if (rows == 1) {
             std::memcpy(&decode_position, positions.bytes().data(), sizeof(decode_position));
         }
-        const auto chunk_count = rows == 1
-            ? (static_cast<std::size_t>(decode_position) / attention_chunk_size + 1)
-            : 1;
+        const auto chunk_count =
+            rows == 1 ? (static_cast<std::size_t>(decode_position) / attention_chunk_size + 1) : 1;
 
         if (chunk_count > 1 && decode_position >= chunked_attention_min_tokens - 1) {
             const auto partial_stride = head_dimension + 2;
@@ -1174,8 +1257,7 @@ metal_context::dispatch_paged_attention_f32(const metal_buffer& queries,
                 return fail(partials.error());
             }
 
-            const auto shader_chunk_size =
-                static_cast<std::uint32_t>(attention_chunk_size);
+            const auto shader_chunk_size = static_cast<std::uint32_t>(attention_chunk_size);
             const auto shader_chunk_count = static_cast<std::uint32_t>(chunk_count);
             auto opened = implementation_->open_dispatch_encoder();
             if (!opened) {
@@ -1196,9 +1278,7 @@ metal_context::dispatch_paged_attention_f32(const metal_buffer& queries,
             [encoder setBytes:&shader_query_head_count
                        length:sizeof(shader_query_head_count)
                       atIndex:9];
-            [encoder setBytes:&shader_kv_head_count
-                       length:sizeof(shader_kv_head_count)
-                      atIndex:10];
+            [encoder setBytes:&shader_kv_head_count length:sizeof(shader_kv_head_count) atIndex:10];
             [encoder setBytes:&shader_head_dimension
                        length:sizeof(shader_head_dimension)
                       atIndex:11];
@@ -1234,8 +1314,8 @@ metal_context::dispatch_paged_attention_f32(const metal_buffer& queries,
             [encoder setThreadgroupMemoryLength:sizeof(float) atIndex:1];
             [encoder dispatchThreadgroups:MTLSizeMake(query_head_count, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(head_dimension, 1, 1)];
-            return implementation_->complete_dispatch_encoder(
-                *opened, "paged_attention_chunked_decode");
+            return implementation_->complete_dispatch_encoder(*opened,
+                                                              "paged_attention_chunked_decode");
         }
 
         auto opened = implementation_->open_dispatch_encoder();
@@ -1265,9 +1345,7 @@ metal_context::dispatch_paged_attention_f32(const metal_buffer& queries,
         [encoder setBytes:&shader_block_table_entry_count
                    length:sizeof(shader_block_table_entry_count)
                   atIndex:15];
-        [encoder setBytes:&shader_simdgroup_count
-                   length:sizeof(shader_simdgroup_count)
-                  atIndex:16];
+        [encoder setBytes:&shader_simdgroup_count length:sizeof(shader_simdgroup_count) atIndex:16];
         [encoder setThreadgroupMemoryLength:head_dimension * sizeof(float) atIndex:0];
         [encoder setThreadgroupMemoryLength:4 * sizeof(float) atIndex:1];
 
