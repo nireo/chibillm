@@ -33,6 +33,28 @@ message_from_error(NSError* error, std::string_view fallback)
     return message == nullptr ? std::string(fallback) : std::string(message);
 }
 
+MTLSize
+adaptive_2d_threadgroup_size(id<MTLComputePipelineState> pipeline,
+                             std::size_t grid_width,
+                             std::size_t grid_height)
+{
+    if (grid_height == 1) {
+        const auto simd_width =
+            static_cast<std::size_t>(pipeline.threadExecutionWidth);
+        return MTLSizeMake(std::min(simd_width, grid_width), 1, 1);
+    }
+
+    constexpr std::size_t preferred_threadgroup_dimension = 16;
+    const auto max_threads =
+        static_cast<std::size_t>(pipeline.maxTotalThreadsPerThreadgroup);
+    const auto threadgroup_width =
+        std::min({ preferred_threadgroup_dimension, max_threads, grid_width });
+    const auto threadgroup_height = std::min(
+        { preferred_threadgroup_dimension, max_threads / threadgroup_width, grid_height });
+
+    return MTLSizeMake(threadgroup_width, threadgroup_height, 1);
+}
+
 } // namespace
 
 struct metal_buffer::implementation {
@@ -516,15 +538,9 @@ metal_context::dispatch_matmul(const metal_buffer& lhs,
         [encoder setBytes:&shader_inner_dimension length:sizeof(shader_inner_dimension) atIndex:4];
         [encoder setBytes:&shader_columns length:sizeof(shader_columns) atIndex:5];
 
-        constexpr std::size_t preferred_threadgroup_dimension = 16;
-        const auto max_threads = static_cast<std::size_t>(
-            implementation_->matmul_f32_pipeline.maxTotalThreadsPerThreadgroup);
-        const auto threadgroup_width = std::min(preferred_threadgroup_dimension, max_threads);
-        const auto threadgroup_height =
-            std::min(preferred_threadgroup_dimension, max_threads / threadgroup_width);
-
         [encoder dispatchThreads:MTLSizeMake(columns, rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
+            threadsPerThreadgroup:adaptive_2d_threadgroup_size(
+                                      implementation_->matmul_f32_pipeline, columns, rows)];
         return implementation_->complete_dispatch_encoder(*opened);
     }
 }
@@ -564,15 +580,11 @@ metal_context::dispatch_linear_bf16(const metal_buffer& input,
         [encoder setBytes:&shader_input_features length:sizeof(shader_input_features) atIndex:4];
         [encoder setBytes:&shader_output_features length:sizeof(shader_output_features) atIndex:5];
 
-        constexpr std::size_t preferred_threadgroup_dimension = 16;
-        const auto max_threads = static_cast<std::size_t>(
-            implementation_->linear_bf16_pipeline.maxTotalThreadsPerThreadgroup);
-        const auto threadgroup_width = std::min(preferred_threadgroup_dimension, max_threads);
-        const auto threadgroup_height =
-            std::min(preferred_threadgroup_dimension, max_threads / threadgroup_width);
-
         [encoder dispatchThreads:MTLSizeMake(output_features, rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
+            threadsPerThreadgroup:adaptive_2d_threadgroup_size(
+                                      implementation_->linear_bf16_pipeline,
+                                      output_features,
+                                      rows)];
         return implementation_->complete_dispatch_encoder(*opened);
     }
 }
@@ -621,15 +633,11 @@ metal_context::dispatch_linear_split_bf16(const metal_buffer& input,
             [encoder setBytes:&shader_widths[i] length:sizeof(shader_widths[i]) atIndex:7 + i];
         }
 
-        constexpr std::size_t preferred_threadgroup_dimension = 16;
-        const auto max_threads = static_cast<std::size_t>(
-            implementation_->linear_split_bf16_pipeline.maxTotalThreadsPerThreadgroup);
-        const auto threadgroup_width = std::min(preferred_threadgroup_dimension, max_threads);
-        const auto threadgroup_height =
-            std::min(preferred_threadgroup_dimension, max_threads / threadgroup_width);
-
         [encoder dispatchThreads:MTLSizeMake(total_width, rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
+            threadsPerThreadgroup:adaptive_2d_threadgroup_size(
+                                      implementation_->linear_split_bf16_pipeline,
+                                      total_width,
+                                      rows)];
 
         return implementation_->complete_dispatch_encoder(*opened);
     }
@@ -665,15 +673,11 @@ metal_context::dispatch_embedding_bf16(const metal_buffer& token_ids,
         [encoder setBytes:&shader_token_count length:sizeof(shader_token_count) atIndex:3];
         [encoder setBytes:&shader_hidden_size length:sizeof(shader_hidden_size) atIndex:4];
 
-        constexpr std::size_t preferred_threadgroup_dimension = 16;
-        const auto max_threads = static_cast<std::size_t>(
-            implementation_->embedding_bf16_pipeline.maxTotalThreadsPerThreadgroup);
-        const auto threadgroup_width = std::min(preferred_threadgroup_dimension, max_threads);
-        const auto threadgroup_height =
-            std::min(preferred_threadgroup_dimension, max_threads / threadgroup_width);
-
         [encoder dispatchThreads:MTLSizeMake(hidden_size, token_count, 1)
-            threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
+            threadsPerThreadgroup:adaptive_2d_threadgroup_size(
+                                      implementation_->embedding_bf16_pipeline,
+                                      hidden_size,
+                                      token_count)];
         return implementation_->complete_dispatch_encoder(*opened);
     }
 }
@@ -836,15 +840,9 @@ metal_context::dispatch_rope_f32(const metal_buffer& input,
         [encoder setBytes:&shader_head_dimension length:sizeof(shader_head_dimension) atIndex:5];
         [encoder setBytes:&theta length:sizeof(theta) atIndex:6];
 
-        constexpr std::size_t preferred_threadgroup_dimension = 16;
-        const auto max_threads = static_cast<std::size_t>(
-            implementation_->rope_f32_pipeline.maxTotalThreadsPerThreadgroup);
-        const auto threadgroup_width = std::min(preferred_threadgroup_dimension, max_threads);
-        const auto threadgroup_height =
-            std::min(preferred_threadgroup_dimension, max_threads / threadgroup_width);
-
         [encoder dispatchThreads:MTLSizeMake(pair_columns, rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
+            threadsPerThreadgroup:adaptive_2d_threadgroup_size(
+                                      implementation_->rope_f32_pipeline, pair_columns, rows)];
         return implementation_->complete_dispatch_encoder(*opened);
     }
 }
@@ -892,15 +890,11 @@ metal_context::dispatch_store_kv_f32(const metal_buffer& keys,
         [encoder setBytes:&shader_layer length:sizeof(shader_layer) atIndex:7];
         [encoder setBytes:&shader_slot_count length:sizeof(shader_slot_count) atIndex:8];
 
-        constexpr std::size_t preferred_threadgroup_dimension = 16;
-        const auto max_threads = static_cast<std::size_t>(
-            implementation_->store_kv_f32_pipeline.maxTotalThreadsPerThreadgroup);
-        const auto threadgroup_width = std::min(preferred_threadgroup_dimension, max_threads);
-        const auto threadgroup_height =
-            std::min(preferred_threadgroup_dimension, max_threads / threadgroup_width);
-
         [encoder dispatchThreads:MTLSizeMake(feature_count, rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
+            threadsPerThreadgroup:adaptive_2d_threadgroup_size(
+                                      implementation_->store_kv_f32_pipeline,
+                                      feature_count,
+                                      rows)];
         return implementation_->complete_dispatch_encoder(*opened);
     }
 }
