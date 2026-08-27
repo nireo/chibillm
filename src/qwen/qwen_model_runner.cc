@@ -160,8 +160,16 @@ qwen_model_runner::execute(const model_batch& batch)
     if (!metadata) {
         return fail(metadata.error());
     }
+
+    // every kernel of the forward pass is encoded into one command buffer and
+    // awaited exactly once at the end; per-op waits would dominate wall time.
+    auto pass_started = context_.begin_compute_pass();
+    if (!pass_started) {
+        return fail(model_runner_errc::backend_failure);
+    }
     auto hidden_states = embed_qwen_tokens(context_, weights_, batch.tokens);
     if (!hidden_states) {
+        context_.abort_compute_pass();
         return fail(model_runner_errc::backend_failure);
     }
     auto final_hidden = run_qwen_layers(context_, config_, weights_, std::move(*hidden_states),
@@ -174,8 +182,15 @@ qwen_model_runner::execute(const model_batch& batch)
                                         },
                                         cache_);
     if (!final_hidden) {
+        context_.abort_compute_pass();
         return fail(model_runner_errc::backend_failure);
     }
+    auto pass_finished = context_.end_compute_pass();
+    if (!pass_finished) {
+        return fail(model_runner_errc::backend_failure);
+    }
+
+    // reads shared memory written by the pass above, so it runs after it.
     auto tokens =
         sample_qwen_greedy(context_, config_, weights_, *final_hidden, metadata->logits_indices);
     if (!tokens) {

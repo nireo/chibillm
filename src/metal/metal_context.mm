@@ -52,8 +52,73 @@ struct metal_context::implementation {
     id<MTLComputePipelineState> rope_f32_pipeline;
     id<MTLComputePipelineState> store_kv_f32_pipeline;
     id<MTLComputePipelineState> paged_attention_f32_pipeline;
+    // one open "pass" collects many dispatches into a single command buffer.
+    // nil when no pass is open. Accessed by const dispatches through the shallow
+    // constness of the owning unique_ptr (pointer constness, not pointee).
+    id<MTLCommandBuffer> pass_command_buffer;
+    id<MTLComputeCommandEncoder> pass_encoder;
     std::string device_name;
+
+    // what one dispatch encodes into; see definition below.
+    struct dispatch_frame;
+
+    [[nodiscard]] result<dispatch_frame, metal_error> open_dispatch_encoder();
+    [[nodiscard]] result<void, metal_error>
+    complete_dispatch_encoder(const dispatch_frame& frame);
 };
+
+// what a dispatch needs to encode one kernel. command_buffer is nil when the
+// dispatch is appending to an open compute pass instead of running standalone.
+struct metal_context::implementation::dispatch_frame {
+    id<MTLCommandBuffer> command_buffer;
+    id<MTLComputeCommandEncoder> encoder;
+};
+
+// returns the encoder a dispatch must encode into: the open pass's encoder when
+// batching, or a fresh self-contained command buffer otherwise (legacy behavior).
+result<metal_context::implementation::dispatch_frame, metal_error>
+metal_context::implementation::open_dispatch_encoder()
+{
+    if (pass_encoder != nil) {
+        return dispatch_frame { nil, pass_encoder };
+    }
+
+    id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
+    if (command_buffer == nil) {
+        return fail(make_error(metal_errc::command_buffer_creation_failed,
+                               "failed to create a Metal command buffer"));
+    }
+
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    if (encoder == nil) {
+        return fail(make_error(metal_errc::command_encoder_creation_failed,
+                               "failed to create a Metal compute encoder"));
+    }
+
+    return dispatch_frame { command_buffer, encoder };
+}
+
+// closes out one dispatch. Standalone frames commit and wait as before; kernels
+// appended to an open pass are finished later by end_compute_pass().
+result<void, metal_error>
+metal_context::implementation::complete_dispatch_encoder(const dispatch_frame& frame)
+{
+    if (frame.command_buffer == nil) {
+        return {};
+    }
+
+    [frame.encoder endEncoding];
+    [frame.command_buffer commit];
+    [frame.command_buffer waitUntilCompleted];
+
+    if (frame.command_buffer.status != MTLCommandBufferStatusCompleted) {
+        return fail(make_error(
+            metal_errc::execution_failed,
+            message_from_error(frame.command_buffer.error, "Metal command execution failed")));
+    }
+
+    return {};
+}
 
 metal_buffer::metal_buffer(std::unique_ptr<implementation> implementation) noexcept
     : implementation_(std::move(implementation))
@@ -299,6 +364,83 @@ metal_context::device_name() const noexcept
     return implementation_->device_name;
 }
 
+result<void, metal_error>
+metal_context::begin_compute_pass()
+{
+    @autoreleasepool {
+        if (implementation_->pass_encoder != nil) {
+            return fail(make_error(metal_errc::invalid_input,
+                                   "cannot begin a compute pass while one is already open"));
+        }
+
+        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
+        if (command_buffer == nil) {
+            return fail(make_error(metal_errc::command_buffer_creation_failed,
+                                   "failed to create a Metal command buffer"));
+        }
+
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return fail(make_error(metal_errc::command_encoder_creation_failed,
+                                   "failed to create a Metal compute encoder"));
+        }
+
+        implementation_->pass_command_buffer = command_buffer;
+        implementation_->pass_encoder = encoder;
+        return {};
+    }
+}
+
+result<void, metal_error>
+metal_context::end_compute_pass()
+{
+    @autoreleasepool {
+        if (implementation_->pass_encoder == nil || implementation_->pass_command_buffer == nil) {
+            return fail(make_error(metal_errc::invalid_input,
+                                   "cannot end a compute pass while none is open"));
+        }
+
+        // detach first so a failure below still leaves the context reusable.
+        id<MTLCommandBuffer> command_buffer = implementation_->pass_command_buffer;
+        id<MTLComputeCommandEncoder> encoder = implementation_->pass_encoder;
+        implementation_->pass_command_buffer = nil;
+        implementation_->pass_encoder = nil;
+
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return fail(make_error(
+                metal_errc::execution_failed,
+                message_from_error(command_buffer.error, "Metal command execution failed")));
+        }
+
+        return {};
+    }
+}
+
+void
+metal_context::abort_compute_pass() noexcept
+{
+    @autoreleasepool {
+        if (implementation_->pass_command_buffer == nil) {
+            return;
+        }
+
+        id<MTLCommandBuffer> command_buffer = implementation_->pass_command_buffer;
+        id<MTLComputeCommandEncoder> encoder = implementation_->pass_encoder;
+        implementation_->pass_command_buffer = nil;
+        implementation_->pass_encoder = nil;
+
+        // nothing encoded here may be read afterwards; commit only so shared-memory
+        // writes settle deterministically before the caller sees the error.
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+    }
+}
+
 result<metal_buffer, metal_error>
 metal_context::make_shared_buffer(std::size_t size_bytes) const
 {
@@ -342,17 +484,11 @@ metal_context::dispatch_matmul(const metal_buffer& lhs,
         const auto shader_inner_dimension = static_cast<std::uint32_t>(inner_dimension);
         const auto shader_columns = static_cast<std::uint32_t>(columns);
 
-        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
-        if (command_buffer == nil) {
-            return fail(make_error(metal_errc::command_buffer_creation_failed,
-                                   "failed to create a Metal command buffer"));
+        auto opened = implementation_->open_dispatch_encoder();
+        if (!opened) {
+            return fail(opened.error());
         }
-
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return fail(make_error(metal_errc::command_encoder_creation_failed,
-                                   "failed to create a Metal compute encoder"));
-        }
+        id<MTLComputeCommandEncoder> encoder = opened->encoder;
 
         [encoder setComputePipelineState:implementation_->matmul_f32_pipeline];
         [encoder setBuffer:lhs.implementation_->buffer offset:0 atIndex:0];
@@ -371,18 +507,7 @@ metal_context::dispatch_matmul(const metal_buffer& lhs,
 
         [encoder dispatchThreads:MTLSizeMake(columns, rows, 1)
             threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
-        [encoder endEncoding];
-
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return fail(make_error(
-                metal_errc::execution_failed,
-                message_from_error(command_buffer.error, "Metal command execution failed")));
-        }
-
-        return {};
+        return implementation_->complete_dispatch_encoder(*opened);
     }
 }
 
@@ -407,17 +532,11 @@ metal_context::dispatch_linear_bf16(const metal_buffer& input,
         const auto shader_input_features = static_cast<std::uint32_t>(input_features);
         const auto shader_output_features = static_cast<std::uint32_t>(output_features);
 
-        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
-        if (command_buffer == nil) {
-            return fail(make_error(metal_errc::command_buffer_creation_failed,
-                                   "failed to create a Metal command buffer"));
+        auto opened = implementation_->open_dispatch_encoder();
+        if (!opened) {
+            return fail(opened.error());
         }
-
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return fail(make_error(metal_errc::command_encoder_creation_failed,
-                                   "failed to create a Metal compute encoder"));
-        }
+        id<MTLComputeCommandEncoder> encoder = opened->encoder;
 
         [encoder setComputePipelineState:implementation_->linear_bf16_pipeline];
         [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
@@ -436,18 +555,7 @@ metal_context::dispatch_linear_bf16(const metal_buffer& input,
 
         [encoder dispatchThreads:MTLSizeMake(output_features, rows, 1)
             threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
-        [encoder endEncoding];
-
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return fail(make_error(
-                metal_errc::execution_failed,
-                message_from_error(command_buffer.error, "Metal command execution failed")));
-        }
-
-        return {};
+        return implementation_->complete_dispatch_encoder(*opened);
     }
 }
 
@@ -468,17 +576,11 @@ metal_context::dispatch_embedding_bf16(const metal_buffer& token_ids,
         const auto shader_token_count = static_cast<std::uint32_t>(token_count);
         const auto shader_hidden_size = static_cast<std::uint32_t>(hidden_size);
 
-        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
-        if (command_buffer == nil) {
-            return fail(make_error(metal_errc::command_buffer_creation_failed,
-                                   "failed to create a Metal command buffer"));
+        auto opened = implementation_->open_dispatch_encoder();
+        if (!opened) {
+            return fail(opened.error());
         }
-
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return fail(make_error(metal_errc::command_encoder_creation_failed,
-                                   "failed to create a Metal compute encoder"));
-        }
+        id<MTLComputeCommandEncoder> encoder = opened->encoder;
 
         [encoder setComputePipelineState:implementation_->embedding_bf16_pipeline];
         [encoder setBuffer:token_ids.implementation_->buffer offset:0 atIndex:0];
@@ -496,18 +598,7 @@ metal_context::dispatch_embedding_bf16(const metal_buffer& token_ids,
 
         [encoder dispatchThreads:MTLSizeMake(hidden_size, token_count, 1)
             threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
-        [encoder endEncoding];
-
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return fail(make_error(
-                metal_errc::execution_failed,
-                message_from_error(command_buffer.error, "Metal command execution failed")));
-        }
-
-        return {};
+        return implementation_->complete_dispatch_encoder(*opened);
     }
 }
 
@@ -529,17 +620,11 @@ metal_context::dispatch_rms_norm_bf16(const metal_buffer& input,
         const auto shader_rows = static_cast<std::uint32_t>(rows);
         const auto shader_hidden_size = static_cast<std::uint32_t>(hidden_size);
 
-        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
-        if (command_buffer == nil) {
-            return fail(make_error(metal_errc::command_buffer_creation_failed,
-                                   "failed to create a Metal command buffer"));
+        auto opened = implementation_->open_dispatch_encoder();
+        if (!opened) {
+            return fail(opened.error());
         }
-
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return fail(make_error(metal_errc::command_encoder_creation_failed,
-                                   "failed to create a Metal compute encoder"));
-        }
+        id<MTLComputeCommandEncoder> encoder = opened->encoder;
 
         [encoder setComputePipelineState:implementation_->rms_norm_bf16_pipeline];
         [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
@@ -556,18 +641,7 @@ metal_context::dispatch_rms_norm_bf16(const metal_buffer& input,
 
         [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
-        [encoder endEncoding];
-
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return fail(make_error(
-                metal_errc::execution_failed,
-                message_from_error(command_buffer.error, "Metal command execution failed")));
-        }
-
-        return {};
+        return implementation_->complete_dispatch_encoder(*opened);
     }
 }
 
@@ -585,17 +659,11 @@ metal_context::dispatch_silu_mul_f32(const metal_buffer& gate,
 
         const auto shader_element_count = static_cast<std::uint32_t>(element_count);
 
-        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
-        if (command_buffer == nil) {
-            return fail(make_error(metal_errc::command_buffer_creation_failed,
-                                   "failed to create a Metal command buffer"));
+        auto opened = implementation_->open_dispatch_encoder();
+        if (!opened) {
+            return fail(opened.error());
         }
-
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return fail(make_error(metal_errc::command_encoder_creation_failed,
-                                   "failed to create a Metal compute encoder"));
-        }
+        id<MTLComputeCommandEncoder> encoder = opened->encoder;
 
         [encoder setComputePipelineState:implementation_->silu_mul_f32_pipeline];
         [encoder setBuffer:gate.implementation_->buffer offset:0 atIndex:0];
@@ -611,18 +679,7 @@ metal_context::dispatch_silu_mul_f32(const metal_buffer& gate,
 
         [encoder dispatchThreads:MTLSizeMake(element_count, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
-        [encoder endEncoding];
-
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return fail(make_error(
-                metal_errc::execution_failed,
-                message_from_error(command_buffer.error, "Metal command execution failed")));
-        }
-
-        return {};
+        return implementation_->complete_dispatch_encoder(*opened);
     }
 }
 
@@ -640,17 +697,11 @@ metal_context::dispatch_add_f32(const metal_buffer& lhs,
 
         const auto shader_element_count = static_cast<std::uint32_t>(element_count);
 
-        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
-        if (command_buffer == nil) {
-            return fail(make_error(metal_errc::command_buffer_creation_failed,
-                                   "failed to create a Metal command buffer"));
+        auto opened = implementation_->open_dispatch_encoder();
+        if (!opened) {
+            return fail(opened.error());
         }
-
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return fail(make_error(metal_errc::command_encoder_creation_failed,
-                                   "failed to create a Metal compute encoder"));
-        }
+        id<MTLComputeCommandEncoder> encoder = opened->encoder;
 
         [encoder setComputePipelineState:implementation_->add_f32_pipeline];
         [encoder setBuffer:lhs.implementation_->buffer offset:0 atIndex:0];
@@ -666,18 +717,7 @@ metal_context::dispatch_add_f32(const metal_buffer& lhs,
 
         [encoder dispatchThreads:MTLSizeMake(element_count, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
-        [encoder endEncoding];
-
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return fail(make_error(
-                metal_errc::execution_failed,
-                message_from_error(command_buffer.error, "Metal command execution failed")));
-        }
-
-        return {};
+        return implementation_->complete_dispatch_encoder(*opened);
     }
 }
 
@@ -705,17 +745,11 @@ metal_context::dispatch_rope_f32(const metal_buffer& input,
         const auto shader_head_count = static_cast<std::uint32_t>(head_count);
         const auto shader_head_dimension = static_cast<std::uint32_t>(head_dimension);
 
-        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
-        if (command_buffer == nil) {
-            return fail(make_error(metal_errc::command_buffer_creation_failed,
-                                   "failed to create a Metal command buffer"));
+        auto opened = implementation_->open_dispatch_encoder();
+        if (!opened) {
+            return fail(opened.error());
         }
-
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return fail(make_error(metal_errc::command_encoder_creation_failed,
-                                   "failed to create a Metal compute encoder"));
-        }
+        id<MTLComputeCommandEncoder> encoder = opened->encoder;
 
         [encoder setComputePipelineState:implementation_->rope_f32_pipeline];
         [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
@@ -735,18 +769,7 @@ metal_context::dispatch_rope_f32(const metal_buffer& input,
 
         [encoder dispatchThreads:MTLSizeMake(pair_columns, rows, 1)
             threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
-        [encoder endEncoding];
-
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return fail(make_error(
-                metal_errc::execution_failed,
-                message_from_error(command_buffer.error, "Metal command execution failed")));
-        }
-
-        return {};
+        return implementation_->complete_dispatch_encoder(*opened);
     }
 }
 
@@ -776,17 +799,11 @@ metal_context::dispatch_store_kv_f32(const metal_buffer& keys,
         const auto shader_layer = static_cast<std::uint32_t>(layer);
         const auto shader_slot_count = static_cast<std::uint32_t>(slot_count);
 
-        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
-        if (command_buffer == nil) {
-            return fail(make_error(metal_errc::command_buffer_creation_failed,
-                                   "failed to create a Metal command buffer"));
+        auto opened = implementation_->open_dispatch_encoder();
+        if (!opened) {
+            return fail(opened.error());
         }
-
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return fail(make_error(metal_errc::command_encoder_creation_failed,
-                                   "failed to create a Metal compute encoder"));
-        }
+        id<MTLComputeCommandEncoder> encoder = opened->encoder;
 
         [encoder setComputePipelineState:implementation_->store_kv_f32_pipeline];
         [encoder setBuffer:keys.implementation_->buffer offset:0 atIndex:0];
@@ -808,18 +825,7 @@ metal_context::dispatch_store_kv_f32(const metal_buffer& keys,
 
         [encoder dispatchThreads:MTLSizeMake(feature_count, rows, 1)
             threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
-        [encoder endEncoding];
-
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return fail(make_error(
-                metal_errc::execution_failed,
-                message_from_error(command_buffer.error, "Metal command execution failed")));
-        }
-
-        return {};
+        return implementation_->complete_dispatch_encoder(*opened);
     }
 }
 
@@ -872,17 +878,11 @@ metal_context::dispatch_paged_attention_f32(const metal_buffer& queries,
         const auto shader_block_table_entry_count =
             static_cast<std::uint32_t>(block_table_entry_count);
 
-        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
-        if (command_buffer == nil) {
-            return fail(make_error(metal_errc::command_buffer_creation_failed,
-                                   "failed to create a Metal command buffer"));
+        auto opened = implementation_->open_dispatch_encoder();
+        if (!opened) {
+            return fail(opened.error());
         }
-
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return fail(make_error(metal_errc::command_encoder_creation_failed,
-                                   "failed to create a Metal compute encoder"));
-        }
+        id<MTLComputeCommandEncoder> encoder = opened->encoder;
 
         [encoder setComputePipelineState:implementation_->paged_attention_f32_pipeline];
         [encoder setBuffer:queries.implementation_->buffer offset:0 atIndex:0];
@@ -910,18 +910,7 @@ metal_context::dispatch_paged_attention_f32(const metal_buffer& queries,
 
         [encoder dispatchThreadgroups:MTLSizeMake(query_head_count, rows, 1)
                 threadsPerThreadgroup:MTLSizeMake(head_dimension, 1, 1)];
-        [encoder endEncoding];
-
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return fail(make_error(
-                metal_errc::execution_failed,
-                message_from_error(command_buffer.error, "Metal command execution failed")));
-        }
-
-        return {};
+        return implementation_->complete_dispatch_encoder(*opened);
     }
 }
 

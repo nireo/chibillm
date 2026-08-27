@@ -28,6 +28,19 @@ public:
 
     [[nodiscard]] std::string_view device_name() const noexcept;
 
+    // opens one command buffer whose compute encoder collects every dispatch until
+    // end_compute_pass(). Dispatches made while a pass is open are appended to it;
+    // they no longer wait on the GPU individually.
+    [[nodiscard]] result<void, metal_error> begin_compute_pass();
+
+    // commits the open command buffer and waits once for all of its kernels.
+    [[nodiscard]] result<void, metal_error> end_compute_pass();
+
+    // commits (and waits on) whatever kernels were already encoded into the open
+    // pass, then closes it. Used when a batched operation fails midway so GPU and
+    // shared-memory state still settle before returning to the caller.
+    void abort_compute_pass() noexcept;
+
     [[nodiscard]] result<metal_buffer, metal_error>
     make_shared_buffer(std::size_t size_bytes) const;
 
