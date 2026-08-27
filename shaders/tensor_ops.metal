@@ -62,6 +62,37 @@ linear_bf16(device const float* input [[buffer(0)]],
 }
 
 kernel void
+linear_bf16_decode(device const float* input [[buffer(0)]],
+    device const ushort* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& input_features [[buffer(3)]],
+    constant uint& output_features [[buffer(4)]],
+    constant uint& outputs_per_threadgroup [[buffer(5)]],
+    constant uint& simd_width [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]])
+{
+    const uint output_feature =
+        threadgroup_position.x * outputs_per_threadgroup + simdgroup;
+    if (output_feature >= output_features) {
+        return;
+    }
+
+    float accumulator = 0.0F;
+    const ulong weight_base = ulong(output_feature) * ulong(input_features);
+    for (uint k = lane; k < input_features; k += simd_width) {
+        const float value = as_type<float>(uint(weight[weight_base + ulong(k)]) << 16);
+        accumulator += input[k] * value;
+    }
+
+    accumulator = simd_sum(accumulator);
+    if (lane == 0) {
+        output[output_feature] = accumulator;
+    }
+}
+
+kernel void
 linear_split_bf16(device const float* input [[buffer(0)]],
     device const ushort* weight [[buffer(1)]],
     device float* output_a [[buffer(2)]],
@@ -108,6 +139,49 @@ linear_split_bf16(device const float* input [[buffer(0)]],
     }
 
     output[row * row_length + local_column] = accumulator;
+}
+
+kernel void
+linear_split_bf16_decode(device const float* input [[buffer(0)]],
+    device const ushort* weight [[buffer(1)]],
+    device float* output_a [[buffer(2)]],
+    device float* output_b [[buffer(3)]],
+    device float* output_c [[buffer(4)]],
+    constant uint& input_features [[buffer(5)]],
+    constant uint& width_a [[buffer(6)]],
+    constant uint& width_b [[buffer(7)]],
+    constant uint& width_c [[buffer(8)]],
+    constant uint& outputs_per_threadgroup [[buffer(9)]],
+    constant uint& simd_width [[buffer(10)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]])
+{
+    const uint weight_row =
+        threadgroup_position.x * outputs_per_threadgroup + simdgroup;
+    const uint total_width = width_a + width_b + width_c;
+    if (weight_row >= total_width) {
+        return;
+    }
+
+    float accumulator = 0.0F;
+    const ulong weight_base = ulong(weight_row) * ulong(input_features);
+    for (uint k = lane; k < input_features; k += simd_width) {
+        const float value = as_type<float>(uint(weight[weight_base + ulong(k)]) << 16);
+        accumulator += input[k] * value;
+    }
+
+    accumulator = simd_sum(accumulator);
+    if (lane != 0) {
+        return;
+    }
+    if (weight_row < width_a) {
+        output_a[weight_row] = accumulator;
+    } else if (weight_row < width_a + width_b) {
+        output_b[weight_row - width_a] = accumulator;
+    } else {
+        output_c[weight_row - width_a - width_b] = accumulator;
+    }
 }
 
 kernel void

@@ -307,6 +307,35 @@ TEST_CASE("linear preserves signed fractional bf16 weights")
     CHECK(values[1] == doctest::Approx(-1.5F));
 }
 
+TEST_CASE("linear split projects a single row into separate outputs")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto input = make_tensor(*context, dtype::f32, { 1, 4 });
+    auto weight = make_tensor(*context, dtype::bf16, { 5, 4 });
+    auto output_a = make_tensor(*context, dtype::f32, { 1, 2 });
+    auto output_b = make_tensor(*context, dtype::f32, { 1, 1 });
+    auto output_c = make_tensor(*context, dtype::f32, { 1, 2 });
+    write_floats(input, { 1.0F, 2.0F, 3.0F, 4.0F });
+    write_bf16(weight,
+               {
+                   1.0F, 0.0F, 0.0F, 0.0F,
+                   0.0F, 1.0F, 0.0F, 0.0F,
+                   0.0F, 0.0F, 1.0F, 0.0F,
+                   0.0F, 0.0F, 0.0F, 1.0F,
+                   1.0F, 1.0F, 1.0F, 1.0F,
+               });
+
+    auto projected = linear_split(
+        *context, input, weight, { &output_a, &output_b, &output_c });
+    REQUIRE(projected.has_value());
+
+    CHECK(read_floats(output_a) == std::vector<float> { 1.0F, 2.0F });
+    CHECK(read_floats(output_b) == std::vector<float> { 3.0F });
+    CHECK(read_floats(output_c) == std::vector<float> { 4.0F, 10.0F });
+}
+
 TEST_CASE("embedding lookup gathers token rows in input order")
 {
     auto context = metal_context::make(load_shader_source());
