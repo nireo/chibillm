@@ -1,6 +1,7 @@
 #include "tensor/tensor_ops.h"
 #include "tensor/dtype.h"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -83,6 +84,67 @@ linear(const metal_context& context,
 
     const auto dispatched = context.dispatch_linear_bf16(
         input.buffer(), weight.buffer(), output.buffer(), rows, input_features, output_features);
+    if (!dispatched) {
+        return fail(tensor_op_errc::backend_failure);
+    }
+
+    return {};
+}
+
+result<void, tensor_op_errc>
+linear_split(const metal_context& context,
+             const metal_tensor& input,
+             const metal_tensor& packed_weight,
+             std::initializer_list<metal_tensor*> outputs)
+{
+    const auto& input_shape = input.descriptor().shape();
+    const auto& weight_shape = packed_weight.descriptor().shape();
+    if (input_shape.rank() != 2 || weight_shape.rank() != 2) {
+        return fail(tensor_op_errc::invalid_rank);
+    }
+    if (input.descriptor().type() != dtype::f32
+        || packed_weight.descriptor().type() != dtype::bf16) {
+        return fail(tensor_op_errc::unsupported_dtype);
+    }
+    if (outputs.size() < 2 || outputs.size() > 3) {
+        return fail(tensor_op_errc::output_shape_mismatch);
+    }
+
+    const auto rows = input_shape.dimensions()[0];
+    const auto input_features = input_shape.dimensions()[1];
+    std::array<metal_buffer*, 3> output_buffers;
+    std::array<std::size_t, 3> widths {};
+    std::size_t i = 0;
+    std::size_t total_width = 0;
+    for (auto* output : outputs) {
+        if (output == nullptr) {
+            return fail(tensor_op_errc::output_shape_mismatch);
+        }
+        const auto& shape = output->descriptor().shape();
+        if (shape.rank() != 2) {
+            return fail(tensor_op_errc::invalid_rank);
+        }
+        if (shape.dimensions()[0] != rows) {
+            return fail(tensor_op_errc::output_shape_mismatch);
+        }
+        if (output->descriptor().type() != dtype::f32) {
+            return fail(tensor_op_errc::unsupported_dtype);
+        }
+        widths[i] = shape.dimensions()[1];
+        total_width += widths[i];
+        output_buffers[i++] = &output->buffer();
+    }
+    while (i < output_buffers.size()) {
+        output_buffers[i++] = output_buffers[0];
+    }
+
+    if (weight_shape.dimensions()[0] != total_width
+        || weight_shape.dimensions()[1] != input_features) {
+        return fail(tensor_op_errc::inner_dimension_mismatch);
+    }
+
+    const auto dispatched = context.dispatch_linear_split_bf16(
+        input.buffer(), packed_weight.buffer(), output_buffers, rows, input_features, widths);
     if (!dispatched) {
         return fail(tensor_op_errc::backend_failure);
     }

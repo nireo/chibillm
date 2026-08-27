@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 
 #include "metal/metal_context.h"
 #include "metal/metal_kv_cache.h"
@@ -45,6 +46,13 @@ enum class tensor_op_errc : std::uint8_t {
                                                   const metal_tensor& input,
                                                   const metal_tensor& weight,
                                                   metal_tensor& output);
+
+// Projects one input through two or three vertically packed bf16 weights in one launch.
+[[nodiscard]] result<void, tensor_op_errc>
+linear_split(const metal_context& context,
+             const metal_tensor& input,
+             const metal_tensor& packed_weight,
+             std::initializer_list<metal_tensor*> outputs);
 
 // gathers i32 token ids [t] from bf16 weight [vocabulary, hidden] into f32 output [t, hidden].
 [[nodiscard]] result<void, tensor_op_errc> embedding_lookup(const metal_context& context,

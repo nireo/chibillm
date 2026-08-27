@@ -1,7 +1,9 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <string_view>
 
@@ -54,6 +56,11 @@ private:
                                                const metal_tensor& input,
                                                const metal_tensor& weight,
                                                metal_tensor& output);
+
+    friend result<void, tensor_op_errc> linear_split(const metal_context& context,
+                                                     const metal_tensor& input,
+                                                     const metal_tensor& weight,
+                                                     std::initializer_list<metal_tensor*> outputs);
 
     friend result<void, tensor_op_errc> embedding_lookup(const metal_context& context,
                                                          const metal_tensor& token_ids,
@@ -124,6 +131,14 @@ private:
                                                                  std::size_t rows,
                                                                  std::size_t input_features,
                                                                  std::size_t output_features) const;
+
+    [[nodiscard]] result<void, metal_error>
+    dispatch_linear_split_bf16(const metal_buffer& input,
+                               const metal_buffer& weight,
+                               const std::array<metal_buffer*, 3>& outputs,
+                               std::size_t rows,
+                               std::size_t input_features,
+                               const std::array<std::size_t, 3>& widths) const;
 
     [[nodiscard]] result<void, metal_error> dispatch_embedding_bf16(const metal_buffer& token_ids,
                                                                     const metal_buffer& weight,

@@ -62,6 +62,55 @@ linear_bf16(device const float* input [[buffer(0)]],
 }
 
 kernel void
+linear_split_bf16(device const float* input [[buffer(0)]],
+    device const ushort* weight [[buffer(1)]],
+    device float* output_a [[buffer(2)]],
+    device float* output_b [[buffer(3)]],
+    device float* output_c [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& input_features [[buffer(6)]],
+    constant uint& width_a [[buffer(7)]],
+    constant uint& width_b [[buffer(8)]],
+    constant uint& width_c [[buffer(9)]],
+    uint2 position [[thread_position_in_grid]])
+{
+    const uint total_width = width_a + width_b + width_c;
+    if (position.x >= total_width || position.y >= rows) {
+        return;
+    }
+
+    const ulong row = position.y;
+    const ulong weight_column = position.x;
+    const ulong k_count = input_features;
+
+    device float* output;
+    ulong row_length;
+    ulong local_column;
+    if (weight_column < width_a) {
+        output = output_a;
+        row_length = width_a;
+        local_column = weight_column;
+    } else if (weight_column < width_a + width_b) {
+        output = output_b;
+        row_length = width_b;
+        local_column = weight_column - width_a;
+    } else {
+        output = output_c;
+        row_length = width_c;
+        local_column = weight_column - width_a - width_b;
+    }
+
+    float accumulator = 0.0F;
+    const ulong weight_base = weight_column * k_count;
+    for (ulong k = 0; k < k_count; ++k) {
+        const float value = as_type<float>(uint(weight[weight_base + k]) << 16);
+        accumulator += input[row * k_count + k] * value;
+    }
+
+    output[row * row_length + local_column] = accumulator;
+}
+
+kernel void
 embedding_bf16(device const int* token_ids [[buffer(0)]],
     device const ushort* weight [[buffer(1)]],
     device float* output [[buffer(2)]],

@@ -289,9 +289,10 @@ TEST_CASE("Qwen weights are loaded into resident Metal tensors")
     const std::vector<std::size_t> embedding_shape { config.vocabulary_size, config.hidden_size };
     CHECK(std::ranges::equal(weights->token_embedding.descriptor().shape().dimensions(),
                              embedding_shape));
-    const std::vector<std::size_t> query_shape { config.query_width(), config.hidden_size };
-    CHECK(std::ranges::equal(weights->layers[0].query.descriptor().shape().dimensions(),
-                             query_shape));
+    const std::vector<std::size_t> qkv_shape { config.query_width() + 2 * config.kv_width(),
+                                               config.hidden_size };
+    CHECK(std::ranges::equal(weights->layers[0].qkv_packed.descriptor().shape().dimensions(),
+                             qkv_shape));
 
     const auto embedding = weights->token_embedding.buffer().bytes();
     REQUIRE_FALSE(embedding.empty());
@@ -452,11 +453,11 @@ TEST_CASE("Qwen layer input produces normalized query key and value projections"
     embeddings[7] = 4.0F;
     write_bf16(weights->token_embedding, embeddings);
     write_bf16(weights->layers[0].input_norm, { 1.0F, 1.0F, 1.0F, 1.0F });
-    write_bf16(weights->layers[0].query,
-               { 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F,
-                 0.0F, 1.0F });
-    write_bf16(weights->layers[0].key, { 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F });
-    write_bf16(weights->layers[0].value, { 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F });
+    // packed layout is [query | key | value], so one write covers all three.
+    write_bf16(weights->layers[0].qkv_packed,
+               { 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F,
+                 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F,
+                 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F });
     write_bf16(weights->layers[0].query_norm, { 1.0F, 1.0F });
     write_bf16(weights->layers[0].key_norm, { 1.0F, 1.0F });
     write_bf16(weights->layers[0].attention_output,
@@ -555,8 +556,10 @@ TEST_CASE("Qwen layer input produces normalized query key and value projections"
     gate_weights[0] = 1.0F;
     up_weights[1] = 1.0F;
     down_weights[0] = 1.0F;
-    write_bf16(weights->layers[0].mlp_gate, gate_weights);
-    write_bf16(weights->layers[0].mlp_up, up_weights);
+    // packed layout is [gate | up].
+    auto packed_gateup = gate_weights;
+    packed_gateup.insert(packed_gateup.end(), up_weights.begin(), up_weights.end());
+    write_bf16(weights->layers[0].gateup_packed, packed_gateup);
     write_bf16(weights->layers[0].mlp_down, down_weights);
 
     auto mlp_output = run_qwen_mlp(*context, config, weights->layers[0], *attention_residual);
@@ -577,9 +580,17 @@ TEST_CASE("Qwen layer input produces normalized query key and value projections"
         write_bf16(layer.input_norm, std::vector<float>(config.hidden_size, 1.0F));
         write_bf16(layer.query_norm, std::vector<float>(config.head_dimension, 1.0F));
         write_bf16(layer.key_norm, std::vector<float>(config.head_dimension, 1.0F));
-        write_bf16(layer.query, std::vector<float>(layer.query.descriptor().element_count(), 0.0F));
-        write_bf16(layer.key, std::vector<float>(layer.key.descriptor().element_count(), 0.0F));
-        write_bf16(layer.value, { 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F });
+        // zero query and key projections, keep the original value projection at
+        // the back of the packed layout.
+        const auto value_block =
+            std::vector<float> { 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F };
+        std::vector<float> packed_qkv(config.query_width() * config.hidden_size
+                                          + 2 * config.kv_width() * config.hidden_size,
+                                      0.0F);
+        const auto value_offset = (config.query_width() + config.kv_width()) * config.hidden_size;
+        std::copy(value_block.begin(), value_block.end(),
+                  packed_qkv.begin() + static_cast<std::ptrdiff_t>(value_offset));
+        write_bf16(layer.qkv_packed, packed_qkv);
         write_bf16(layer.attention_output,
                    { 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F,
                      0.0F, 0.0F, 1.0F });

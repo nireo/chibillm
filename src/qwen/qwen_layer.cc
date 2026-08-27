@@ -174,21 +174,13 @@ project_qwen_qkv(const metal_context& context,
     auto query = make_tensor(context, dtype::f32, { rows, config.query_width() });
     if (!query)
         return fail(query.error());
-    operation = linear(context, *normalized, weights.query, *query);
-    if (!operation) {
-        return fail(operation_error(operation.error()));
-    }
     auto key = make_tensor(context, dtype::f32, { rows, config.kv_width() });
     if (!key)
         return fail(key.error());
-    operation = linear(context, *normalized, weights.key, *key);
-    if (!operation) {
-        return fail(operation_error(operation.error()));
-    }
     auto value = make_tensor(context, dtype::f32, { rows, config.kv_width() });
     if (!value)
         return fail(value.error());
-    operation = linear(context, *normalized, weights.value, *value);
+    operation = linear_split(context, *normalized, weights.qkv_packed, { &*query, &*key, &*value });
     if (!operation) {
         return fail(operation_error(operation.error()));
     }
@@ -285,14 +277,10 @@ run_qwen_mlp(const metal_context& context,
     auto gate = make_tensor(context, dtype::f32, { rows, config.intermediate_size });
     if (!gate)
         return fail(gate.error());
-    operation = linear(context, *normalized, weights.mlp_gate, *gate);
-    if (!operation) {
-        return fail(operation_error(operation.error()));
-    }
     auto up = make_tensor(context, dtype::f32, { rows, config.intermediate_size });
     if (!up)
         return fail(up.error());
-    operation = linear(context, *normalized, weights.mlp_up, *up);
+    operation = linear_split(context, *normalized, weights.gateup_packed, { &*gate, &*up });
     if (!operation) {
         return fail(operation_error(operation.error()));
     }

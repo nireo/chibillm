@@ -27,12 +27,11 @@ struct qwen_layer_weights {
     metal_tensor post_attention_norm;
     metal_tensor query_norm;
     metal_tensor key_norm;
-    metal_tensor query;
-    metal_tensor key;
-    metal_tensor value;
+    // q | k | v projection matrices stacked so one kernel launch reads them all.
+    metal_tensor qkv_packed;
     metal_tensor attention_output;
-    metal_tensor mlp_gate;
-    metal_tensor mlp_up;
+    // mlp gate | up projections stacked for the same reason.
+    metal_tensor gateup_packed;
     metal_tensor mlp_down;
 };
 

@@ -45,6 +45,7 @@ struct metal_context::implementation {
     id<MTLLibrary> shader_library;
     id<MTLComputePipelineState> matmul_f32_pipeline;
     id<MTLComputePipelineState> linear_bf16_pipeline;
+    id<MTLComputePipelineState> linear_split_bf16_pipeline;
     id<MTLComputePipelineState> embedding_bf16_pipeline;
     id<MTLComputePipelineState> rms_norm_bf16_pipeline;
     id<MTLComputePipelineState> silu_mul_f32_pipeline;
@@ -220,6 +221,22 @@ metal_context::make(std::string_view shader_source)
                 message_from_error(pipeline_error, "failed to create the linear_bf16 pipeline")));
         }
 
+        id<MTLFunction> linear_split_bf16 = [library newFunctionWithName:@"linear_split_bf16"];
+        if (linear_split_bf16 == nil) {
+            return fail(make_error(metal_errc::shader_function_not_found,
+                                   "the Metal shader library does not contain linear_split_bf16"));
+        }
+
+        pipeline_error = nil;
+        id<MTLComputePipelineState> linear_split_bf16_pipeline =
+            [device newComputePipelineStateWithFunction:linear_split_bf16 error:&pipeline_error];
+        if (linear_split_bf16_pipeline == nil) {
+            return fail(
+                make_error(metal_errc::pipeline_creation_failed,
+                           message_from_error(pipeline_error,
+                                              "failed to create the linear_split_bf16 pipeline")));
+        }
+
         id<MTLFunction> embedding_bf16 = [library newFunctionWithName:@"embedding_bf16"];
         if (embedding_bf16 == nil) {
             return fail(make_error(metal_errc::shader_function_not_found,
@@ -335,6 +352,7 @@ metal_context::make(std::string_view shader_source)
         implementation->shader_library = library;
         implementation->matmul_f32_pipeline = matmul_f32_pipeline;
         implementation->linear_bf16_pipeline = linear_bf16_pipeline;
+        implementation->linear_split_bf16_pipeline = linear_split_bf16_pipeline;
         implementation->embedding_bf16_pipeline = embedding_bf16_pipeline;
         implementation->rms_norm_bf16_pipeline = rms_norm_bf16_pipeline;
         implementation->silu_mul_f32_pipeline = silu_mul_f32_pipeline;
@@ -555,6 +573,64 @@ metal_context::dispatch_linear_bf16(const metal_buffer& input,
 
         [encoder dispatchThreads:MTLSizeMake(output_features, rows, 1)
             threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
+        return implementation_->complete_dispatch_encoder(*opened);
+    }
+}
+
+result<void, metal_error>
+metal_context::dispatch_linear_split_bf16(const metal_buffer& input,
+                                          const metal_buffer& weight,
+                                          const std::array<metal_buffer*, 3>& outputs,
+                                          std::size_t rows,
+                                          std::size_t input_features,
+                                          const std::array<std::size_t, 3>& widths) const
+{
+    @autoreleasepool {
+        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
+        const auto total_width = widths[0] + widths[1] + widths[2];
+        if (rows > max_shader_dimension
+            || input_features > max_shader_dimension
+            || total_width > max_shader_dimension) {
+            return fail(make_error(metal_errc::invalid_input,
+                                   "linear split dimensions exceed the shader uint range"));
+        }
+
+        const auto shader_rows = static_cast<std::uint32_t>(rows);
+        const auto shader_input_features = static_cast<std::uint32_t>(input_features);
+        const std::array shader_widths {
+            static_cast<std::uint32_t>(widths[0]),
+            static_cast<std::uint32_t>(widths[1]),
+            static_cast<std::uint32_t>(widths[2]),
+        };
+
+        auto opened = implementation_->open_dispatch_encoder();
+        if (!opened) {
+            return fail(opened.error());
+        }
+        id<MTLComputeCommandEncoder> encoder = opened->encoder;
+
+        [encoder setComputePipelineState:implementation_->linear_split_bf16_pipeline];
+        [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:weight.implementation_->buffer offset:0 atIndex:1];
+        for (std::size_t i = 0; i < outputs.size(); ++i) {
+            [encoder setBuffer:outputs[i]->implementation_->buffer offset:0 atIndex:2 + i];
+        }
+        [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:5];
+        [encoder setBytes:&shader_input_features length:sizeof(shader_input_features) atIndex:6];
+        for (std::size_t i = 0; i < shader_widths.size(); ++i) {
+            [encoder setBytes:&shader_widths[i] length:sizeof(shader_widths[i]) atIndex:7 + i];
+        }
+
+        constexpr std::size_t preferred_threadgroup_dimension = 16;
+        const auto max_threads = static_cast<std::size_t>(
+            implementation_->linear_split_bf16_pipeline.maxTotalThreadsPerThreadgroup);
+        const auto threadgroup_width = std::min(preferred_threadgroup_dimension, max_threads);
+        const auto threadgroup_height =
+            std::min(preferred_threadgroup_dimension, max_threads / threadgroup_width);
+
+        [encoder dispatchThreads:MTLSizeMake(total_width, rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(threadgroup_width, threadgroup_height, 1)];
+
         return implementation_->complete_dispatch_encoder(*opened);
     }
 }

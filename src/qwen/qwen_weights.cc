@@ -112,6 +112,58 @@ load_tensor(const metal_context& context, const safetensors_file& file, std::str
     return std::move(*tensor);
 }
 
+// loads row-major [out, in] bf16 tensors back-to-back into one metal tensor so
+// downstream code can run a single projection over them.
+result<metal_tensor, qwen_weights_errc>
+load_packed_tensors(const metal_context& context,
+                    const safetensors_file& file,
+                    const std::vector<std::string>& names)
+{
+    const auto* first = file.find(names[0]);
+    if (first == nullptr || first->shape.size() != 2) {
+        return fail(qwen_weights_errc::missing_tensor);
+    }
+    const auto inner_features = first->shape[1];
+
+    std::size_t total_rows = 0;
+    for (const auto& name : names) {
+        const auto* info = file.find(name);
+        if (info == nullptr
+            || info->type != safetensors_dtype::bf16
+            || info->shape.size() != 2
+            || info->shape[1] != inner_features) {
+            return fail(qwen_weights_errc::tensor_shape_mismatch);
+        }
+        if (total_rows > std::numeric_limits<std::size_t>::max() - info->shape[0]) {
+            return fail(qwen_weights_errc::tensor_count_overflow);
+        }
+        total_rows += info->shape[0];
+    }
+
+    auto packed = metal_tensor::make(context, dtype::bf16, { total_rows, inner_features });
+    if (!packed) {
+        return fail(packed.error() == metal_tensor_errc::invalid_descriptor
+                        ? qwen_weights_errc::tensor_creation_failed
+                        : qwen_weights_errc::metal_allocation_failed);
+    }
+
+    const auto element_size = sizeof(std::uint16_t);
+    auto bytes = packed->buffer().bytes();
+    std::size_t row_offset = 0;
+    for (const auto& name : names) {
+        const auto* info = file.find(name);
+        auto destination =
+            bytes.subspan(row_offset * inner_features * element_size,
+                          static_cast<std::size_t>(info->shape[0]) * inner_features * element_size);
+        if (!file.read(name, destination)) {
+            return fail(qwen_weights_errc::tensor_read_failed);
+        }
+        row_offset += info->shape[0];
+    }
+
+    return std::move(*packed);
+}
+
 result<qwen_layer_weights, qwen_weights_errc>
 load_layer(const metal_context& context, const safetensors_file& file, std::size_t layer)
 {
@@ -131,35 +183,30 @@ load_layer(const metal_context& context, const safetensors_file& file, std::size
     auto key_norm = load("self_attn.k_norm.weight");
     if (!key_norm)
         return fail(key_norm.error());
-    auto query = load("self_attn.q_proj.weight");
-    if (!query)
-        return fail(query.error());
-    auto key = load("self_attn.k_proj.weight");
-    if (!key)
-        return fail(key.error());
-    auto value = load("self_attn.v_proj.weight");
-    if (!value)
-        return fail(value.error());
+
+    auto qkv_packed = load_packed_tensors(context, file,
+                                          { layer_tensor_name(layer, "self_attn.q_proj.weight"),
+                                            layer_tensor_name(layer, "self_attn.k_proj.weight"),
+                                            layer_tensor_name(layer, "self_attn.v_proj.weight") });
+    if (!qkv_packed)
+        return fail(qkv_packed.error());
     auto attention_output = load("self_attn.o_proj.weight");
     if (!attention_output)
         return fail(attention_output.error());
-    auto mlp_gate = load("mlp.gate_proj.weight");
-    if (!mlp_gate)
-        return fail(mlp_gate.error());
-    auto mlp_up = load("mlp.up_proj.weight");
-    if (!mlp_up)
-        return fail(mlp_up.error());
+    auto gateup_packed = load_packed_tensors(context, file,
+                                             { layer_tensor_name(layer, "mlp.gate_proj.weight"),
+                                               layer_tensor_name(layer, "mlp.up_proj.weight") });
+    if (!gateup_packed)
+        return fail(gateup_packed.error());
     auto mlp_down = load("mlp.down_proj.weight");
     if (!mlp_down)
         return fail(mlp_down.error());
 
     return qwen_layer_weights {
-        std::move(*input_norm), std::move(*post_attention_norm),
-        std::move(*query_norm), std::move(*key_norm),
-        std::move(*query),      std::move(*key),
-        std::move(*value),      std::move(*attention_output),
-        std::move(*mlp_gate),   std::move(*mlp_up),
-        std::move(*mlp_down),
+        std::move(*input_norm),    std::move(*post_attention_norm),
+        std::move(*query_norm),    std::move(*key_norm),
+        std::move(*qkv_packed),    std::move(*attention_output),
+        std::move(*gateup_packed), std::move(*mlp_down),
     };
 }
 
