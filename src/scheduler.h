@@ -102,6 +102,10 @@ public:
     // cancels an in-flight reservation without releasing cache capacity.
     [[nodiscard]] result<void, scheduler_errc> abort(const scheduled_batch& batch);
 
+    // Request lifecycle operations are valid only between model batches.
+    [[nodiscard]] result<void, scheduler_errc> cancel(seq_id id);
+    [[nodiscard]] result<void, scheduler_errc> remove(seq_id id);
+
 private:
     scheduler(scheduler_config config, block_manager manager);
 

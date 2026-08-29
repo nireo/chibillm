@@ -255,6 +255,33 @@ TEST_CASE("maximum new-token limit is evaluated after appending the sample")
     CHECK(engine.is_finished());
 }
 
+TEST_CASE("cancel releases a running sequence and allows it to be retired")
+{
+    auto scheduler_result = scheduler::make(test_config());
+    auto sequence = seq::make(1, { 10, 20 }, sampling_params {}, 2);
+    REQUIRE(scheduler_result.has_value());
+    REQUIRE(sequence.has_value());
+    auto& engine = *scheduler_result;
+    REQUIRE(engine.add(std::move(*sequence)).has_value());
+
+    auto prefill = engine.schedule();
+    REQUIRE(prefill.has_value());
+    const std::array<token_id, 1> sample { 30 };
+    REQUIRE(engine.complete(*prefill, sample).has_value());
+    CHECK(engine.cache().used_block_count() == 1);
+
+    REQUIRE(engine.cancel(1).has_value());
+    const auto* cancelled = engine.find_sequence(1);
+    REQUIRE(cancelled != nullptr);
+    CHECK(cancelled->reason() == finish_reason::cancelled);
+    CHECK(engine.cache().used_block_count() == 0);
+    CHECK(engine.is_finished());
+
+    REQUIRE(engine.remove(1).has_value());
+    CHECK(engine.find_sequence(1) == nullptr);
+    CHECK(engine.sequence_count() == 0);
+}
+
 TEST_CASE("completion validation leaves an in-flight reservation untouched")
 {
     auto scheduler_result = scheduler::make(test_config());

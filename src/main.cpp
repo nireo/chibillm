@@ -14,33 +14,15 @@
 
 #include "inference_engine.h"
 #include "qwen/qwen_model_runner.h"
-#include "qwen/qwen_tokenizer.h"
+#include "server.h"
 
 namespace {
 
-using chibillm::qwen_tokenizer;
 using chibillm::result;
 
 constexpr std::size_t kv_block_count = 64;
 constexpr std::size_t kv_block_size = 16;
-constexpr std::size_t max_context_tokens = kv_block_count * kv_block_size;
 constexpr std::size_t max_new_tokens = 512;
-
-struct chat_message {
-    std::string role;
-    std::string content;
-};
-
-result<std::vector<chibillm::token_id>, chibillm::qwen_tokenizer_errc>
-format_chat_prompt(const qwen_tokenizer& tokenizer, std::span<const chat_message> messages)
-{
-    std::string prompt;
-    for (const auto& message : messages) {
-        prompt += "<|im_start|>" + message.role + "\n" + message.content + "<|im_end|>\n";
-    }
-    prompt += "<|im_start|>assistant\n<think>\n\n</think>\n\n";
-    return tokenizer.encode(prompt);
-}
 
 enum class chat_errc {
     context_full,
@@ -56,15 +38,13 @@ struct generation_result {
 };
 
 result<generation_result, chat_errc>
-generate(chibillm::qwen_model_runner& runner,
-         const qwen_tokenizer& tokenizer,
-         std::span<const chat_message> history)
+generate(chibillm::qwen_model_runner& runner, std::span<const chibillm::chat_message> history)
 {
-    auto prompt = format_chat_prompt(tokenizer, history);
+    auto prompt = runner.encode_chat(history);
     if (!prompt) {
         return chibillm::fail(chat_errc::generation_failed);
     }
-    if (prompt->size() >= max_context_tokens) {
+    if (prompt->size() >= runner.info().max_context_tokens) {
         return chibillm::fail(chat_errc::context_full);
     }
 
@@ -74,7 +54,7 @@ generate(chibillm::qwen_model_runner& runner,
             .max_batch_tokens = 128,
             .kv_block_count = kv_block_count,
             .kv_block_size = kv_block_size,
-            .eos_token = runner.config().eos_token_id,
+            .eos_token = runner.info().eos_token,
         },
         runner);
     if (!engine) {
@@ -82,7 +62,8 @@ generate(chibillm::qwen_model_runner& runner,
     }
 
     const auto prompt_tokens = prompt->size();
-    const auto token_budget = std::min(max_new_tokens, max_context_tokens - prompt->size());
+    const auto token_budget =
+        std::min(max_new_tokens, runner.info().max_context_tokens - prompt->size());
     auto sequence = chibillm::seq::make(1, std::move(*prompt),
                                         {
                                             .temperature = 1.0F,
@@ -114,7 +95,7 @@ generate(chibillm::qwen_model_runner& runner,
     if (finished == nullptr || !produced_token) {
         return chibillm::fail(chat_errc::generation_failed);
     }
-    auto response = tokenizer.decode(finished->completion_tokens());
+    auto response = runner.decode(finished->completion_tokens());
     if (!response) {
         return chibillm::fail(chat_errc::generation_failed);
     }
@@ -170,20 +151,21 @@ main(int argc, char** argv)
 {
     using namespace chibillm;
 
-    const std::filesystem::path model_directory = argc > 1 ? argv[1] : "qwen_model";
-    auto tokenizer = qwen_tokenizer::load(model_directory);
-    if (!tokenizer) {
-        std::cerr << "failed to load the tokenizer from " << model_directory << '\n';
-        return 1;
-    }
+    const bool serve_mode = argc > 1 && std::string_view(argv[1]) == "--serve";
+    const std::filesystem::path model_directory =
+        serve_mode ? (argc > 2 ? argv[2] : "qwen_model") : (argc > 1 ? argv[1] : "qwen_model");
     const auto shader_source = load_text(CHIBILLM_SHADER_PATH);
     if (shader_source.empty()) {
         std::cerr << "failed to load Metal shaders\n";
         return 1;
     }
     const auto load_started = std::chrono::steady_clock::now();
-    auto runner =
-        qwen_model_runner::make(model_directory, shader_source, kv_block_count, kv_block_size);
+    auto model_id = model_directory.lexically_normal().filename().string();
+    if (model_id.empty()) {
+        model_id = "chibillm-qwen";
+    }
+    auto runner = qwen_model_runner::make(model_directory, shader_source, kv_block_count,
+                                          kv_block_size, std::move(model_id));
     if (!runner) {
         std::cerr << "failed to load Qwen from " << model_directory << '\n';
         return 1;
@@ -196,6 +178,30 @@ main(int argc, char** argv)
         << "[perf] model loaded in "
         << load_time
         << " s\n";
+
+    if (serve_mode) {
+        auto server = openai_server::make(*runner,
+                                          {
+                                              .host = "127.0.0.1",
+                                              .port = 8000,
+                                              .max_sequences = 4,
+                                              .max_pending_requests = 64,
+                                              .max_batch_tokens = 128,
+                                              .kv_block_count = kv_block_count,
+                                              .kv_block_size = kv_block_size,
+                                              .default_max_completion_tokens = 256,
+                                          });
+        if (!server) {
+            std::cerr << "failed to start the HTTP server\n";
+            return 1;
+        }
+        std::cerr << "listening on http://127.0.0.1:" << (*server)->port() << "/v1\n";
+        if (!(*server)->run()) {
+            std::cerr << "HTTP server failed\n";
+            return 1;
+        }
+        return 0;
+    }
 
     std::vector<chat_message> history;
     std::cout << "chibillm chat — /reset clears history, /quit exits\n";
@@ -216,7 +222,7 @@ main(int argc, char** argv)
         }
 
         history.push_back({ "user", input });
-        auto response = generate(*runner, *tokenizer, history);
+        auto response = generate(*runner, history);
         if (!response) {
             history.pop_back();
             std::cerr << (response.error() == chat_errc::context_full

@@ -80,6 +80,7 @@ split_utf8(std::string_view text)
             : length == 2                ? 0x80U
             : length == 3                ? 0x800U
                                          : 0x10000U;
+
         if (codepoint < minimum
             || codepoint > 0x10FFFF
             || (codepoint >= 0xD800 && codepoint <= 0xDFFF)) {

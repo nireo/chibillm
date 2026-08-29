@@ -6,7 +6,8 @@
 
 namespace chibillm {
 
-bool kv_block::is_free() const noexcept
+bool
+kv_block::is_free() const noexcept
 {
     return ref_count == 0;
 }
@@ -136,7 +137,7 @@ block_manager::ensure_capacity(seq& sequence)
 
     const auto amount = *amount_needed;
     if (amount == 0) {
-        return { };
+        return {};
     }
 
     if (amount > free_block_ids_.size()) {
@@ -160,7 +161,7 @@ block_manager::ensure_capacity(seq& sequence)
     }
 
     assert_invariants();
-    return { };
+    return {};
 }
 
 result<void, block_manager_errc>
@@ -210,10 +211,11 @@ block_manager::release(seq& sequence)
     }
 
     assert_invariants();
-    return { };
+    return {};
 }
 
-void block_manager::assert_invariants() const noexcept
+void
+block_manager::assert_invariants() const noexcept
 {
 #ifndef NDEBUG
     assert(block_size_ > 0);

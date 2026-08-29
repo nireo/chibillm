@@ -31,6 +31,11 @@ nlohmann_json_dep = dependency(
   fallback: ['nlohmann_json', 'nlohmann_json_dep'],
 )
 
+cpp_httplib_dep = dependency(
+  'cpp-httplib',
+  fallback: ['cpp-httplib', 'cpp_httplib_dep'],
+)
+
 chibillm_model_format = static_library(
   'chibillm_model_format',
   'src/model_format/safetensors.cc',
@@ -86,6 +91,18 @@ chibillm_qwen = static_library(
   install: false,
 )
 
+chibillm_server = static_library(
+  'chibillm_server',
+  'src/server.cc',
+  include_directories: src_include,
+  dependencies: [
+    cpp_httplib_dep,
+    nlohmann_json_dep,
+  ],
+  link_with: chibillm_core,
+  install: false,
+)
+
 executable(
   'chibillm',
   'src/main.cpp',
@@ -97,8 +114,14 @@ executable(
       'tensor_ops.metal',
     ) + '"',
   ],
-  dependencies: metal_framework_dep,
-  link_with: chibillm_qwen,
+  dependencies: [
+    cpp_httplib_dep,
+    metal_framework_dep,
+  ],
+  link_with: [
+    chibillm_qwen,
+    chibillm_server,
+  ],
   install: true,
 )
 
@@ -144,6 +167,23 @@ chibillm_inference_engine_tests = executable(
 )
 
 test('chibillm inference engine tests', chibillm_inference_engine_tests)
+
+chibillm_server_tests = executable(
+  'chibillm_server_tests',
+  'tests/server_test.cc',
+  include_directories: src_include,
+  dependencies: [
+    cpp_httplib_dep,
+    doctest_dep,
+    nlohmann_json_dep,
+  ],
+  link_with: [
+    chibillm_core,
+    chibillm_server,
+  ],
+)
+
+test('chibillm server tests', chibillm_server_tests)
 
 qwen_config_fixture_path = join_paths(
   meson.project_source_root(),

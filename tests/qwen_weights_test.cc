@@ -178,6 +178,22 @@ write_config(const std::filesystem::path& path, const qwen_config& config)
     REQUIRE(output.good());
 }
 
+void
+write_tokenizer(const std::filesystem::path& path)
+{
+    std::ofstream vocabulary(path / "vocab.json");
+    REQUIRE(vocabulary.good());
+    vocabulary << R"({"a":0,"b":1,"c":2,"d":3,"e":4,"f":5,"g":6,"h":7})";
+
+    std::ofstream config(path / "tokenizer_config.json");
+    REQUIRE(config.good());
+    config << R"({"added_tokens_decoder":{}})";
+
+    std::ofstream merges(path / "merges.txt");
+    REQUIRE(merges.good());
+    merges << "#version: 0.2\n";
+}
+
 std::string
 load_shader_source()
 {
@@ -381,6 +397,7 @@ TEST_CASE("Qwen model runner executes a flattened multi-sequence batch")
     const auto config = test_config();
     temporary_model_directory model_directory;
     write_config(model_directory.path() / "config.json", config);
+    write_tokenizer(model_directory.path());
     auto weights_file =
         write_weights(expected_tensors(config), "chibillm_qwen_runner_model/model.safetensors");
 

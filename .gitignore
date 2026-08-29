@@ -9,6 +9,7 @@
 
 # Meson subproject downloads
 /subprojects/doctest-*/
+/subprojects/cpp-httplib-*/
 /subprojects/nlohmann_json/
 /subprojects/packagecache/
 /subprojects/.wraplock

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 #include "model_runner.h"
 #include "result.h"
@@ -17,6 +18,14 @@ enum class inference_engine_errc : std::uint8_t {
     runner_result_count_mismatch,
     batch_abort_failed,
     batch_completion_failed,
+    sequence_cancel_failed,
+    sequence_remove_failed,
+};
+
+struct sequence_update {
+    seq_id id;
+    token_id token;
+    finish_reason reason;
 };
 
 // coordinates scheduling, model execution, and sequence completion.
@@ -35,13 +44,15 @@ public:
     [[nodiscard]] const seq* find_sequence(seq_id id) const noexcept;
 
     [[nodiscard]] result<void, inference_engine_errc> add(seq sequence);
-    [[nodiscard]] result<void, inference_engine_errc> step();
+    [[nodiscard]] result<std::vector<sequence_update>, inference_engine_errc> step();
+    [[nodiscard]] result<void, inference_engine_errc> cancel(seq_id id);
+    [[nodiscard]] result<void, inference_engine_errc> remove(seq_id id);
 
 private:
     inference_engine(scheduler scheduler, model_runner& runner) noexcept;
 
-    [[nodiscard]] result<void, inference_engine_errc> fail_after_abort(const scheduled_batch& batch,
-                                                                       inference_engine_errc error);
+    [[nodiscard]] std::unexpected<inference_engine_errc>
+    fail_after_abort(const scheduled_batch& batch, inference_engine_errc error);
 
     scheduler scheduler_;
     model_runner* runner_;

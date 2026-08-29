@@ -34,7 +34,33 @@ test_config()
     };
 }
 
-class failing_model_runner final : public model_runner {
+class test_model_runner : public model_runner {
+public:
+    const chibillm::model_info&
+    info() const noexcept override
+    {
+        static const chibillm::model_info value {
+            .id = "test",
+            .max_context_tokens = 16,
+            .eos_token = 99,
+        };
+        return value;
+    }
+
+    result<std::vector<token_id>, model_runner_errc>
+    encode_chat(std::span<const chibillm::chat_message>) override
+    {
+        return chibillm::fail(model_runner_errc::backend_failure);
+    }
+
+    result<std::string, model_runner_errc>
+    decode(std::span<const token_id>) const override
+    {
+        return chibillm::fail(model_runner_errc::backend_failure);
+    }
+};
+
+class failing_model_runner final : public test_model_runner {
 public:
     result<std::vector<token_id>, model_runner_errc>
     execute(const model_batch&) override
@@ -43,7 +69,7 @@ public:
     }
 };
 
-class empty_result_model_runner final : public model_runner {
+class empty_result_model_runner final : public test_model_runner {
 public:
     result<std::vector<token_id>, model_runner_errc>
     execute(const model_batch&) override
@@ -87,12 +113,16 @@ TEST_CASE("engine runs chunked prefill and decode until the length limit")
     REQUIRE(engine->add(std::move(*sequence)).has_value());
 
     std::size_t step_count = 0;
+    std::size_t update_count = 0;
     while (!engine->is_finished()) {
-        REQUIRE(engine->step().has_value());
+        auto updates = engine->step();
+        REQUIRE(updates.has_value());
+        update_count += updates->size();
         ++step_count;
     }
 
     CHECK(step_count == 4);
+    CHECK(update_count == 3);
     const auto* finished = engine->find_sequence(1);
     REQUIRE(finished != nullptr);
     CHECK(finished->status() == seq_status::finished);

@@ -436,6 +436,58 @@ scheduler::abort(const scheduled_batch& batch)
     return {};
 }
 
+result<void, scheduler_errc>
+scheduler::cancel(seq_id id)
+{
+    if (active_batch_.has_value()) {
+        return fail(scheduler_errc::batch_in_flight);
+    }
+
+    auto* sequence = find_sequence(id);
+    if (sequence == nullptr) {
+        return fail(scheduler_errc::unknown_sequence);
+    }
+    if (sequence->is_finished()) {
+        return {};
+    }
+
+    auto& queue = sequence->status() == seq_status::waiting ? waiting_ : running_;
+    if (!remove_from_queue(queue, id)) {
+        return fail(scheduler_errc::invalid_sequence_state);
+    }
+    auto finished = sequence->finish(finish_reason::cancelled);
+    if (!finished) {
+        return fail(scheduler_errc::sequence_failure);
+    }
+    auto released = block_manager_.release(*sequence);
+    if (!released) {
+        return fail(scheduler_errc::block_manager_failure);
+    }
+
+    assert_invariants();
+    return {};
+}
+
+result<void, scheduler_errc>
+scheduler::remove(seq_id id)
+{
+    if (active_batch_.has_value()) {
+        return fail(scheduler_errc::batch_in_flight);
+    }
+
+    const auto found = sequences_.find(id);
+    if (found == sequences_.end()) {
+        return fail(scheduler_errc::unknown_sequence);
+    }
+    if (!found->second.is_finished()) {
+        return fail(scheduler_errc::invalid_sequence_state);
+    }
+
+    sequences_.erase(found);
+    assert_invariants();
+    return {};
+}
+
 bool
 scheduler::remove_from_queue(std::deque<seq_id>& queue, seq_id id) noexcept
 {

@@ -1,6 +1,8 @@
 #include "qwen/qwen_model_runner.h"
 
+#include <algorithm>
 #include <limits>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -100,14 +102,21 @@ result<qwen_model_runner, qwen_model_runner_errc>
 qwen_model_runner::make(const std::filesystem::path& model_directory,
                         std::string_view shader_source,
                         std::size_t kv_block_count,
-                        std::size_t kv_block_size)
+                        std::size_t kv_block_size,
+                        std::string model_id)
 {
-    if (kv_block_count == 0 || kv_block_size == 0) {
+    if (kv_block_count == 0
+        || kv_block_size == 0
+        || kv_block_count > std::numeric_limits<std::size_t>::max() / kv_block_size) {
         return fail(qwen_model_runner_errc::cache_creation_failed);
     }
     auto config = load_qwen_config(model_directory / "config.json");
     if (!config) {
         return fail(qwen_model_runner_errc::config_load_failed);
+    }
+    auto tokenizer = qwen_tokenizer::load(model_directory);
+    if (!tokenizer) {
+        return fail(qwen_model_runner_errc::tokenizer_load_failed);
     }
     auto file = safetensors_file::open(model_directory / "model.safetensors");
     if (!file) {
@@ -133,24 +142,78 @@ qwen_model_runner::make(const std::filesystem::path& model_directory,
         return fail(qwen_model_runner_errc::weights_load_failed);
     }
 
-    return qwen_model_runner { std::move(*context), std::move(*config), std::move(*weights),
-                               std::move(*cache) };
+    const auto context_tokens =
+        std::min(config->max_position_embeddings, kv_block_count * kv_block_size);
+    model_info info {
+        .id = std::move(model_id),
+        .max_context_tokens = context_tokens,
+        .eos_token = config->eos_token_id,
+    };
+    return qwen_model_runner { std::move(*context), std::move(*config),    std::move(*weights),
+                               std::move(*cache),   std::move(*tokenizer), std::move(info) };
 }
 
 qwen_model_runner::qwen_model_runner(metal_context context,
                                      qwen_config config,
                                      qwen_weights weights,
-                                     metal_kv_cache cache)
+                                     metal_kv_cache cache,
+                                     qwen_tokenizer tokenizer,
+                                     model_info info)
     : context_(std::move(context))
     , config_(std::move(config))
     , weights_(std::move(weights))
     , cache_(std::move(cache))
+    , tokenizer_(std::move(tokenizer))
+    , info_(std::move(info))
 {}
 
 const qwen_config&
 qwen_model_runner::config() const noexcept
 {
     return config_;
+}
+
+const model_info&
+qwen_model_runner::info() const noexcept
+{
+    return info_;
+}
+
+result<std::vector<token_id>, model_runner_errc>
+qwen_model_runner::encode_chat(std::span<const chat_message> messages)
+{
+    if (messages.empty()) {
+        return fail(model_runner_errc::invalid_chat);
+    }
+
+    std::string prompt;
+    for (const auto& message : messages) {
+        if (message.role != "developer"
+            && message.role != "system"
+            && message.role != "user"
+            && message.role != "assistant") {
+            return fail(model_runner_errc::invalid_chat);
+        }
+        const auto role = message.role == "developer" ? "system" : message.role;
+        prompt += "<|im_start|>" + role + "\n" + message.content + "<|im_end|>\n";
+    }
+    prompt += "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+    auto tokens = tokenizer_.encode(prompt);
+    if (!tokens) {
+        return fail(model_runner_errc::tokenizer_failure);
+    }
+    return std::move(*tokens);
+}
+
+result<std::string, model_runner_errc>
+qwen_model_runner::decode(std::span<const token_id> tokens) const
+{
+    auto text = tokenizer_.decode(tokens);
+    if (!text) {
+        return fail(model_runner_errc::tokenizer_failure);
+    }
+    return std::move(*text);
 }
 
 result<std::vector<token_id>, model_runner_errc>
