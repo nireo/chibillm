@@ -248,18 +248,19 @@ qwen_model_runner::execute(const model_batch& batch)
         context_.abort_compute_pass();
         return fail(model_runner_errc::backend_failure);
     }
+    auto encoded_tokens =
+        encode_qwen_greedy(context_, config_, weights_, *final_hidden, metadata->logits_indices);
+    if (!encoded_tokens) {
+        context_.abort_compute_pass();
+        return fail(model_runner_errc::backend_failure);
+    }
     auto pass_finished = context_.end_compute_pass();
     if (!pass_finished) {
         return fail(model_runner_errc::backend_failure);
     }
 
-    // reads shared memory written by the pass above, so it runs after it.
-    auto tokens =
-        sample_qwen_greedy(context_, config_, weights_, *final_hidden, metadata->logits_indices);
-    if (!tokens) {
-        return fail(model_runner_errc::backend_failure);
-    }
-    return std::move(*tokens);
+    // The pass writes only one int32 per sequence for the CPU to read.
+    return read_qwen_greedy(*encoded_tokens);
 }
 
 } // namespace chibillm

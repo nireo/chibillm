@@ -93,6 +93,9 @@ struct metal_context::implementation {
     id<MTLComputePipelineState> linear_split_bf16_decode_pipeline;
     id<MTLComputePipelineState> embedding_bf16_pipeline;
     id<MTLComputePipelineState> rms_norm_bf16_pipeline;
+    id<MTLComputePipelineState> gather_rows_f32_pipeline;
+    id<MTLComputePipelineState> linear_bf16_partial_argmax_pipeline;
+    id<MTLComputePipelineState> reduce_argmax_pipeline;
     id<MTLComputePipelineState> silu_mul_f32_pipeline;
     id<MTLComputePipelineState> add_f32_pipeline;
     id<MTLComputePipelineState> rope_f32_pipeline;
@@ -414,6 +417,41 @@ metal_context::make(std::string_view shader_source)
                 message_from_error(pipeline_error, "failed to create the rms_norm_bf16 pipeline")));
         }
 
+        id<MTLFunction> gather_rows_f32 = [library newFunctionWithName:@"gather_rows_f32"];
+        id<MTLFunction> linear_bf16_partial_argmax =
+            [library newFunctionWithName:@"linear_bf16_partial_argmax"];
+        id<MTLFunction> reduce_argmax = [library newFunctionWithName:@"reduce_argmax"];
+        if (gather_rows_f32 == nil || linear_bf16_partial_argmax == nil || reduce_argmax == nil) {
+            return fail(make_error(metal_errc::shader_function_not_found,
+                                   "the Metal shader library is missing GPU sampling kernels"));
+        }
+        pipeline_error = nil;
+        id<MTLComputePipelineState> gather_rows_f32_pipeline =
+            [device newComputePipelineStateWithFunction:gather_rows_f32 error:&pipeline_error];
+        if (gather_rows_f32_pipeline == nil) {
+            return fail(make_error(
+                metal_errc::pipeline_creation_failed,
+                message_from_error(pipeline_error, "failed to create the row gather pipeline")));
+        }
+        pipeline_error = nil;
+        id<MTLComputePipelineState> linear_bf16_partial_argmax_pipeline =
+            [device newComputePipelineStateWithFunction:linear_bf16_partial_argmax
+                                                  error:&pipeline_error];
+        if (linear_bf16_partial_argmax_pipeline == nil) {
+            return fail(
+                make_error(metal_errc::pipeline_creation_failed,
+                           message_from_error(pipeline_error,
+                                              "failed to create the partial argmax pipeline")));
+        }
+        pipeline_error = nil;
+        id<MTLComputePipelineState> reduce_argmax_pipeline =
+            [device newComputePipelineStateWithFunction:reduce_argmax error:&pipeline_error];
+        if (reduce_argmax_pipeline == nil) {
+            return fail(make_error(
+                metal_errc::pipeline_creation_failed,
+                message_from_error(pipeline_error, "failed to create the argmax pipeline")));
+        }
+
         id<MTLFunction> silu_mul_f32 = [library newFunctionWithName:@"silu_mul_f32"];
         if (silu_mul_f32 == nil) {
             return fail(make_error(metal_errc::shader_function_not_found,
@@ -540,6 +578,9 @@ metal_context::make(std::string_view shader_source)
         implementation->linear_split_bf16_decode_pipeline = linear_split_bf16_decode_pipeline;
         implementation->embedding_bf16_pipeline = embedding_bf16_pipeline;
         implementation->rms_norm_bf16_pipeline = rms_norm_bf16_pipeline;
+        implementation->gather_rows_f32_pipeline = gather_rows_f32_pipeline;
+        implementation->linear_bf16_partial_argmax_pipeline = linear_bf16_partial_argmax_pipeline;
+        implementation->reduce_argmax_pipeline = reduce_argmax_pipeline;
         implementation->silu_mul_f32_pipeline = silu_mul_f32_pipeline;
         implementation->add_f32_pipeline = add_f32_pipeline;
         implementation->rope_f32_pipeline = rope_f32_pipeline;
@@ -1004,6 +1045,106 @@ metal_context::dispatch_rms_norm_bf16(const metal_buffer& input,
                 threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
         const auto profile_name = hidden_size <= 256 ? "rms_norm_heads" : "rms_norm_hidden";
         return implementation_->complete_dispatch_encoder(*opened, profile_name);
+    }
+}
+
+result<void, metal_error>
+metal_context::dispatch_greedy_vocabulary_bf16(const metal_buffer& hidden_states,
+                                               const metal_buffer& row_indices,
+                                               const metal_buffer& norm_weight,
+                                               const metal_buffer& vocabulary_weight,
+                                               metal_buffer& normalized,
+                                               metal_buffer& partial_maxima,
+                                               metal_buffer& token_ids,
+                                               std::size_t rows,
+                                               std::size_t hidden_size,
+                                               std::size_t vocabulary_size,
+                                               std::size_t partial_count,
+                                               float epsilon) const
+{
+    @autoreleasepool {
+        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
+        if (rows > max_shader_dimension
+            || hidden_size > max_shader_dimension
+            || vocabulary_size > max_shader_dimension
+            || partial_count > max_shader_dimension) {
+            return fail(make_error(metal_errc::invalid_input,
+                                   "GPU sampling dimensions exceed the shader uint range"));
+        }
+
+        constexpr std::size_t thread_count = 256;
+        constexpr std::size_t outputs_per_threadgroup = 32;
+        const auto projection_pipeline = implementation_->linear_bf16_partial_argmax_pipeline;
+        const auto simd_width = static_cast<std::size_t>(projection_pipeline.threadExecutionWidth);
+        const auto simdgroup_count = thread_count / simd_width;
+        if (thread_count % simd_width != 0
+            || outputs_per_threadgroup % simdgroup_count != 0
+            || projection_pipeline.maxTotalThreadsPerThreadgroup < thread_count
+            || implementation_->reduce_argmax_pipeline.maxTotalThreadsPerThreadgroup
+                < thread_count) {
+            return fail(make_error(metal_errc::invalid_input,
+                                   "GPU sampling does not support this threadgroup layout"));
+        }
+        const auto expected_partials =
+            (vocabulary_size + outputs_per_threadgroup - 1) / outputs_per_threadgroup;
+        if (partial_count != expected_partials) {
+            return fail(make_error(metal_errc::invalid_input,
+                                   "GPU sampling partial buffer has the wrong size"));
+        }
+
+        const auto shader_rows = static_cast<std::uint32_t>(rows);
+        const auto shader_hidden_size = static_cast<std::uint32_t>(hidden_size);
+        const auto shader_vocabulary_size = static_cast<std::uint32_t>(vocabulary_size);
+        const auto shader_partial_count = static_cast<std::uint32_t>(partial_count);
+        const auto outputs_per_simdgroup =
+            static_cast<std::uint32_t>(outputs_per_threadgroup / simdgroup_count);
+        const auto shader_simd_width = static_cast<std::uint32_t>(simd_width);
+        auto opened = implementation_->open_dispatch_encoder();
+        if (!opened) {
+            return fail(opened.error());
+        }
+        id<MTLComputeCommandEncoder> encoder = opened->encoder;
+
+        [encoder setComputePipelineState:implementation_->gather_rows_f32_pipeline];
+        [encoder setBuffer:hidden_states.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:row_indices.implementation_->buffer offset:0 atIndex:1];
+        [encoder setBuffer:normalized.implementation_->buffer offset:0 atIndex:2];
+        [encoder setBytes:&shader_hidden_size length:sizeof(shader_hidden_size) atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(hidden_size, rows, 1)
+            threadsPerThreadgroup:adaptive_2d_threadgroup_size(
+                                      implementation_->gather_rows_f32_pipeline, hidden_size,
+                                      rows)];
+
+        [encoder setComputePipelineState:implementation_->rms_norm_bf16_pipeline];
+        [encoder setBuffer:normalized.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:norm_weight.implementation_->buffer offset:0 atIndex:1];
+        [encoder setBuffer:normalized.implementation_->buffer offset:0 atIndex:2];
+        [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:3];
+        [encoder setBytes:&shader_hidden_size length:sizeof(shader_hidden_size) atIndex:4];
+        [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:5];
+        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
+
+        [encoder setComputePipelineState:projection_pipeline];
+        [encoder setBuffer:normalized.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:vocabulary_weight.implementation_->buffer offset:0 atIndex:1];
+        [encoder setBuffer:partial_maxima.implementation_->buffer offset:0 atIndex:2];
+        [encoder setBytes:&shader_hidden_size length:sizeof(shader_hidden_size) atIndex:3];
+        [encoder setBytes:&shader_vocabulary_size length:sizeof(shader_vocabulary_size) atIndex:4];
+        [encoder setBytes:&shader_partial_count length:sizeof(shader_partial_count) atIndex:5];
+        [encoder setBytes:&outputs_per_simdgroup length:sizeof(outputs_per_simdgroup) atIndex:6];
+        [encoder setBytes:&shader_simd_width length:sizeof(shader_simd_width) atIndex:7];
+        [encoder dispatchThreadgroups:MTLSizeMake(partial_count, rows, 1)
+                threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
+
+        [encoder setComputePipelineState:implementation_->reduce_argmax_pipeline];
+        [encoder setBuffer:partial_maxima.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:token_ids.implementation_->buffer offset:0 atIndex:1];
+        [encoder setBytes:&shader_partial_count length:sizeof(shader_partial_count) atIndex:2];
+        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
+
+        return implementation_->complete_dispatch_encoder(*opened, "greedy_vocabulary_argmax");
     }
 }
 

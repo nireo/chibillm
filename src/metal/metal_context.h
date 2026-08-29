@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <memory>
+#include <span>
 #include <string_view>
 
 #include "metal/metal_buffer.h"
@@ -15,6 +16,9 @@ namespace chibillm {
 
 class metal_tensor;
 class metal_kv_cache;
+struct qwen_config;
+struct qwen_weights;
+enum class qwen_output_errc : std::uint8_t;
 enum class tensor_op_errc : std::uint8_t;
 
 // owns the metal device, queue, shader library, and compute pipelines.
@@ -79,6 +83,13 @@ private:
                                                        float epsilon,
                                                        metal_tensor& output);
 
+    friend result<metal_tensor, qwen_output_errc>
+    encode_qwen_greedy(const metal_context& context,
+                       const qwen_config& config,
+                       const qwen_weights& weights,
+                       const metal_tensor& hidden_states,
+                       std::span<const std::size_t> logits_indices);
+
     friend result<void, tensor_op_errc> silu_mul(const metal_context& context,
                                                  const metal_tensor& gate,
                                                  const metal_tensor& up,
@@ -116,6 +127,8 @@ private:
 
     struct implementation;
 
+    static constexpr std::size_t greedy_argmax_outputs_per_threadgroup = 32;
+
     explicit metal_context(std::unique_ptr<implementation> implementation) noexcept;
 
     [[nodiscard]] result<void, metal_error> dispatch_matmul(const metal_buffer& lhs,
@@ -152,6 +165,20 @@ private:
                                                                    std::size_t rows,
                                                                    std::size_t hidden_size,
                                                                    float epsilon) const;
+
+    [[nodiscard]] result<void, metal_error>
+    dispatch_greedy_vocabulary_bf16(const metal_buffer& hidden_states,
+                                    const metal_buffer& row_indices,
+                                    const metal_buffer& norm_weight,
+                                    const metal_buffer& vocabulary_weight,
+                                    metal_buffer& normalized,
+                                    metal_buffer& partial_maxima,
+                                    metal_buffer& token_ids,
+                                    std::size_t rows,
+                                    std::size_t hidden_size,
+                                    std::size_t vocabulary_size,
+                                    std::size_t partial_count,
+                                    float epsilon) const;
 
     [[nodiscard]] result<void, metal_error> dispatch_silu_mul_f32(const metal_buffer& gate,
                                                                   const metal_buffer& up,
