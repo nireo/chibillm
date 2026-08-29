@@ -61,6 +61,12 @@ private:
                                                const metal_tensor& weight,
                                                metal_tensor& output);
 
+    friend result<void, tensor_op_errc> linear_add(const metal_context& context,
+                                                   const metal_tensor& input,
+                                                   const metal_tensor& weight,
+                                                   const metal_tensor& residual,
+                                                   metal_tensor& output);
+
     friend result<void, tensor_op_errc> linear_split(const metal_context& context,
                                                      const metal_tensor& input,
                                                      const metal_tensor& weight,
@@ -144,6 +150,14 @@ private:
                                                                  std::size_t rows,
                                                                  std::size_t input_features,
                                                                  std::size_t output_features) const;
+
+    [[nodiscard]] result<void, metal_error>
+    dispatch_linear_add_bf16(const metal_buffer& input,
+                             const metal_buffer& weight,
+                             const metal_buffer& residual,
+                             metal_buffer& output,
+                             std::size_t input_features,
+                             std::size_t output_features) const;
 
     [[nodiscard]] result<void, metal_error>
     dispatch_linear_split_bf16(const metal_buffer& input,

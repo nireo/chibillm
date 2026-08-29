@@ -23,6 +23,7 @@ using chibillm::bf16;
 using chibillm::dtype;
 using chibillm::embedding_lookup;
 using chibillm::linear;
+using chibillm::linear_add;
 using chibillm::matmul;
 using chibillm::metal_context;
 using chibillm::metal_kv_cache;
@@ -232,6 +233,43 @@ TEST_CASE("linear projects f32 input with row-major bf16 weights")
     CHECK(values[5] == doctest::Approx(98.0F));
     CHECK(values[6] == doctest::Approx(113.0F));
     CHECK(values[7] == doctest::Approx(128.0F));
+}
+
+TEST_CASE("linear add fuses decode residuals and supports prefill rows")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto weight = make_tensor(*context, dtype::bf16, { 4, 3 });
+    write_bf16(weight,
+               { 1.0F, 5.0F, 9.0F, 2.0F, 6.0F, 10.0F, 3.0F, 7.0F, 11.0F, 4.0F, 8.0F, 12.0F });
+
+    auto decode_input = make_tensor(*context, dtype::f32, { 1, 3 });
+    auto decode_residual = make_tensor(*context, dtype::f32, { 1, 4 });
+    auto decode_output = make_tensor(*context, dtype::f32, { 1, 4 });
+    write_floats(decode_input, { 1.0F, 2.0F, 3.0F });
+    write_floats(decode_residual, { 1.0F, 2.0F, 3.0F, 4.0F });
+    REQUIRE(linear_add(*context, decode_input, weight, decode_residual, decode_output).has_value());
+    const auto decode_values = read_floats(decode_output);
+    REQUIRE(decode_values.size() == 4);
+    CHECK(decode_values[0] == doctest::Approx(39.0F));
+    CHECK(decode_values[1] == doctest::Approx(46.0F));
+    CHECK(decode_values[2] == doctest::Approx(53.0F));
+    CHECK(decode_values[3] == doctest::Approx(60.0F));
+
+    auto prefill_input = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto prefill_residual = make_tensor(*context, dtype::f32, { 2, 4 });
+    auto prefill_output = make_tensor(*context, dtype::f32, { 2, 4 });
+    write_floats(prefill_input, { 1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F });
+    write_floats(prefill_residual, { 1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F });
+    REQUIRE(
+        linear_add(*context, prefill_input, weight, prefill_residual, prefill_output).has_value());
+    const auto prefill_values = read_floats(prefill_output);
+    const std::vector<float> expected { 39.0F, 46.0F, 53.0F, 60.0F, 88.0F, 104.0F, 120.0F, 136.0F };
+    REQUIRE(prefill_values.size() == expected.size());
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        CHECK(prefill_values[index] == doctest::Approx(expected[index]));
+    }
 }
 
 TEST_CASE("linear requires rank-two tensors")

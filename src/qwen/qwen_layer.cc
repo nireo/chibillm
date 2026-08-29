@@ -130,17 +130,10 @@ run_attention(const metal_context& context,
     if (!operation) {
         return fail(operation_error(operation.error()));
     }
-    auto projected = make_tensor(context, dtype::f32, { rows, config.hidden_size });
-    if (!projected)
-        return fail(projected.error());
-    operation = linear(context, *attended, weights.attention_output, *projected);
-    if (!operation) {
-        return fail(operation_error(operation.error()));
-    }
     auto residual = make_tensor(context, dtype::f32, { rows, config.hidden_size });
     if (!residual)
         return fail(residual.error());
-    operation = add(context, hidden_states, *projected, *residual);
+    operation = linear_add(context, *attended, weights.attention_output, hidden_states, *residual);
     if (!operation) {
         return fail(operation_error(operation.error()));
     }
@@ -291,17 +284,10 @@ run_qwen_mlp(const metal_context& context,
     if (!operation) {
         return fail(operation_error(operation.error()));
     }
-    auto projected = make_tensor(context, dtype::f32, { rows, config.hidden_size });
-    if (!projected)
-        return fail(projected.error());
-    operation = linear(context, *activated, weights.mlp_down, *projected);
-    if (!operation) {
-        return fail(operation_error(operation.error()));
-    }
     auto residual = make_tensor(context, dtype::f32, { rows, config.hidden_size });
     if (!residual)
         return fail(residual.error());
-    operation = add(context, hidden_states, *projected, *residual);
+    operation = linear_add(context, *activated, weights.mlp_down, hidden_states, *residual);
     if (!operation) {
         return fail(operation_error(operation.error()));
     }

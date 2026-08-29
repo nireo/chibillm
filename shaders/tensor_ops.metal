@@ -105,6 +105,41 @@ linear_bf16(device const float* input [[buffer(0)]],
     output[row * ulong(output_features) + output_feature] = accumulator;
 }
 
+static inline float
+linear_bf16_decode_dot(device const float* input,
+                       device const ushort* weight,
+                       uint input_features,
+                       uint weight_row,
+                       uint lane,
+                       uint simd_width)
+{
+    float accumulator0 = 0.0F;
+    float accumulator1 = 0.0F;
+    float accumulator2 = 0.0F;
+    float accumulator3 = 0.0F;
+    const ulong weight_base = ulong(weight_row) * ulong(input_features);
+    uint k = lane;
+    for (; k + 3 * simd_width < input_features; k += 4 * simd_width) {
+        const float value0 = as_type<float>(uint(weight[weight_base + ulong(k)]) << 16);
+        const float value1 =
+            as_type<float>(uint(weight[weight_base + ulong(k + simd_width)]) << 16);
+        const float value2 =
+            as_type<float>(uint(weight[weight_base + ulong(k + 2 * simd_width)]) << 16);
+        const float value3 =
+            as_type<float>(uint(weight[weight_base + ulong(k + 3 * simd_width)]) << 16);
+        accumulator0 += input[k] * value0;
+        accumulator1 += input[k + simd_width] * value1;
+        accumulator2 += input[k + 2 * simd_width] * value2;
+        accumulator3 += input[k + 3 * simd_width] * value3;
+    }
+    float accumulator = accumulator0 + accumulator1 + accumulator2 + accumulator3;
+    for (; k < input_features; k += simd_width) {
+        const float value = as_type<float>(uint(weight[weight_base + ulong(k)]) << 16);
+        accumulator += input[k] * value;
+    }
+    return simd_sum(accumulator);
+}
+
 kernel void
 linear_bf16_decode(device const float* input [[buffer(0)]],
                    device const ushort* weight [[buffer(1)]],
@@ -122,16 +157,35 @@ linear_bf16_decode(device const float* input [[buffer(0)]],
         return;
     }
 
-    float accumulator = 0.0F;
-    const ulong weight_base = ulong(output_feature) * ulong(input_features);
-    for (uint k = lane; k < input_features; k += simd_width) {
-        const float value = as_type<float>(uint(weight[weight_base + ulong(k)]) << 16);
-        accumulator += input[k] * value;
-    }
-
-    accumulator = simd_sum(accumulator);
+    const float accumulator =
+        linear_bf16_decode_dot(input, weight, input_features, output_feature, lane, simd_width);
     if (lane == 0) {
         output[output_feature] = accumulator;
+    }
+}
+
+kernel void
+linear_add_bf16_decode(device const float* input [[buffer(0)]],
+                       device const ushort* weight [[buffer(1)]],
+                       device const float* residual [[buffer(2)]],
+                       device float* output [[buffer(3)]],
+                       constant uint& input_features [[buffer(4)]],
+                       constant uint& output_features [[buffer(5)]],
+                       constant uint& outputs_per_threadgroup [[buffer(6)]],
+                       constant uint& simd_width [[buffer(7)]],
+                       uint lane [[thread_index_in_simdgroup]],
+                       uint simdgroup [[simdgroup_index_in_threadgroup]],
+                       uint3 threadgroup_position [[threadgroup_position_in_grid]])
+{
+    const uint output_feature = threadgroup_position.x * outputs_per_threadgroup + simdgroup;
+    if (output_feature >= output_features) {
+        return;
+    }
+
+    const float accumulator =
+        linear_bf16_decode_dot(input, weight, input_features, output_feature, lane, simd_width);
+    if (lane == 0) {
+        output[output_feature] = residual[output_feature] + accumulator;
     }
 }
 
@@ -206,14 +260,8 @@ linear_split_bf16_decode(device const float* input [[buffer(0)]],
         return;
     }
 
-    float accumulator = 0.0F;
-    const ulong weight_base = ulong(weight_row) * ulong(input_features);
-    for (uint k = lane; k < input_features; k += simd_width) {
-        const float value = as_type<float>(uint(weight[weight_base + ulong(k)]) << 16);
-        accumulator += input[k] * value;
-    }
-
-    accumulator = simd_sum(accumulator);
+    const float accumulator =
+        linear_bf16_decode_dot(input, weight, input_features, weight_row, lane, simd_width);
     if (lane != 0) {
         return;
     }
@@ -259,6 +307,9 @@ rms_norm_bf16(device const float* input [[buffer(0)]],
               constant uint& hidden_size [[buffer(4)]],
               constant float& epsilon [[buffer(5)]],
               uint thread_index [[thread_index_in_threadgroup]],
+              uint lane [[thread_index_in_simdgroup]],
+              uint simdgroup [[simdgroup_index_in_threadgroup]],
+              uint simd_width [[threads_per_simdgroup]],
               uint3 threadgroup_position [[threadgroup_position_in_grid]],
               uint3 threads_per_threadgroup [[threads_per_threadgroup]])
 {
@@ -276,20 +327,21 @@ rms_norm_bf16(device const float* input [[buffer(0)]],
         local_sum += value * value;
     }
 
-    threadgroup float partial_sums[256];
-    partial_sums[thread_index] = local_sum;
+    local_sum = simd_sum(local_sum);
+    threadgroup float partial_sums[32];
+    if (lane == 0) {
+        partial_sums[simdgroup] = local_sum;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = thread_count / 2; stride > 0; stride >>= 1) {
-        if (thread_index < stride) {
-            partial_sums[thread_index] += partial_sums[thread_index + stride];
+    if (simdgroup == 0) {
+        const uint simdgroup_count = thread_count / simd_width;
+        float sum = lane < simdgroup_count ? partial_sums[lane] : 0.0F;
+        sum = simd_sum(sum);
+        if (lane == 0) {
+            const float mean_square = sum / float(hidden_size);
+            partial_sums[0] = rsqrt(mean_square + epsilon);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (thread_index == 0) {
-        const float mean_square = partial_sums[0] / float(hidden_size);
-        partial_sums[0] = rsqrt(mean_square + epsilon);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

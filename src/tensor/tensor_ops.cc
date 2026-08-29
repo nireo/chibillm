@@ -92,6 +92,62 @@ linear(const metal_context& context,
 }
 
 result<void, tensor_op_errc>
+linear_add(const metal_context& context,
+           const metal_tensor& input,
+           const metal_tensor& weight,
+           const metal_tensor& residual,
+           metal_tensor& output)
+{
+    const auto& input_shape = input.descriptor().shape();
+    const auto& weight_shape = weight.descriptor().shape();
+    const auto& residual_shape = residual.descriptor().shape();
+    const auto& output_shape = output.descriptor().shape();
+
+    if (input_shape.rank() != 2
+        || weight_shape.rank() != 2
+        || residual_shape.rank() != 2
+        || output_shape.rank() != 2) {
+        return fail(tensor_op_errc::invalid_rank);
+    }
+    if (input.descriptor().type() != dtype::f32
+        || weight.descriptor().type() != dtype::bf16
+        || residual.descriptor().type() != dtype::f32
+        || output.descriptor().type() != dtype::f32) {
+        return fail(tensor_op_errc::unsupported_dtype);
+    }
+
+    const auto rows = input_shape.dimensions()[0];
+    const auto input_features = input_shape.dimensions()[1];
+    const auto output_features = weight_shape.dimensions()[0];
+    if (weight_shape.dimensions()[1] != input_features) {
+        return fail(tensor_op_errc::inner_dimension_mismatch);
+    }
+    if (residual_shape.dimensions()[0] != rows
+        || residual_shape.dimensions()[1] != output_features) {
+        return fail(tensor_op_errc::input_shape_mismatch);
+    }
+    if (output_shape.dimensions()[0] != rows || output_shape.dimensions()[1] != output_features) {
+        return fail(tensor_op_errc::output_shape_mismatch);
+    }
+
+    if (rows != 1) {
+        auto operation = linear(context, input, weight, output);
+        if (!operation) {
+            return operation;
+        }
+        return add(context, residual, output, output);
+    }
+
+    const auto dispatched =
+        context.dispatch_linear_add_bf16(input.buffer(), weight.buffer(), residual.buffer(),
+                                         output.buffer(), input_features, output_features);
+    if (!dispatched) {
+        return fail(tensor_op_errc::backend_failure);
+    }
+    return {};
+}
+
+result<void, tensor_op_errc>
 linear_split(const metal_context& context,
              const metal_tensor& input,
              const metal_tensor& packed_weight,

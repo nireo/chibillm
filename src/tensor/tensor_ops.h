@@ -47,6 +47,13 @@ enum class tensor_op_errc : std::uint8_t {
                                                   const metal_tensor& weight,
                                                   metal_tensor& output);
 
+// projects input and adds a same-shaped f32 residual into output.
+[[nodiscard]] result<void, tensor_op_errc> linear_add(const metal_context& context,
+                                                      const metal_tensor& input,
+                                                      const metal_tensor& weight,
+                                                      const metal_tensor& residual,
+                                                      metal_tensor& output);
+
 // Projects one input through two or three vertically packed bf16 weights in one launch.
 [[nodiscard]] result<void, tensor_op_errc>
 linear_split(const metal_context& context,
