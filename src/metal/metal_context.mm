@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -184,6 +185,8 @@ struct metal_context::implementation {
     bool profiling_enabled = false;
     bool tensorops_enabled = false;
     std::map<std::string, profile_stats> profile;
+    std::mutex rope_frequency_mutex;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, id<MTLBuffer>> rope_frequency_buffers;
     std::shared_ptr<activation_arena> arena = std::make_shared<activation_arena>();
 
     // what one dispatch encodes into; see definition below.
@@ -1398,6 +1401,33 @@ metal_context::dispatch_rope_f32(const metal_buffer& input,
         const auto shader_head_count = static_cast<std::uint32_t>(head_count);
         const auto shader_head_dimension = static_cast<std::uint32_t>(head_dimension);
 
+        const auto frequency_key =
+            std::pair { shader_head_dimension, std::bit_cast<std::uint32_t>(theta) };
+        id<MTLBuffer> frequency_buffer;
+        {
+            const std::scoped_lock lock(implementation_->rope_frequency_mutex);
+            auto found = implementation_->rope_frequency_buffers.find(frequency_key);
+            if (found == implementation_->rope_frequency_buffers.end()) {
+                std::vector<float> frequencies(head_dimension / 2);
+                for (std::size_t pair = 0; pair < frequencies.size(); ++pair) {
+                    const auto exponent =
+                        -2.0F * static_cast<float>(pair) / static_cast<float>(head_dimension);
+                    frequencies[pair] = std::pow(theta, exponent);
+                }
+                frequency_buffer =
+                    [implementation_->device newBufferWithBytes:frequencies.data()
+                                                         length:frequencies.size() * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+                if (frequency_buffer == nil) {
+                    return fail(make_error(metal_errc::buffer_creation_failed,
+                                           "failed to allocate RoPE frequency buffer"));
+                }
+                implementation_->rope_frequency_buffers.emplace(frequency_key, frequency_buffer);
+            } else {
+                frequency_buffer = found->second;
+            }
+        }
+
         auto opened = implementation_->open_dispatch_encoder();
         if (!opened) {
             return fail(opened.error());
@@ -1411,7 +1441,7 @@ metal_context::dispatch_rope_f32(const metal_buffer& input,
         [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:3];
         [encoder setBytes:&shader_head_count length:sizeof(shader_head_count) atIndex:4];
         [encoder setBytes:&shader_head_dimension length:sizeof(shader_head_dimension) atIndex:5];
-        [encoder setBytes:&theta length:sizeof(theta) atIndex:6];
+        [encoder setBuffer:frequency_buffer offset:0 atIndex:6];
 
         [encoder dispatchThreads:MTLSizeMake(pair_columns, rows, 1)
             threadsPerThreadgroup:adaptive_2d_threadgroup_size(implementation_->rope_f32_pipeline,
@@ -1524,7 +1554,7 @@ metal_context::dispatch_paged_attention_f32(const metal_buffer& queries,
             static_cast<std::uint32_t>((head_dimension - 1) / simd_width + 1);
 
         constexpr std::size_t attention_chunk_size = 64;
-        constexpr std::uint32_t chunked_attention_min_tokens = 128;
+        constexpr std::uint32_t chunked_attention_min_tokens = 64;
         std::uint32_t decode_position = 0;
         if (rows == 1) {
             std::memcpy(&decode_position, positions.bytes().data(), sizeof(decode_position));

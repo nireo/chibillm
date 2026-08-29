@@ -518,7 +518,7 @@ rope_f32(device const float* input [[buffer(0)]],
          constant uint& row_count [[buffer(3)]],
          constant uint& head_count [[buffer(4)]],
          constant uint& head_dimension [[buffer(5)]],
-         constant float& theta [[buffer(6)]],
+         device const float* inverse_frequencies [[buffer(6)]],
          uint2 grid_position [[thread_position_in_grid]])
 {
     const uint half_dimension = head_dimension / 2;
@@ -535,9 +535,7 @@ rope_f32(device const float* input [[buffer(0)]],
     const ulong first_index = head_offset + ulong(pair);
     const ulong second_index = first_index + ulong(half_dimension);
 
-    const float exponent = -2.0F * float(pair) / float(head_dimension);
-    const float frequency = pow(theta, exponent);
-    const float angle = float(positions[row]) * frequency;
+    const float angle = float(positions[row]) * inverse_frequencies[pair];
     const float cosine = cos(angle);
     const float sine = sin(angle);
 
