@@ -11,9 +11,11 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace chibillm {
 namespace {
@@ -38,18 +40,6 @@ message_from_error(NSError* error, std::string_view fallback)
     return message == nullptr ? std::string(fallback) : std::string(message);
 }
 
-bool
-environment_flag(const char* name, bool default_value)
-{
-    const char* value = std::getenv(name);
-    if (value == nullptr) {
-        return default_value;
-    }
-    return std::string_view(value) != "0"
-        && std::string_view(value) != "false"
-        && std::string_view(value) != "off";
-}
-
 MTLSize
 adaptive_2d_threadgroup_size(id<MTLComputePipelineState> pipeline,
                              std::size_t grid_width,
@@ -70,10 +60,91 @@ adaptive_2d_threadgroup_size(id<MTLComputePipelineState> pipeline,
     return MTLSizeMake(threadgroup_width, threadgroup_height, 1);
 }
 
+// Exact-size freelists for temporary buffers created while a compute pass is
+// open. Released buffers stay pending until the command buffer completes, so a
+// later pass can reuse them without aliasing resources inside one encoder.
+// Keeping the state shared also makes late buffer destruction safe if its owning
+// context has already moved or been destroyed.
+struct activation_arena {
+    void
+    begin_pass()
+    {
+        const std::scoped_lock lock(mutex);
+        pass_open = true;
+    }
+
+    void
+    complete_pass()
+    {
+        const std::scoped_lock lock(mutex);
+        pass_open = false;
+        for (auto& [size_bytes, buffers] : pending) {
+            auto& destination = available[size_bytes];
+            destination.insert(destination.end(), buffers.begin(), buffers.end());
+        }
+        pending.clear();
+    }
+
+    id<MTLBuffer>
+    acquire(std::size_t size_bytes)
+    {
+        const std::scoped_lock lock(mutex);
+        auto found = available.find(size_bytes);
+        if (found == available.end() || found->second.empty()) {
+            ++allocations;
+            return nil;
+        }
+
+        id<MTLBuffer> buffer = found->second.back();
+        found->second.pop_back();
+        cached_bytes -= size_bytes;
+        ++reuses;
+        return buffer;
+    }
+
+    void
+    recycle(id<MTLBuffer> buffer)
+    {
+        const std::scoped_lock lock(mutex);
+        const auto size_bytes = static_cast<std::size_t>(buffer.length);
+        auto& destination = pass_open ? pending[size_bytes] : available[size_bytes];
+        destination.push_back(buffer);
+        cached_bytes += size_bytes;
+        peak_cached_bytes = std::max(peak_cached_bytes, cached_bytes);
+    }
+
+    void
+    dump_stats() const
+    {
+        const std::scoped_lock lock(mutex);
+        std::fprintf(stderr,
+                     "[metal-arena] allocations=%zu reuses=%zu cached_bytes=%zu "
+                     "peak_cached_bytes=%zu\n",
+                     allocations, reuses, cached_bytes, peak_cached_bytes);
+    }
+
+    mutable std::mutex mutex;
+    std::map<std::size_t, std::vector<id<MTLBuffer>>> available;
+    std::map<std::size_t, std::vector<id<MTLBuffer>>> pending;
+    bool pass_open = false;
+    std::size_t allocations = 0;
+    std::size_t reuses = 0;
+    std::size_t cached_bytes = 0;
+    std::size_t peak_cached_bytes = 0;
+};
+
 } // namespace
 
 struct metal_buffer::implementation {
     id<MTLBuffer> buffer;
+    std::shared_ptr<activation_arena> arena;
+
+    ~implementation()
+    {
+        if (arena != nullptr && buffer != nil) {
+            arena->recycle(buffer);
+        }
+    }
 };
 
 struct metal_context::implementation {
@@ -112,6 +183,7 @@ struct metal_context::implementation {
     bool profiling_enabled = false;
     bool tensorops_enabled = false;
     std::map<std::string, profile_stats> profile;
+    std::shared_ptr<activation_arena> arena = std::make_shared<activation_arena>();
 
     // what one dispatch encodes into; see definition below.
     struct dispatch_frame;
@@ -258,20 +330,13 @@ metal_context::make(std::string_view shader_source)
         NSError* library_error = nil;
         id<MTLLibrary> library = nil;
         bool compiled_metal4 = false;
-        const bool tensorops_requested = environment_flag("CHIBILLM_TENSOROPS", true);
         if (@available(macOS 26.0, *)) {
-            if (tensorops_requested && [device supportsFamily:MTLGPUFamilyApple10]) {
+            if ([device supportsFamily:MTLGPUFamilyApple10]) {
                 MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
                 options.languageVersion = MTLLanguageVersion4_0;
                 options.preprocessorMacros = @{@"CHIBILLM_ENABLE_TENSOROPS" : @1};
                 library = [device newLibraryWithSource:source options:options error:&library_error];
                 compiled_metal4 = library != nil;
-                if (library == nil && std::getenv("CHIBILLM_TENSOROPS") != nullptr) {
-                    const char* error_message = library_error.localizedDescription.UTF8String;
-                    std::fprintf(
-                        stderr, "[metal] TensorOps shader unavailable, using legacy kernels: %s\n",
-                        error_message == nullptr ? "unknown compilation error" : error_message);
-                }
             }
         }
         if (library == nil) {
@@ -589,7 +654,7 @@ metal_context::make(std::string_view shader_source)
         implementation->paged_attention_partial_f32_pipeline = paged_attention_partial_f32_pipeline;
         implementation->paged_attention_reduce_f32_pipeline = paged_attention_reduce_f32_pipeline;
         implementation->device_name = device_name == nullptr ? "unknown Metal device" : device_name;
-        implementation->profiling_enabled = std::getenv("CHIBILLM_PROFILE_METAL") != nullptr;
+        implementation->profiling_enabled = std::getenv("CHIBILLM_PROFILE") != nullptr;
         implementation->tensorops_enabled = linear_bf16_tensorops_pipeline != nil;
 
         return metal_context { std::move(implementation) };
@@ -606,8 +671,9 @@ metal_context& metal_context::operator=(metal_context&&) noexcept = default;
 
 metal_context::~metal_context()
 {
-    if (implementation_) {
+    if (implementation_ && implementation_->profiling_enabled) {
         implementation_->dump_profile();
+        implementation_->arena->dump_stats();
     }
 }
 
@@ -638,6 +704,7 @@ metal_context::begin_compute_pass()
                                    "failed to create a Metal compute encoder"));
         }
 
+        implementation_->arena->begin_pass();
         implementation_->pass_command_buffer = command_buffer;
         implementation_->pass_encoder = encoder;
         return {};
@@ -662,6 +729,7 @@ metal_context::end_compute_pass()
         [encoder endEncoding];
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
+        implementation_->arena->complete_pass();
 
         if (command_buffer.status != MTLCommandBufferStatusCompleted) {
             return fail(make_error(
@@ -691,6 +759,7 @@ metal_context::abort_compute_pass() noexcept
         [encoder endEncoding];
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
+        implementation_->arena->complete_pass();
     }
 }
 
@@ -702,17 +771,23 @@ metal_context::make_shared_buffer(std::size_t size_bytes) const
             return fail(make_error(metal_errc::invalid_input, "Metal buffer size must be nonzero"));
         }
 
-        id<MTLBuffer> buffer =
-            [implementation_->device newBufferWithLength:size_bytes
-                                                 options:MTLResourceStorageModeShared];
+        const bool is_activation = implementation_->pass_encoder != nil;
+        id<MTLBuffer> buffer = is_activation ? implementation_->arena->acquire(size_bytes) : nil;
+        if (buffer == nil) {
+            buffer = [implementation_->device newBufferWithLength:size_bytes
+                                                          options:MTLResourceStorageModeShared];
+        }
         if (buffer == nil) {
             return fail(make_error(metal_errc::buffer_creation_failed,
                                    "failed to create a shared Metal buffer"));
         }
 
-        auto implementation = std::make_unique<metal_buffer::implementation>();
-        implementation->buffer = buffer;
-        return metal_buffer { std::move(implementation) };
+        auto buffer_implementation = std::make_unique<metal_buffer::implementation>();
+        buffer_implementation->buffer = buffer;
+        if (is_activation) {
+            buffer_implementation->arena = implementation_->arena;
+        }
+        return metal_buffer { std::move(buffer_implementation) };
     }
 }
 

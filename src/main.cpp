@@ -178,7 +178,6 @@ main(int argc, char** argv)
         << "[perf] model loaded in "
         << load_time
         << " s\n";
-
     if (serve_mode) {
         auto server = openai_server::make(*runner,
                                           {

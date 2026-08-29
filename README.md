@@ -21,6 +21,11 @@ Inside the chat, use `/reset` to clear conversation history and `/quit` to exit.
 After each response, a `[perf]` line reports time to first token, approximate prefill
 throughput, decode throughput, and total generation time.
 
+For detailed diagnostics, set `CHIBILLM_PROFILE=1`. At shutdown, it reports
+per-kernel Metal timings and activation-arena reuse statistics. Detailed profiling
+synchronizes individual kernels, so use the normal `[perf]` line for production-like
+throughput measurements.
+
 ## OpenAI-compatible server
 
 Start the same model as an HTTP server with:
