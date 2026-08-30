@@ -21,7 +21,7 @@ tensor_error(metal_tensor_errc error)
 
 result<metal_tensor, qwen_output_errc>
 encode_qwen_greedy(const metal_context& context,
-                   const qwen_config& config,
+                   const qwen3_config& config,
                    const qwen_weights& weights,
                    const metal_tensor& hidden_states,
                    std::span<const std::size_t> logits_indices)
@@ -95,7 +95,7 @@ read_qwen_greedy(const metal_tensor& token_ids)
 
 result<std::vector<token_id>, qwen_output_errc>
 sample_qwen_greedy(const metal_context& context,
-                   const qwen_config& config,
+                   const qwen3_config& config,
                    const qwen_weights& weights,
                    const metal_tensor& hidden_states,
                    std::span<const std::size_t> logits_indices)

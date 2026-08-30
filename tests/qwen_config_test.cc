@@ -1,12 +1,19 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <array>
+#include <cstddef>
+#include <fstream>
+#include <iterator>
 #include <string>
 
-#include "qwen/qwen_config.h"
+#include "qwen/qwen_configs.h"
 
-using chibillm::load_qwen_config;
-using chibillm::parse_qwen_config;
+using chibillm::load_qwen3_5_config;
+using chibillm::load_qwen3_config;
+using chibillm::parse_qwen3_5_config;
+using chibillm::parse_qwen3_config;
+using chibillm::qwen3_5_layer_type;
 using chibillm::qwen_config_errc;
 
 namespace {
@@ -48,9 +55,9 @@ replace_once(std::string& text, std::string_view from, std::string_view to)
 
 } // namespace
 
-TEST_CASE("qwen config loads the Qwen3 checkpoint geometry")
+TEST_CASE("Qwen3 config loads the checkpoint geometry")
 {
-    auto loaded = load_qwen_config(QWEN_CONFIG_FIXTURE_PATH);
+    auto loaded = load_qwen3_config(QWEN3_CONFIG_FIXTURE_PATH);
     REQUIRE(loaded.has_value());
 
     CHECK(loaded->vocabulary_size == 151936);
@@ -71,79 +78,125 @@ TEST_CASE("qwen config loads the Qwen3 checkpoint geometry")
     CHECK(loaded->queries_per_kv_head() == 2);
 }
 
-TEST_CASE("qwen config rejects malformed and incomplete JSON")
+TEST_CASE("Qwen3 config rejects malformed and incomplete JSON")
 {
-    CHECK(parse_qwen_config("{").error() == qwen_config_errc::invalid_json);
+    CHECK(parse_qwen3_config("{").error() == qwen_config_errc::invalid_json);
 
     auto config = valid_config();
     replace_once(config, "\"vocab_size\": 32", "\"not_vocab_size\": 32");
-    CHECK(parse_qwen_config(config).error() == qwen_config_errc::missing_field);
+    CHECK(parse_qwen3_config(config).error() == qwen_config_errc::missing_field);
 }
 
-TEST_CASE("qwen config supports only the implemented Qwen architecture")
+TEST_CASE("Qwen3 config supports only the implemented Qwen3 architecture")
 {
     SUBCASE("model type")
     {
         auto config = valid_config();
         replace_once(config, "\"qwen3\"", "\"llama\"");
-        CHECK(parse_qwen_config(config).error() == qwen_config_errc::unsupported_model_type);
+        CHECK(parse_qwen3_config(config).error() == qwen_config_errc::unsupported_model_type);
     }
 
     SUBCASE("activation")
     {
         auto config = valid_config();
         replace_once(config, "\"silu\"", "\"gelu\"");
-        CHECK(parse_qwen_config(config).error() == qwen_config_errc::unsupported_configuration);
+        CHECK(parse_qwen3_config(config).error() == qwen_config_errc::unsupported_configuration);
     }
 
     SUBCASE("dtype")
     {
         auto config = valid_config();
         replace_once(config, "\"bfloat16\"", "\"float16\"");
-        CHECK(parse_qwen_config(config).error() == qwen_config_errc::unsupported_configuration);
+        CHECK(parse_qwen3_config(config).error() == qwen_config_errc::unsupported_configuration);
     }
 
     SUBCASE("attention bias")
     {
         auto config = valid_config();
         replace_once(config, "\"attention_bias\": false", "\"attention_bias\": true");
-        CHECK(parse_qwen_config(config).error() == qwen_config_errc::unsupported_configuration);
+        CHECK(parse_qwen3_config(config).error() == qwen_config_errc::unsupported_configuration);
     }
 
     SUBCASE("sliding window")
     {
         auto config = valid_config();
         replace_once(config, "\"use_sliding_window\": false", "\"use_sliding_window\": true");
-        CHECK(parse_qwen_config(config).error() == qwen_config_errc::unsupported_configuration);
+        CHECK(parse_qwen3_config(config).error() == qwen_config_errc::unsupported_configuration);
     }
 }
 
-TEST_CASE("qwen config validates attention geometry and token ids")
+TEST_CASE("Qwen3 config validates attention geometry and token ids")
 {
     SUBCASE("grouped-query mapping")
     {
         auto config = valid_config();
         replace_once(config, "\"num_attention_heads\": 4", "\"num_attention_heads\": 3");
-        CHECK(parse_qwen_config(config).error() == qwen_config_errc::invalid_geometry);
+        CHECK(parse_qwen3_config(config).error() == qwen_config_errc::invalid_geometry);
     }
 
     SUBCASE("RoPE dimension")
     {
         auto config = valid_config();
         replace_once(config, "\"head_dim\": 4", "\"head_dim\": 3");
-        CHECK(parse_qwen_config(config).error() == qwen_config_errc::invalid_geometry);
+        CHECK(parse_qwen3_config(config).error() == qwen_config_errc::invalid_geometry);
     }
 
     SUBCASE("EOS token")
     {
         auto config = valid_config();
         replace_once(config, "\"eos_token_id\": 11", "\"eos_token_id\": 32");
-        CHECK(parse_qwen_config(config).error() == qwen_config_errc::invalid_geometry);
+        CHECK(parse_qwen3_config(config).error() == qwen_config_errc::invalid_geometry);
     }
 }
 
-TEST_CASE("qwen config reports unreadable files")
+TEST_CASE("Qwen config loaders report unreadable files")
 {
-    CHECK(load_qwen_config("this-file-does-not-exist.json").error()
+    CHECK(load_qwen3_config("this-file-does-not-exist.json").error()
           == qwen_config_errc::file_read_failed);
+    CHECK(load_qwen3_5_config("this-file-does-not-exist.json").error()
+          == qwen_config_errc::file_read_failed);
+}
+
+TEST_CASE("Qwen3.5 config loads the official 0.8B hybrid geometry")
+{
+    auto loaded = load_qwen3_5_config(QWEN3_5_CONFIG_FIXTURE_PATH);
+    REQUIRE(loaded.has_value());
+
+    CHECK(loaded->vocabulary_size == 248320);
+    CHECK(loaded->hidden_size == 1024);
+    CHECK(loaded->intermediate_size == 3584);
+    CHECK(loaded->layer_count == 24);
+    CHECK(loaded->query_head_count == 8);
+    CHECK(loaded->kv_head_count == 2);
+    CHECK(loaded->head_dimension == 256);
+    CHECK(loaded->query_width() == 2048);
+    CHECK(loaded->kv_width() == 512);
+    CHECK(loaded->queries_per_kv_head() == 4);
+    CHECK(loaded->rotary_dimension() == 64);
+    CHECK(loaded->linear_key_width() == 2048);
+    CHECK(loaded->linear_value_width() == 2048);
+    CHECK(loaded->linear_conv_kernel_dimension == 4);
+    CHECK(loaded->full_attention_interval == 4);
+    CHECK(loaded->full_attention_layer_count() == 6);
+    CHECK(loaded->layer_types[0] == qwen3_5_layer_type::linear_attention);
+    CHECK(loaded->layer_types[3] == qwen3_5_layer_type::full_attention);
+    CHECK(loaded->max_position_embeddings == 262144);
+    CHECK(loaded->rope_theta == doctest::Approx(10000000.0F));
+    CHECK(loaded->partial_rotary_factor == doctest::Approx(0.25F));
+    CHECK(loaded->eos_token_id == 248044);
+    CHECK(loaded->tie_word_embeddings);
+    CHECK(loaded->attention_output_gate);
+    CHECK(loaded->mrope_interleaved);
+    CHECK(loaded->mrope_sections == std::array<std::size_t, 3> { 11, 11, 10 });
+}
+
+TEST_CASE("Qwen3 and Qwen3.5 parsers remain architecture-specific")
+{
+    std::ifstream input(QWEN3_5_CONFIG_FIXTURE_PATH);
+    REQUIRE(input.good());
+    const std::string qwen3_5_json { std::istreambuf_iterator<char>(input),
+                                     std::istreambuf_iterator<char>() };
+
+    CHECK(parse_qwen3_config(qwen3_5_json).error() == qwen_config_errc::unsupported_model_type);
+    CHECK(parse_qwen3_5_config(valid_config()).error() == qwen_config_errc::unsupported_model_type);
 }

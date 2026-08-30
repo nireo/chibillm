@@ -23,7 +23,7 @@ struct batch_metadata {
 };
 
 result<batch_metadata, model_runner_errc>
-prepare_metadata(const model_batch& batch, const qwen_config& config, const metal_kv_cache& cache)
+prepare_metadata(const model_batch& batch, const qwen3_config& config, const metal_kv_cache& cache)
 {
     if (batch.empty()) {
         return fail(model_runner_errc::empty_batch);
@@ -110,7 +110,7 @@ qwen_model_runner::make(const std::filesystem::path& model_directory,
         || kv_block_count > std::numeric_limits<std::size_t>::max() / kv_block_size) {
         return fail(qwen_model_runner_errc::cache_creation_failed);
     }
-    auto config = load_qwen_config(model_directory / "config.json");
+    auto config = load_qwen3_config(model_directory / "config.json");
     if (!config) {
         return fail(qwen_model_runner_errc::config_load_failed);
     }
@@ -154,7 +154,7 @@ qwen_model_runner::make(const std::filesystem::path& model_directory,
 }
 
 qwen_model_runner::qwen_model_runner(metal_context context,
-                                     qwen_config config,
+                                     qwen3_config config,
                                      qwen_weights weights,
                                      metal_kv_cache cache,
                                      qwen_tokenizer tokenizer,
@@ -167,7 +167,7 @@ qwen_model_runner::qwen_model_runner(metal_context context,
     , info_(std::move(info))
 {}
 
-const qwen_config&
+const qwen3_config&
 qwen_model_runner::config() const noexcept
 {
     return config_;

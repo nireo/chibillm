@@ -73,7 +73,7 @@ chibillm_metal = static_library(
 chibillm_qwen = static_library(
   'chibillm_qwen',
   [
-    'src/qwen/qwen_config.cc',
+    'src/qwen/qwen_configs.cc',
     'src/qwen/qwen_embedding.cc',
     'src/qwen/qwen_layer.cc',
     'src/qwen/qwen_model_runner.cc',
@@ -185,11 +185,18 @@ chibillm_server_tests = executable(
 
 test('chibillm server tests', chibillm_server_tests)
 
-qwen_config_fixture_path = join_paths(
+qwen3_config_fixture_path = join_paths(
   meson.project_source_root(),
   'tests',
   'fixtures',
   'qwen3_0_6b_config.json',
+)
+
+qwen3_5_config_fixture_path = join_paths(
+  meson.project_source_root(),
+  'tests',
+  'fixtures',
+  'qwen3_5_0_8b_config.json',
 )
 
 chibillm_qwen_config_tests = executable(
@@ -197,7 +204,8 @@ chibillm_qwen_config_tests = executable(
   'tests/qwen_config_test.cc',
   include_directories: src_include,
   cpp_args: [
-    '-DQWEN_CONFIG_FIXTURE_PATH="' + qwen_config_fixture_path + '"',
+    '-DQWEN3_CONFIG_FIXTURE_PATH="' + qwen3_config_fixture_path + '"',
+    '-DQWEN3_5_CONFIG_FIXTURE_PATH="' + qwen3_5_config_fixture_path + '"',
   ],
   dependencies: [
     doctest_dep,

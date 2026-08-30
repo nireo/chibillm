@@ -10,7 +10,7 @@
 #include "metal/metal_context.h"
 #include "metal/metal_kv_cache.h"
 #include "model_runner.h"
-#include "qwen/qwen_config.h"
+#include "qwen/qwen_configs.h"
 #include "qwen/qwen_tokenizer.h"
 #include "qwen/qwen_weights.h"
 #include "result.h"
@@ -41,7 +41,7 @@ public:
     qwen_model_runner(qwen_model_runner&&) noexcept = default;
     qwen_model_runner& operator=(qwen_model_runner&&) noexcept = default;
 
-    [[nodiscard]] const qwen_config& config() const noexcept;
+    [[nodiscard]] const qwen3_config& config() const noexcept;
     [[nodiscard]] const model_info& info() const noexcept override;
 
     [[nodiscard]] result<std::vector<token_id>, model_runner_errc>
@@ -55,14 +55,14 @@ public:
 
 private:
     qwen_model_runner(metal_context context,
-                      qwen_config config,
+                      qwen3_config config,
                       qwen_weights weights,
                       metal_kv_cache cache,
                       qwen_tokenizer tokenizer,
                       model_info info);
 
     metal_context context_;
-    qwen_config config_;
+    qwen3_config config_;
     qwen_weights weights_;
     metal_kv_cache cache_;
     qwen_tokenizer tokenizer_;

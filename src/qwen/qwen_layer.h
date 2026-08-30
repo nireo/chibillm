@@ -7,7 +7,7 @@
 #include "metal/metal_context.h"
 #include "metal/metal_kv_cache.h"
 #include "metal/metal_tensor.h"
-#include "qwen/qwen_config.h"
+#include "qwen/qwen_configs.h"
 #include "qwen/qwen_weights.h"
 #include "result.h"
 
@@ -35,24 +35,24 @@ struct qwen_attention_metadata {
 };
 
 [[nodiscard]] result<qwen_qkv, qwen_layer_errc> project_qwen_qkv(const metal_context& context,
-                                                                 const qwen_config& config,
+                                                                 const qwen3_config& config,
                                                                  const qwen_layer_weights& weights,
                                                                  const metal_tensor& hidden_states);
 
 [[nodiscard]] result<qwen_qkv, qwen_layer_errc> normalize_qwen_qk(const metal_context& context,
-                                                                  const qwen_config& config,
+                                                                  const qwen3_config& config,
                                                                   const qwen_layer_weights& weights,
                                                                   qwen_qkv qkv);
 
 [[nodiscard]] result<qwen_qkv, qwen_layer_errc>
 apply_qwen_rope(const metal_context& context,
-                const qwen_config& config,
+                const qwen3_config& config,
                 qwen_qkv qkv,
                 std::span<const std::uint32_t> positions);
 
 [[nodiscard]] result<metal_tensor, qwen_layer_errc>
 run_qwen_attention(const metal_context& context,
-                   const qwen_config& config,
+                   const qwen3_config& config,
                    const qwen_layer_weights& weights,
                    std::size_t layer,
                    const metal_tensor& hidden_states,
@@ -61,13 +61,13 @@ run_qwen_attention(const metal_context& context,
                    metal_kv_cache& cache);
 
 [[nodiscard]] result<metal_tensor, qwen_layer_errc> run_qwen_mlp(const metal_context& context,
-                                                                 const qwen_config& config,
+                                                                 const qwen3_config& config,
                                                                  const qwen_layer_weights& weights,
                                                                  const metal_tensor& hidden_states);
 
 [[nodiscard]] result<metal_tensor, qwen_layer_errc>
 run_qwen_layers(const metal_context& context,
-                const qwen_config& config,
+                const qwen3_config& config,
                 const qwen_weights& weights,
                 metal_tensor hidden_states,
                 qwen_attention_metadata metadata,

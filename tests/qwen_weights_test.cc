@@ -18,7 +18,7 @@
 #include "metal/metal_context.h"
 #include "metal/metal_kv_cache.h"
 #include "model_format/safetensors.h"
-#include "qwen/qwen_config.h"
+#include "qwen/qwen_configs.h"
 #include "qwen/qwen_embedding.h"
 #include "qwen/qwen_layer.h"
 #include "qwen/qwen_model_runner.h"
@@ -36,8 +36,8 @@ using chibillm::metal_kv_cache;
 using chibillm::metal_tensor;
 using chibillm::normalize_qwen_qk;
 using chibillm::project_qwen_qkv;
+using chibillm::qwen3_config;
 using chibillm::qwen_attention_metadata;
-using chibillm::qwen_config;
 using chibillm::qwen_model_runner;
 using chibillm::qwen_weights_errc;
 using chibillm::run_qwen_attention;
@@ -56,7 +56,7 @@ struct tensor_spec {
     std::vector<std::size_t> shape;
 };
 
-qwen_config
+qwen3_config
 test_config()
 {
     return {
@@ -77,7 +77,7 @@ test_config()
 }
 
 std::vector<tensor_spec>
-expected_tensors(const qwen_config& config)
+expected_tensors(const qwen3_config& config)
 {
     std::vector<tensor_spec> tensors {
         { "model.embed_tokens.weight", "BF16", { config.vocabulary_size, config.hidden_size } },
@@ -148,7 +148,7 @@ private:
 };
 
 void
-write_config(const std::filesystem::path& path, const qwen_config& config)
+write_config(const std::filesystem::path& path, const qwen3_config& config)
 {
     const nlohmann::json json {
         { "model_type", "qwen3" },

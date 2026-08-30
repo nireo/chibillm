@@ -7,7 +7,7 @@
 
 #include "metal/metal_context.h"
 #include "metal/metal_tensor.h"
-#include "qwen/qwen_config.h"
+#include "qwen/qwen_configs.h"
 #include "qwen/qwen_weights.h"
 #include "result.h"
 #include "seq.h"
@@ -28,7 +28,7 @@ enum class qwen_output_errc : std::uint8_t {
 // current Metal command buffer. Only the small token-ID tensor is returned.
 [[nodiscard]] result<metal_tensor, qwen_output_errc>
 encode_qwen_greedy(const metal_context& context,
-                   const qwen_config& config,
+                   const qwen3_config& config,
                    const qwen_weights& weights,
                    const metal_tensor& hidden_states,
                    std::span<const std::size_t> logits_indices);
@@ -40,7 +40,7 @@ encode_qwen_greedy(const metal_context& context,
 // for its one command buffer and this returns its token IDs immediately.
 [[nodiscard]] result<std::vector<token_id>, qwen_output_errc>
 sample_qwen_greedy(const metal_context& context,
-                   const qwen_config& config,
+                   const qwen3_config& config,
                    const qwen_weights& weights,
                    const metal_tensor& hidden_states,
                    std::span<const std::size_t> logits_indices);

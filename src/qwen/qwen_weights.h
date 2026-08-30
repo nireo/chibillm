@@ -6,7 +6,7 @@
 #include "metal/metal_context.h"
 #include "metal/metal_tensor.h"
 #include "model_format/safetensors.h"
-#include "qwen/qwen_config.h"
+#include "qwen/qwen_configs.h"
 #include "result.h"
 
 namespace chibillm {
@@ -43,9 +43,9 @@ struct qwen_weights {
 };
 
 [[nodiscard]] result<void, qwen_weights_errc> validate_qwen_weights(const safetensors_file& weights,
-                                                                    const qwen_config& config);
+                                                                    const qwen3_config& config);
 
 [[nodiscard]] result<qwen_weights, qwen_weights_errc> load_qwen_weights(
-    const metal_context& context, const safetensors_file& file, const qwen_config& config);
+    const metal_context& context, const safetensors_file& file, const qwen3_config& config);
 
 } // namespace chibillm

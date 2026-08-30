@@ -82,7 +82,7 @@ upload_attention_metadata(const metal_context& context, qwen_attention_metadata 
 
 result<qwen_qkv, qwen_layer_errc>
 apply_rope(const metal_context& context,
-           const qwen_config& config,
+           const qwen3_config& config,
            qwen_qkv qkv,
            const metal_tensor& positions)
 {
@@ -107,7 +107,7 @@ apply_rope(const metal_context& context,
 
 result<metal_tensor, qwen_layer_errc>
 run_attention(const metal_context& context,
-              const qwen_config& config,
+              const qwen3_config& config,
               const qwen_layer_weights& weights,
               std::size_t layer,
               const metal_tensor& hidden_states,
@@ -144,7 +144,7 @@ run_attention(const metal_context& context,
 
 result<qwen_qkv, qwen_layer_errc>
 project_qwen_qkv(const metal_context& context,
-                 const qwen_config& config,
+                 const qwen3_config& config,
                  const qwen_layer_weights& weights,
                  const metal_tensor& hidden_states)
 {
@@ -183,7 +183,7 @@ project_qwen_qkv(const metal_context& context,
 
 result<qwen_qkv, qwen_layer_errc>
 normalize_qwen_qk(const metal_context& context,
-                  const qwen_config& config,
+                  const qwen3_config& config,
                   const qwen_layer_weights& weights,
                   qwen_qkv qkv)
 {
@@ -214,7 +214,7 @@ normalize_qwen_qk(const metal_context& context,
 
 result<qwen_qkv, qwen_layer_errc>
 apply_qwen_rope(const metal_context& context,
-                const qwen_config& config,
+                const qwen3_config& config,
                 qwen_qkv qkv,
                 std::span<const std::uint32_t> positions)
 {
@@ -230,7 +230,7 @@ apply_qwen_rope(const metal_context& context,
 
 result<metal_tensor, qwen_layer_errc>
 run_qwen_attention(const metal_context& context,
-                   const qwen_config& config,
+                   const qwen3_config& config,
                    const qwen_layer_weights& weights,
                    std::size_t layer,
                    const metal_tensor& hidden_states,
@@ -247,7 +247,7 @@ run_qwen_attention(const metal_context& context,
 
 result<metal_tensor, qwen_layer_errc>
 run_qwen_mlp(const metal_context& context,
-             const qwen_config& config,
+             const qwen3_config& config,
              const qwen_layer_weights& weights,
              const metal_tensor& hidden_states)
 {
@@ -297,7 +297,7 @@ run_qwen_mlp(const metal_context& context,
 
 result<metal_tensor, qwen_layer_errc>
 run_qwen_layers(const metal_context& context,
-                const qwen_config& config,
+                const qwen3_config& config,
                 const qwen_weights& weights,
                 metal_tensor hidden_states,
                 qwen_attention_metadata metadata,

@@ -16,7 +16,7 @@ namespace chibillm {
 
 class metal_tensor;
 class metal_kv_cache;
-struct qwen_config;
+struct qwen3_config;
 struct qwen_weights;
 enum class qwen_output_errc : std::uint8_t;
 enum class tensor_op_errc : std::uint8_t;
@@ -91,7 +91,7 @@ private:
 
     friend result<metal_tensor, qwen_output_errc>
     encode_qwen_greedy(const metal_context& context,
-                       const qwen_config& config,
+                       const qwen3_config& config,
                        const qwen_weights& weights,
                        const metal_tensor& hidden_states,
                        std::span<const std::size_t> logits_indices);

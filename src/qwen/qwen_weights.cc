@@ -37,7 +37,7 @@ layer_tensor_name(std::size_t layer, std::string_view suffix)
 }
 
 result<void, qwen_weights_errc>
-validate_layer(const safetensors_file& weights, const qwen_config& config, std::size_t layer)
+validate_layer(const safetensors_file& weights, const qwen3_config& config, std::size_t layer)
 {
     const auto hidden = config.hidden_size;
     const auto intermediate = config.intermediate_size;
@@ -213,7 +213,7 @@ load_layer(const metal_context& context, const safetensors_file& file, std::size
 } // namespace
 
 result<void, qwen_weights_errc>
-validate_qwen_weights(const safetensors_file& weights, const qwen_config& config)
+validate_qwen_weights(const safetensors_file& weights, const qwen3_config& config)
 {
     constexpr std::size_t tensors_per_layer = 11;
     constexpr std::size_t global_tensors = 3;
@@ -255,7 +255,7 @@ validate_qwen_weights(const safetensors_file& weights, const qwen_config& config
 result<qwen_weights, qwen_weights_errc>
 load_qwen_weights(const metal_context& context,
                   const safetensors_file& file,
-                  const qwen_config& config)
+                  const qwen3_config& config)
 {
     auto validated = validate_qwen_weights(file, config);
     if (!validated) {
