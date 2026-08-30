@@ -16,3 +16,4 @@
 
 # Local model downloads (large generated artifacts)
 /qwen_model/
+/qwen3_5_model/

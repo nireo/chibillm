@@ -14,13 +14,14 @@ namespace {
 result<void, qwen_weights_errc>
 expect_tensor(const safetensors_file& weights,
               std::string_view name,
-              std::initializer_list<std::size_t> shape)
+              std::initializer_list<std::size_t> shape,
+              safetensors_dtype type = safetensors_dtype::bf16)
 {
     const auto* tensor = weights.find(name);
     if (tensor == nullptr) {
         return fail(qwen_weights_errc::missing_tensor);
     }
-    if (tensor->type != safetensors_dtype::bf16) {
+    if (tensor->type != type) {
         return fail(qwen_weights_errc::unsupported_dtype);
     }
     if (tensor->shape.size() != shape.size()
@@ -34,6 +35,12 @@ std::string
 layer_tensor_name(std::size_t layer, std::string_view suffix)
 {
     return "model.layers." + std::to_string(layer) + "." + std::string(suffix);
+}
+
+std::string
+qwen3_5_layer_tensor_name(std::size_t layer, std::string_view suffix)
+{
+    return "model.language_model.layers." + std::to_string(layer) + "." + std::string(suffix);
 }
 
 result<void, qwen_weights_errc>
@@ -100,7 +107,19 @@ load_tensor(const metal_context& context, const safetensors_file& file, std::str
         return fail(qwen_weights_errc::missing_tensor);
     }
 
-    auto tensor = metal_tensor::make(context, dtype::bf16, info->shape);
+    dtype tensor_type;
+    switch (info->type) {
+    case safetensors_dtype::bf16:
+        tensor_type = dtype::bf16;
+        break;
+    case safetensors_dtype::f32:
+        tensor_type = dtype::f32;
+        break;
+    default:
+        return fail(qwen_weights_errc::unsupported_dtype);
+    }
+
+    auto tensor = metal_tensor::make(context, tensor_type, info->shape);
     if (!tensor) {
         return fail(tensor.error() == metal_tensor_errc::invalid_descriptor
                         ? qwen_weights_errc::tensor_creation_failed
@@ -210,6 +229,192 @@ load_layer(const metal_context& context, const safetensors_file& file, std::size
     };
 }
 
+result<void, qwen_weights_errc>
+validate_qwen3_5_layer(const safetensors_file& weights,
+                       const qwen3_5_config& config,
+                       std::size_t layer)
+{
+    const auto hidden = config.hidden_size;
+    const auto intermediate = config.intermediate_size;
+    const auto expect = [&](std::string_view suffix, std::initializer_list<std::size_t> shape,
+                            safetensors_dtype type = safetensors_dtype::bf16) {
+        return expect_tensor(weights, qwen3_5_layer_tensor_name(layer, suffix), shape, type);
+    };
+
+    CL_TRY(expect("input_layernorm.weight", { hidden }));
+    CL_TRY(expect("post_attention_layernorm.weight", { hidden }));
+    CL_TRY(expect("mlp.gate_proj.weight", { intermediate, hidden }));
+    CL_TRY(expect("mlp.up_proj.weight", { intermediate, hidden }));
+    CL_TRY(expect("mlp.down_proj.weight", { hidden, intermediate }));
+
+    if (config.layer_types[layer] == qwen3_5_layer_type::full_attention) {
+        const auto query_width = config.query_width();
+        const auto kv_width = config.kv_width();
+        CL_TRY(expect("self_attn.q_norm.weight", { config.head_dimension }));
+        CL_TRY(expect("self_attn.k_norm.weight", { config.head_dimension }));
+        CL_TRY(expect("self_attn.q_proj.weight", { 2 * query_width, hidden }));
+        CL_TRY(expect("self_attn.k_proj.weight", { kv_width, hidden }));
+        CL_TRY(expect("self_attn.v_proj.weight", { kv_width, hidden }));
+        return expect("self_attn.o_proj.weight", { hidden, query_width });
+    }
+
+    const auto key_width = config.linear_key_width();
+    const auto value_width = config.linear_value_width();
+    const auto qkv_width = 2 * key_width + value_width;
+    CL_TRY(expect("linear_attn.in_proj_qkv.weight", { qkv_width, hidden }));
+    CL_TRY(expect("linear_attn.in_proj_z.weight", { value_width, hidden }));
+    CL_TRY(expect("linear_attn.in_proj_a.weight", { config.linear_value_head_count, hidden }));
+    CL_TRY(expect("linear_attn.in_proj_b.weight", { config.linear_value_head_count, hidden }));
+    CL_TRY(
+        expect("linear_attn.conv1d.weight", { qkv_width, 1, config.linear_conv_kernel_dimension }));
+    CL_TRY(expect("linear_attn.A_log", { config.linear_value_head_count }, safetensors_dtype::f32));
+    CL_TRY(expect("linear_attn.dt_bias", { config.linear_value_head_count }));
+    CL_TRY(expect("linear_attn.norm.weight", { config.linear_value_head_dimension },
+                  safetensors_dtype::f32));
+    return expect("linear_attn.out_proj.weight", { hidden, value_width });
+}
+
+result<qwen3_5_full_attention_weights, qwen_weights_errc>
+load_qwen3_5_full_attention(const metal_context& context,
+                            const safetensors_file& file,
+                            std::size_t layer)
+{
+    const auto name = [&](std::string_view suffix) {
+        return qwen3_5_layer_tensor_name(layer, suffix);
+    };
+
+    auto query_norm = load_tensor(context, file, name("self_attn.q_norm.weight"));
+    if (!query_norm)
+        return fail(query_norm.error());
+    auto key_norm = load_tensor(context, file, name("self_attn.k_norm.weight"));
+    if (!key_norm)
+        return fail(key_norm.error());
+    auto qkv_packed =
+        load_packed_tensors(context, file,
+                            { name("self_attn.q_proj.weight"), name("self_attn.k_proj.weight"),
+                              name("self_attn.v_proj.weight") });
+    if (!qkv_packed)
+        return fail(qkv_packed.error());
+    auto output = load_tensor(context, file, name("self_attn.o_proj.weight"));
+    if (!output)
+        return fail(output.error());
+
+    return qwen3_5_full_attention_weights {
+        std::move(*query_norm),
+        std::move(*key_norm),
+        std::move(*qkv_packed),
+        std::move(*output),
+    };
+}
+
+result<qwen3_5_linear_attention_weights, qwen_weights_errc>
+load_qwen3_5_linear_attention(const metal_context& context,
+                              const safetensors_file& file,
+                              std::size_t layer)
+{
+    const auto load = [&](std::string_view suffix) {
+        return load_tensor(context, file, qwen3_5_layer_tensor_name(layer, suffix));
+    };
+
+    auto qkv_projection = load("linear_attn.in_proj_qkv.weight");
+    if (!qkv_projection)
+        return fail(qkv_projection.error());
+    auto gate_projection = load("linear_attn.in_proj_z.weight");
+    if (!gate_projection)
+        return fail(gate_projection.error());
+    auto decay_projection = load("linear_attn.in_proj_a.weight");
+    if (!decay_projection)
+        return fail(decay_projection.error());
+    auto learning_rate_projection = load("linear_attn.in_proj_b.weight");
+    if (!learning_rate_projection)
+        return fail(learning_rate_projection.error());
+    auto convolution = load("linear_attn.conv1d.weight");
+    if (!convolution)
+        return fail(convolution.error());
+    auto decay_log = load("linear_attn.A_log");
+    if (!decay_log)
+        return fail(decay_log.error());
+    auto learning_rate_bias = load("linear_attn.dt_bias");
+    if (!learning_rate_bias)
+        return fail(learning_rate_bias.error());
+    auto norm = load("linear_attn.norm.weight");
+    if (!norm)
+        return fail(norm.error());
+    auto output = load("linear_attn.out_proj.weight");
+    if (!output)
+        return fail(output.error());
+
+    return qwen3_5_linear_attention_weights {
+        std::move(*qkv_projection),
+        std::move(*gate_projection),
+        std::move(*decay_projection),
+        std::move(*learning_rate_projection),
+        std::move(*convolution),
+        std::move(*decay_log),
+        std::move(*learning_rate_bias),
+        std::move(*norm),
+        std::move(*output),
+    };
+}
+
+result<qwen3_5_mixer_weights, qwen_weights_errc>
+load_qwen3_5_mixer(const metal_context& context,
+                   const safetensors_file& file,
+                   qwen3_5_layer_type type,
+                   std::size_t layer)
+{
+    if (type == qwen3_5_layer_type::full_attention) {
+        auto loaded = load_qwen3_5_full_attention(context, file, layer);
+        if (!loaded)
+            return fail(loaded.error());
+        return qwen3_5_mixer_weights { std::in_place_type<qwen3_5_full_attention_weights>,
+                                       std::move(*loaded) };
+    }
+    auto loaded = load_qwen3_5_linear_attention(context, file, layer);
+    if (!loaded)
+        return fail(loaded.error());
+    return qwen3_5_mixer_weights { std::in_place_type<qwen3_5_linear_attention_weights>,
+                                   std::move(*loaded) };
+}
+
+result<qwen3_5_layer_weights, qwen_weights_errc>
+load_qwen3_5_layer(const metal_context& context,
+                   const safetensors_file& file,
+                   const qwen3_5_config& config,
+                   std::size_t layer)
+{
+    const auto name = [&](std::string_view suffix) {
+        return qwen3_5_layer_tensor_name(layer, suffix);
+    };
+    const auto load = [&](std::string_view suffix) {
+        return load_tensor(context, file, name(suffix));
+    };
+
+    auto input_norm = load("input_layernorm.weight");
+    if (!input_norm)
+        return fail(input_norm.error());
+    auto post_attention_norm = load("post_attention_layernorm.weight");
+    if (!post_attention_norm)
+        return fail(post_attention_norm.error());
+    auto gateup_packed = load_packed_tensors(
+        context, file, { name("mlp.gate_proj.weight"), name("mlp.up_proj.weight") });
+    if (!gateup_packed)
+        return fail(gateup_packed.error());
+    auto mlp_down = load("mlp.down_proj.weight");
+    if (!mlp_down)
+        return fail(mlp_down.error());
+
+    auto mixer = load_qwen3_5_mixer(context, file, config.layer_types[layer], layer);
+    if (!mixer)
+        return fail(mixer.error());
+
+    return qwen3_5_layer_weights {
+        std::move(*input_norm),    std::move(*post_attention_norm),
+        std::move(*gateup_packed), std::move(*mlp_down),
+        std::move(*mixer),
+    };
+}
+
 } // namespace
 
 result<void, qwen_weights_errc>
@@ -286,6 +491,54 @@ load_qwen_weights(const metal_context& context,
         std::move(*token_embedding),
         std::move(*final_norm),
         std::move(*output),
+        std::move(layers),
+    };
+}
+
+result<void, qwen_weights_errc>
+validate_qwen3_5_weights(const safetensors_file& weights, const qwen3_5_config& config)
+{
+    if (config.layer_types.size() != config.layer_count
+        || !config.tie_word_embeddings
+        || !config.attention_output_gate) {
+        return fail(qwen_weights_errc::invalid_configuration);
+    }
+
+    CL_TRY(expect_tensor(weights, "model.language_model.embed_tokens.weight",
+                         { config.vocabulary_size, config.hidden_size }));
+    CL_TRY(expect_tensor(weights, "model.language_model.norm.weight", { config.hidden_size }));
+    for (std::size_t layer = 0; layer < config.layer_count; ++layer) {
+        CL_TRY(validate_qwen3_5_layer(weights, config, layer));
+    }
+    return {};
+}
+
+result<qwen3_5_weights, qwen_weights_errc>
+load_qwen3_5_weights(const metal_context& context,
+                     const safetensors_file& file,
+                     const qwen3_5_config& config)
+{
+    CL_TRY(validate_qwen3_5_weights(file, config));
+
+    auto token_embedding = load_tensor(context, file, "model.language_model.embed_tokens.weight");
+    if (!token_embedding)
+        return fail(token_embedding.error());
+    auto final_norm = load_tensor(context, file, "model.language_model.norm.weight");
+    if (!final_norm)
+        return fail(final_norm.error());
+
+    std::vector<qwen3_5_layer_weights> layers;
+    layers.reserve(config.layer_count);
+    for (std::size_t layer = 0; layer < config.layer_count; ++layer) {
+        auto loaded = load_qwen3_5_layer(context, file, config, layer);
+        if (!loaded)
+            return fail(loaded.error());
+        layers.push_back(std::move(*loaded));
+    }
+
+    return qwen3_5_weights {
+        std::move(*token_embedding),
+        std::move(*final_norm),
         std::move(layers),
     };
 }

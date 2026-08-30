@@ -261,6 +261,10 @@ chibillm_qwen_weights_tests = executable(
   ],
   cpp_args: [
     '-DCHIBILLM_SHADER_PATH="' + metal_shader_path + '"',
+    '-DQWEN3_5_MODEL_PATH="' + join_paths(
+      meson.project_source_root(),
+      'qwen3_5_model',
+    ) + '"',
   ],
   dependencies: [
     doctest_dep,

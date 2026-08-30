@@ -12,6 +12,7 @@
 #include <iterator>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "inference_engine.h"
@@ -30,12 +31,18 @@
 using chibillm::apply_qwen_rope;
 using chibillm::bf16;
 using chibillm::embed_qwen_tokens;
+using chibillm::load_qwen3_5_config;
+using chibillm::load_qwen3_5_weights;
 using chibillm::load_qwen_weights;
 using chibillm::metal_context;
 using chibillm::metal_kv_cache;
 using chibillm::metal_tensor;
 using chibillm::normalize_qwen_qk;
 using chibillm::project_qwen_qkv;
+using chibillm::qwen3_5_config;
+using chibillm::qwen3_5_full_attention_weights;
+using chibillm::qwen3_5_layer_type;
+using chibillm::qwen3_5_linear_attention_weights;
 using chibillm::qwen3_config;
 using chibillm::qwen_attention_metadata;
 using chibillm::qwen_model_runner;
@@ -45,6 +52,7 @@ using chibillm::run_qwen_layers;
 using chibillm::run_qwen_mlp;
 using chibillm::safetensors_file;
 using chibillm::sample_qwen_greedy;
+using chibillm::validate_qwen3_5_weights;
 using chibillm::validate_qwen_weights;
 using safetensors_test::temporary_file;
 
@@ -76,6 +84,36 @@ test_config()
     };
 }
 
+qwen3_5_config
+qwen3_5_test_config()
+{
+    return {
+        .vocabulary_size = 8,
+        .hidden_size = 4,
+        .intermediate_size = 6,
+        .layer_count = 2,
+        .query_head_count = 2,
+        .kv_head_count = 1,
+        .head_dimension = 2,
+        .max_position_embeddings = 32,
+        .rms_epsilon = 1e-6F,
+        .rope_theta = 10000.0F,
+        .partial_rotary_factor = 1.0F,
+        .eos_token_id = 2,
+        .tie_word_embeddings = true,
+        .attention_output_gate = true,
+        .full_attention_interval = 2,
+        .layer_types = { qwen3_5_layer_type::linear_attention, qwen3_5_layer_type::full_attention },
+        .linear_conv_kernel_dimension = 3,
+        .linear_key_head_dimension = 2,
+        .linear_key_head_count = 1,
+        .linear_value_head_dimension = 2,
+        .linear_value_head_count = 1,
+        .mrope_interleaved = true,
+        .mrope_sections = { 1, 0, 0 },
+    };
+}
+
 std::vector<tensor_spec>
 expected_tensors(const qwen3_config& config)
 {
@@ -101,6 +139,64 @@ expected_tensors(const qwen3_config& config)
         add(layer, "mlp.gate_proj.weight", { config.intermediate_size, config.hidden_size });
         add(layer, "mlp.up_proj.weight", { config.intermediate_size, config.hidden_size });
         add(layer, "mlp.down_proj.weight", { config.hidden_size, config.intermediate_size });
+    }
+    return tensors;
+}
+
+std::vector<tensor_spec>
+expected_qwen3_5_tensors(const qwen3_5_config& config)
+{
+    std::vector<tensor_spec> tensors {
+        { "model.language_model.embed_tokens.weight",
+          "BF16",
+          { config.vocabulary_size, config.hidden_size } },
+        { "model.language_model.norm.weight", "BF16", { config.hidden_size } },
+    };
+
+    const auto add = [&](std::size_t layer, std::string suffix, std::string dtype,
+                         std::vector<std::size_t> shape) {
+        tensors.push_back(
+            { "model.language_model.layers." + std::to_string(layer) + "." + std::move(suffix),
+              std::move(dtype), std::move(shape) });
+    };
+    for (std::size_t layer = 0; layer < config.layer_count; ++layer) {
+        add(layer, "input_layernorm.weight", "BF16", { config.hidden_size });
+        add(layer, "post_attention_layernorm.weight", "BF16", { config.hidden_size });
+        add(layer, "mlp.gate_proj.weight", "BF16",
+            { config.intermediate_size, config.hidden_size });
+        add(layer, "mlp.up_proj.weight", "BF16", { config.intermediate_size, config.hidden_size });
+        add(layer, "mlp.down_proj.weight", "BF16",
+            { config.hidden_size, config.intermediate_size });
+
+        if (config.layer_types[layer] == qwen3_5_layer_type::full_attention) {
+            add(layer, "self_attn.q_norm.weight", "BF16", { config.head_dimension });
+            add(layer, "self_attn.k_norm.weight", "BF16", { config.head_dimension });
+            add(layer, "self_attn.q_proj.weight", "BF16",
+                { 2 * config.query_width(), config.hidden_size });
+            add(layer, "self_attn.k_proj.weight", "BF16",
+                { config.kv_width(), config.hidden_size });
+            add(layer, "self_attn.v_proj.weight", "BF16",
+                { config.kv_width(), config.hidden_size });
+            add(layer, "self_attn.o_proj.weight", "BF16",
+                { config.hidden_size, config.query_width() });
+            continue;
+        }
+
+        const auto key_width = config.linear_key_width();
+        const auto value_width = config.linear_value_width();
+        const auto qkv_width = 2 * key_width + value_width;
+        add(layer, "linear_attn.in_proj_qkv.weight", "BF16", { qkv_width, config.hidden_size });
+        add(layer, "linear_attn.in_proj_z.weight", "BF16", { value_width, config.hidden_size });
+        add(layer, "linear_attn.in_proj_a.weight", "BF16",
+            { config.linear_value_head_count, config.hidden_size });
+        add(layer, "linear_attn.in_proj_b.weight", "BF16",
+            { config.linear_value_head_count, config.hidden_size });
+        add(layer, "linear_attn.conv1d.weight", "BF16",
+            { qkv_width, 1, config.linear_conv_kernel_dimension });
+        add(layer, "linear_attn.A_log", "F32", { config.linear_value_head_count });
+        add(layer, "linear_attn.dt_bias", "BF16", { config.linear_value_head_count });
+        add(layer, "linear_attn.norm.weight", "F32", { config.linear_value_head_dimension });
+        add(layer, "linear_attn.out_proj.weight", "BF16", { config.hidden_size, value_width });
     }
     return tensors;
 }
@@ -288,6 +384,103 @@ TEST_CASE("Qwen weight validation reports incompatible manifests")
         CHECK(validate_qwen_weights(*weights, config).error()
               == qwen_weights_errc::unexpected_tensor_count);
     }
+}
+
+TEST_CASE("Qwen3.5 weight validation accepts its hybrid tensor layouts")
+{
+    const auto config = qwen3_5_test_config();
+    auto file = write_weights(expected_qwen3_5_tensors(config),
+                              "chibillm_qwen3_5_weights_valid.safetensors");
+    auto weights = safetensors_file::open(file.path());
+    REQUIRE(weights.has_value());
+    CHECK(validate_qwen3_5_weights(*weights, config).has_value());
+}
+
+TEST_CASE("Qwen3.5 weight validation distinguishes architecture and storage types")
+{
+    const auto config = qwen3_5_test_config();
+
+    SUBCASE("missing linear-attention tensor")
+    {
+        auto tensors = expected_qwen3_5_tensors(config);
+        const auto found = std::ranges::find_if(
+            tensors, [](const auto& tensor) { return tensor.name.ends_with("linear_attn.A_log"); });
+        REQUIRE(found != tensors.end());
+        tensors.erase(found);
+        auto file =
+            write_weights(std::move(tensors), "chibillm_qwen3_5_weights_missing.safetensors");
+        auto weights = safetensors_file::open(file.path());
+        REQUIRE(weights.has_value());
+        CHECK(validate_qwen3_5_weights(*weights, config).error()
+              == qwen_weights_errc::missing_tensor);
+    }
+
+    SUBCASE("wrong F32 state dtype")
+    {
+        auto tensors = expected_qwen3_5_tensors(config);
+        const auto found = std::ranges::find_if(
+            tensors, [](const auto& tensor) { return tensor.name.ends_with("linear_attn.A_log"); });
+        REQUIRE(found != tensors.end());
+        found->dtype = "BF16";
+        auto file = write_weights(std::move(tensors), "chibillm_qwen3_5_weights_dtype.safetensors");
+        auto weights = safetensors_file::open(file.path());
+        REQUIRE(weights.has_value());
+        CHECK(validate_qwen3_5_weights(*weights, config).error()
+              == qwen_weights_errc::unsupported_dtype);
+    }
+
+    SUBCASE("Qwen3 manifest is not accepted as Qwen3.5")
+    {
+        auto file =
+            write_weights(expected_tensors(test_config()), "chibillm_qwen3_as_qwen3_5.safetensors");
+        auto weights = safetensors_file::open(file.path());
+        REQUIRE(weights.has_value());
+        CHECK(validate_qwen3_5_weights(*weights, config).error()
+              == qwen_weights_errc::missing_tensor);
+    }
+}
+
+TEST_CASE("Qwen3.5 weights load linear and full-attention layers separately")
+{
+    const auto config = qwen3_5_test_config();
+    auto file = write_weights(expected_qwen3_5_tensors(config),
+                              "chibillm_qwen3_5_weights_load.safetensors");
+    auto safetensors = safetensors_file::open(file.path());
+    REQUIRE(safetensors.has_value());
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+
+    auto weights = load_qwen3_5_weights(*context, *safetensors, config);
+    REQUIRE(weights.has_value());
+    REQUIRE(weights->layers.size() == config.layer_count);
+    REQUIRE(std::holds_alternative<qwen3_5_linear_attention_weights>(weights->layers[0].mixer));
+    REQUIRE(std::holds_alternative<qwen3_5_full_attention_weights>(weights->layers[1].mixer));
+
+    const auto& linear = std::get<qwen3_5_linear_attention_weights>(weights->layers[0].mixer);
+    CHECK(linear.decay_log.descriptor().type() == chibillm::dtype::f32);
+    CHECK(linear.norm.descriptor().type() == chibillm::dtype::f32);
+    CHECK(std::ranges::equal(linear.qkv_projection.descriptor().shape().dimensions(),
+                             std::vector<std::size_t> { 6, config.hidden_size }));
+
+    const auto& full = std::get<qwen3_5_full_attention_weights>(weights->layers[1].mixer);
+    CHECK(std::ranges::equal(full.qkv_packed.descriptor().shape().dimensions(),
+                             std::vector<std::size_t> { 12, config.hidden_size }));
+}
+
+TEST_CASE("Qwen3.5 official 0.8B checkpoint matches the weight schema")
+{
+    const std::filesystem::path model_directory { QWEN3_5_MODEL_PATH };
+    const auto shard = model_directory / "model.safetensors-00001-of-00001.safetensors";
+    if (!std::filesystem::exists(shard)) {
+        MESSAGE("Qwen3.5 model is not installed; skipping local checkpoint validation");
+        return;
+    }
+
+    auto config = load_qwen3_5_config(model_directory / "config.json");
+    auto weights = safetensors_file::open(shard);
+    REQUIRE(config.has_value());
+    REQUIRE(weights.has_value());
+    CHECK(validate_qwen3_5_weights(*weights, *config).has_value());
 }
 
 TEST_CASE("Qwen weights are loaded into resident Metal tensors")
