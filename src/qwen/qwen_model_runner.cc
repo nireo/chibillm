@@ -1,6 +1,7 @@
 #include "qwen/qwen_model_runner.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <string>
 #include <utility>
@@ -13,6 +14,14 @@
 
 namespace chibillm {
 namespace {
+
+template <typename Error>
+void
+log_load_failure(const char* stage, Error error)
+{
+    std::fprintf(stderr, "[model-load] %s failed (error=%u)\n", stage,
+                 static_cast<unsigned>(error));
+}
 
 struct batch_metadata {
     std::vector<std::uint32_t> slots;
@@ -112,18 +121,23 @@ qwen_model_runner::make(const std::filesystem::path& model_directory,
     }
     auto config = load_qwen3_config(model_directory / "config.json");
     if (!config) {
+        log_load_failure("config", config.error());
         return fail(qwen_model_runner_errc::config_load_failed);
     }
     auto tokenizer = qwen_tokenizer::load(model_directory);
     if (!tokenizer) {
+        log_load_failure("tokenizer", tokenizer.error());
         return fail(qwen_model_runner_errc::tokenizer_load_failed);
     }
     auto file = safetensors_file::open(model_directory / "model.safetensors");
     if (!file) {
+        log_load_failure("safetensors", file.error());
         return fail(qwen_model_runner_errc::weights_open_failed);
     }
     auto context = metal_context::make(shader_source);
     if (!context) {
+        std::fprintf(stderr, "[model-load] Metal context failed: %s\n",
+                     context.error().message.c_str());
         return fail(qwen_model_runner_errc::metal_context_creation_failed);
     }
     auto cache = metal_kv_cache::make(*context,
@@ -135,10 +149,12 @@ qwen_model_runner::make(const std::filesystem::path& model_directory,
                                           .head_dimension = config->head_dimension,
                                       });
     if (!cache) {
+        log_load_failure("KV cache", cache.error());
         return fail(qwen_model_runner_errc::cache_creation_failed);
     }
     auto weights = load_qwen_weights(*context, *file, *config);
     if (!weights) {
+        log_load_failure("weights", weights.error());
         return fail(qwen_model_runner_errc::weights_load_failed);
     }
 

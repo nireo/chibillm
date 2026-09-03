@@ -41,6 +41,16 @@ message_from_error(NSError* error, std::string_view fallback)
     return message == nullptr ? std::string(fallback) : std::string(message);
 }
 
+bool
+environment_flag(const char* name)
+{
+    const char* value = std::getenv(name);
+    return value != nullptr
+        && std::string_view(value) != "0"
+        && std::string_view(value) != "false"
+        && std::string_view(value) != "off";
+}
+
 MTLSize
 adaptive_2d_threadgroup_size(id<MTLComputePipelineState> pipeline,
                              std::size_t grid_width,
@@ -118,10 +128,12 @@ struct activation_arena {
     dump_stats() const
     {
         const std::scoped_lock lock(mutex);
+        const auto requests = allocations + reuses;
+        const auto reuse_rate = requests == 0 ? 0.0 : 100.0 * double(reuses) / double(requests);
         std::fprintf(stderr,
                      "[metal-arena] allocations=%zu reuses=%zu cached_bytes=%zu "
-                     "peak_cached_bytes=%zu\n",
-                     allocations, reuses, cached_bytes, peak_cached_bytes);
+                     "peak_cached_bytes=%zu reuse_rate=%.1f%%\n",
+                     allocations, reuses, cached_bytes, peak_cached_bytes, reuse_rate);
     }
 
     mutable std::mutex mutex;
@@ -264,11 +276,25 @@ metal_context::implementation::dump_profile() const noexcept
     if (!profiling_enabled) {
         return;
     }
+    std::vector<std::pair<std::string_view, const profile_stats*>> sorted;
+    sorted.reserve(profile.size());
+    double total_seconds = 0.0;
     for (const auto& [name, stats] : profile) {
-        const auto total_ms = stats.gpu_seconds * 1000.0;
-        std::fprintf(stderr, "[metal-profile] %-28s calls=%zu total_ms=%.3f avg_us=%.3f\n",
-                     name.c_str(), stats.calls, total_ms, total_ms * 1000.0 / stats.calls);
+        sorted.emplace_back(name, &stats);
+        total_seconds += stats.gpu_seconds;
     }
+    std::ranges::sort(sorted, {}, [](const auto& entry) { return -entry.second->gpu_seconds; });
+    for (const auto& [name, stats] : sorted) {
+        const auto total_ms = stats->gpu_seconds * 1000.0;
+        const auto percentage =
+            total_seconds == 0.0 ? 0.0 : 100.0 * stats->gpu_seconds / total_seconds;
+        std::fprintf(
+            stderr, "[metal-profile] %-28.*s calls=%zu total_ms=%8.3f avg_us=%8.3f share=%5.1f%%\n",
+            static_cast<int>(name.size()), name.data(), stats->calls, total_ms,
+            total_ms * 1000.0 / stats->calls, percentage);
+    }
+    std::fprintf(stderr, "[metal-profile] %-28s total_ms=%8.3f\n", "all instrumented work",
+                 total_seconds * 1000.0);
 }
 
 metal_buffer::metal_buffer(std::unique_ptr<implementation> implementation) noexcept
@@ -436,6 +462,11 @@ metal_context::make(std::string_view shader_source)
                                                           options:0
                                                        reflection:nil
                                                             error:&pipeline_error];
+                if (linear_bf16_tensorops_pipeline == nil) {
+                    std::fprintf(
+                        stderr, "[metal] TensorOps pipeline unavailable: %s\n",
+                        message_from_error(pipeline_error, "unknown pipeline error").c_str());
+                }
             }
         }
 
@@ -678,8 +709,14 @@ metal_context::make(std::string_view shader_source)
         implementation->paged_attention_partial_f32_pipeline = paged_attention_partial_f32_pipeline;
         implementation->paged_attention_reduce_f32_pipeline = paged_attention_reduce_f32_pipeline;
         implementation->device_name = device_name == nullptr ? "unknown Metal device" : device_name;
-        implementation->profiling_enabled = std::getenv("CHIBILLM_PROFILE") != nullptr;
-        implementation->tensorops_enabled = linear_bf16_tensorops_pipeline != nil;
+        implementation->profiling_enabled = environment_flag("CHIBILLM_PROFILE");
+        implementation->tensorops_enabled = linear_bf16_tensorops_pipeline != nil
+            && !environment_flag("CHIBILLM_DISABLE_TENSOROPS");
+
+        std::fprintf(stderr, "[metal] device=%s shaders=%s tensorops=%s profile=%s\n",
+                     implementation->device_name.c_str(), compiled_metal4 ? "Metal 4" : "legacy",
+                     implementation->tensorops_enabled ? "enabled" : "disabled",
+                     implementation->profiling_enabled ? "detailed" : "off");
 
         return metal_context { std::move(implementation) };
     }
@@ -1226,7 +1263,7 @@ metal_context::dispatch_greedy_vocabulary_bf16(const metal_buffer& hidden_states
         }
 
         constexpr std::size_t thread_count = 256;
-        constexpr std::size_t outputs_per_threadgroup = 32;
+        constexpr auto outputs_per_threadgroup = greedy_argmax_outputs_per_threadgroup;
         const auto projection_pipeline = implementation_->linear_bf16_partial_argmax_pipeline;
         const auto simd_width = static_cast<std::size_t>(projection_pipeline.threadExecutionWidth);
         const auto simdgroup_count = thread_count / simd_width;

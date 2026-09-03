@@ -6,6 +6,38 @@
 
 using namespace metal;
 
+#if __METAL_VERSION__ >= 310
+using bf16_storage = bfloat;
+using bf16x4_storage = bfloat4;
+
+static inline float
+load_bf16(bf16_storage value)
+{
+    return float(value);
+}
+
+static inline float4
+load_bf16x4(bf16x4_storage value)
+{
+    return float4(value);
+}
+#else
+using bf16_storage = ushort;
+using bf16x4_storage = ushort4;
+
+static inline float
+load_bf16(bf16_storage value)
+{
+    return as_type<float>(uint(value) << 16);
+}
+
+static inline float4
+load_bf16x4(bf16x4_storage value)
+{
+    return as_type<float4>(uint4(value) << 16);
+}
+#endif
+
 #if defined(CHIBILLM_ENABLE_TENSOROPS) && __METAL_VERSION__ >= 400 && defined(__HAVE_TENSOR__)
 using namespace mpp::tensor_ops;
 
@@ -76,7 +108,7 @@ matmul_f32(device const float* lhs [[buffer(0)]],
 
 kernel void
 linear_bf16(device const float* input [[buffer(0)]],
-            device const ushort* weight [[buffer(1)]],
+            device const bf16_storage* weight [[buffer(1)]],
             device float* output [[buffer(2)]],
             constant uint& rows [[buffer(3)]],
             constant uint& input_features [[buffer(4)]],
@@ -96,8 +128,7 @@ linear_bf16(device const float* input [[buffer(0)]],
         const ulong input_index = row * k_count + k;
         const ulong weight_index = output_feature * k_count + k;
 
-        const uint float_bits = uint(weight[weight_index]) << 16;
-        const float value = as_type<float>(float_bits);
+        const float value = load_bf16(weight[weight_index]);
 
         accumulator += input[input_index] * value;
     }
@@ -107,34 +138,26 @@ linear_bf16(device const float* input [[buffer(0)]],
 
 static inline float
 linear_bf16_decode_dot(device const float* input,
-                       device const ushort* weight,
+                       device const bf16_storage* weight,
                        uint input_features,
                        uint weight_row,
                        uint lane,
                        uint simd_width)
 {
-    float accumulator0 = 0.0F;
-    float accumulator1 = 0.0F;
-    float accumulator2 = 0.0F;
-    float accumulator3 = 0.0F;
+    float accumulator = 0.0F;
     const ulong weight_base = ulong(weight_row) * ulong(input_features);
-    uint k = lane;
-    for (; k + 3 * simd_width < input_features; k += 4 * simd_width) {
-        const float value0 = as_type<float>(uint(weight[weight_base + ulong(k)]) << 16);
-        const float value1 =
-            as_type<float>(uint(weight[weight_base + ulong(k + simd_width)]) << 16);
-        const float value2 =
-            as_type<float>(uint(weight[weight_base + ulong(k + 2 * simd_width)]) << 16);
-        const float value3 =
-            as_type<float>(uint(weight[weight_base + ulong(k + 3 * simd_width)]) << 16);
-        accumulator0 += input[k] * value0;
-        accumulator1 += input[k + simd_width] * value1;
-        accumulator2 += input[k + 2 * simd_width] * value2;
-        accumulator3 += input[k + 3 * simd_width] * value3;
+    for (uint k = lane * 4; k + 3 < input_features; k += 4 * simd_width) {
+        const float4 input_values = { input[k], input[k + 1], input[k + 2], input[k + 3] };
+        const bf16x4_storage packed_values = { weight[weight_base + ulong(k)],
+                                               weight[weight_base + ulong(k + 1)],
+                                               weight[weight_base + ulong(k + 2)],
+                                               weight[weight_base + ulong(k + 3)] };
+        const float4 weight_values = load_bf16x4(packed_values);
+        accumulator += dot(input_values, weight_values);
     }
-    float accumulator = accumulator0 + accumulator1 + accumulator2 + accumulator3;
-    for (; k < input_features; k += simd_width) {
-        const float value = as_type<float>(uint(weight[weight_base + ulong(k)]) << 16);
+    const uint vectorized_features = input_features & ~3u;
+    for (uint k = vectorized_features + lane; k < input_features; k += simd_width) {
+        const float value = load_bf16(weight[weight_base + ulong(k)]);
         accumulator += input[k] * value;
     }
     return simd_sum(accumulator);
@@ -142,7 +165,7 @@ linear_bf16_decode_dot(device const float* input,
 
 kernel void
 linear_bf16_decode(device const float* input [[buffer(0)]],
-                   device const ushort* weight [[buffer(1)]],
+                   device const bf16_storage* weight [[buffer(1)]],
                    device float* output [[buffer(2)]],
                    constant uint& input_features [[buffer(3)]],
                    constant uint& output_features [[buffer(4)]],
@@ -166,7 +189,7 @@ linear_bf16_decode(device const float* input [[buffer(0)]],
 
 kernel void
 linear_add_bf16_decode(device const float* input [[buffer(0)]],
-                       device const ushort* weight [[buffer(1)]],
+                       device const bf16_storage* weight [[buffer(1)]],
                        device const float* residual [[buffer(2)]],
                        device float* output [[buffer(3)]],
                        constant uint& input_features [[buffer(4)]],
@@ -191,7 +214,7 @@ linear_add_bf16_decode(device const float* input [[buffer(0)]],
 
 kernel void
 linear_split_bf16(device const float* input [[buffer(0)]],
-                  device const ushort* weight [[buffer(1)]],
+                  device const bf16_storage* weight [[buffer(1)]],
                   device float* output_a [[buffer(2)]],
                   device float* output_b [[buffer(3)]],
                   device float* output_c [[buffer(4)]],
@@ -231,7 +254,7 @@ linear_split_bf16(device const float* input [[buffer(0)]],
     float accumulator = 0.0F;
     const ulong weight_base = weight_column * k_count;
     for (ulong k = 0; k < k_count; ++k) {
-        const float value = as_type<float>(uint(weight[weight_base + k]) << 16);
+        const float value = load_bf16(weight[weight_base + k]);
         accumulator += input[row * k_count + k] * value;
     }
 
@@ -240,7 +263,7 @@ linear_split_bf16(device const float* input [[buffer(0)]],
 
 kernel void
 linear_split_bf16_decode(device const float* input [[buffer(0)]],
-                         device const ushort* weight [[buffer(1)]],
+                         device const bf16_storage* weight [[buffer(1)]],
                          device float* output_a [[buffer(2)]],
                          device float* output_b [[buffer(3)]],
                          device float* output_c [[buffer(4)]],
@@ -276,7 +299,7 @@ linear_split_bf16_decode(device const float* input [[buffer(0)]],
 
 kernel void
 embedding_bf16(device const int* token_ids [[buffer(0)]],
-               device const ushort* weight [[buffer(1)]],
+               device const bf16_storage* weight [[buffer(1)]],
                device float* output [[buffer(2)]],
                constant uint& token_count [[buffer(3)]],
                constant uint& hidden_size [[buffer(4)]],
@@ -292,8 +315,7 @@ embedding_bf16(device const int* token_ids [[buffer(0)]],
     const ulong token = ulong(token_ids[token_position]);
 
     const ulong weight_index = token * hidden_count + hidden_feature;
-    const uint float_bits = uint(weight[weight_index]) << 16;
-    const float value = as_type<float>(float_bits);
+    const float value = load_bf16(weight[weight_index]);
 
     const ulong output_index = token_position * hidden_count + hidden_feature;
     output[output_index] = value;
@@ -301,7 +323,7 @@ embedding_bf16(device const int* token_ids [[buffer(0)]],
 
 kernel void
 rms_norm_bf16(device const float* input [[buffer(0)]],
-              device const ushort* weight [[buffer(1)]],
+              device const bf16_storage* weight [[buffer(1)]],
               device float* output [[buffer(2)]],
               constant uint& row_count [[buffer(3)]],
               constant uint& hidden_size [[buffer(4)]],
@@ -348,8 +370,7 @@ rms_norm_bf16(device const float* input [[buffer(0)]],
     const float inverse_rms = partial_sums[0];
     for (uint feature = thread_index; feature < hidden_size; feature += thread_count) {
         const ulong index = row_offset + ulong(feature);
-        const uint weight_bits = uint(weight[feature]) << 16;
-        const float weight_value = as_type<float>(weight_bits);
+        const float weight_value = load_bf16(weight[feature]);
         output[index] = input[index] * inverse_rms * weight_value;
     }
 }
@@ -377,7 +398,7 @@ gather_rows_f32(device const float* input [[buffer(0)]],
 
 kernel void
 linear_bf16_partial_argmax(device const float* input [[buffer(0)]],
-                           device const ushort* weight [[buffer(1)]],
+                           device const bf16_storage* weight [[buffer(1)]],
                            device argmax_pair* partials [[buffer(2)]],
                            constant uint& hidden_size [[buffer(3)]],
                            constant uint& vocabulary_size [[buffer(4)]],
@@ -402,13 +423,8 @@ linear_bf16_partial_argmax(device const float* input [[buffer(0)]],
         float accumulator = 0.0F;
         if (output_feature < vocabulary_size) {
             const ulong input_base = ulong(row) * ulong(hidden_size);
-            const ulong weight_base = ulong(output_feature) * ulong(hidden_size);
-            for (uint feature = lane; feature < hidden_size; feature += simd_width) {
-                const float value =
-                    as_type<float>(uint(weight[weight_base + ulong(feature)]) << 16);
-                accumulator += input[input_base + ulong(feature)] * value;
-            }
-            accumulator = simd_sum(accumulator);
+            accumulator = linear_bf16_decode_dot(input + input_base, weight, hidden_size,
+                                                 output_feature, lane, simd_width);
             if (lane == 0
                 && (accumulator > best_score
                     || (accumulator == best_score && output_feature < best_index))) {

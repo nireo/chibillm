@@ -133,7 +133,7 @@ private:
 
     struct implementation;
 
-    static constexpr std::size_t greedy_argmax_outputs_per_threadgroup = 32;
+    static constexpr std::size_t greedy_argmax_outputs_per_threadgroup = 64;
 
     explicit metal_context(std::unique_ptr<implementation> implementation) noexcept;
 

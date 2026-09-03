@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
@@ -35,7 +36,21 @@ struct generation_result {
     std::size_t output_tokens;
     double time_to_first_token;
     double total_time;
+    double decode_p50;
+    double decode_p95;
 };
+
+double
+percentile(std::vector<double> samples, double fraction)
+{
+    if (samples.empty()) {
+        return 0.0;
+    }
+    std::ranges::sort(samples);
+    const auto index = std::min(samples.size() - 1,
+                                static_cast<std::size_t>(std::ceil(fraction * samples.size()) - 1));
+    return samples[index];
+}
 
 result<generation_result, chat_errc>
 generate(chibillm::qwen_model_runner& runner, std::span<const chibillm::chat_message> history)
@@ -79,13 +94,20 @@ generate(chibillm::qwen_model_runner& runner, std::span<const chibillm::chat_mes
     const auto started = clock::now();
     auto first_token = started;
     bool produced_token = false;
+    std::vector<double> decode_latencies;
     while (!engine->is_finished()) {
+        const auto step_started = clock::now();
         if (!engine->step()) {
             return chibillm::fail(chat_errc::generation_failed);
         }
+        const auto step_finished = clock::now();
+        if (produced_token) {
+            decode_latencies.push_back(
+                std::chrono::duration<double>(step_finished - step_started).count());
+        }
         const auto* current = engine->find_sequence(1);
         if (!produced_token && current != nullptr && current->completion_token_count() != 0) {
-            first_token = clock::now();
+            first_token = step_finished;
             produced_token = true;
         }
     }
@@ -105,6 +127,8 @@ generate(chibillm::qwen_model_runner& runner, std::span<const chibillm::chat_mes
         .output_tokens = finished->completion_token_count(),
         .time_to_first_token = std::chrono::duration<double>(first_token - started).count(),
         .total_time = std::chrono::duration<double>(finished_at - started).count(),
+        .decode_p50 = percentile(decode_latencies, 0.50),
+        .decode_p95 = percentile(decode_latencies, 0.95),
     };
 }
 
@@ -129,7 +153,11 @@ print_performance(const generation_result& result)
         << prefill_rate
         << " tok/s | decode "
         << decode_rate
-        << " tok/s | total "
+        << " tok/s (p50 "
+        << result.decode_p50 * 1000.0
+        << " ms, p95 "
+        << result.decode_p95 * 1000.0
+        << " ms) | total "
         << result.total_time
         << " s\n";
 }
