@@ -35,18 +35,6 @@ enum class tensor_op_errc : std::uint8_t {
     backend_failure,
 };
 
-// computes lhs [m, k] times rhs [k, n] into output [m, n].
-[[nodiscard]] result<void, tensor_op_errc> matmul(const metal_context& context,
-                                                  const metal_tensor& lhs,
-                                                  const metal_tensor& rhs,
-                                                  metal_tensor& output);
-
-// projects input [m, k] with bf16 weight [n, k] into f32 output [m, n].
-[[nodiscard]] result<void, tensor_op_errc> linear(const metal_context& context,
-                                                  const metal_tensor& input,
-                                                  const metal_tensor& weight,
-                                                  metal_tensor& output);
-
 // projects input and adds a same-shaped f32 residual into output.
 [[nodiscard]] result<void, tensor_op_errc> linear_add(const metal_context& context,
                                                       const metal_tensor& input,
@@ -67,19 +55,12 @@ linear_split(const metal_context& context,
                                                             const metal_tensor& weight,
                                                             metal_tensor& output);
 
-// normalizes each f32 input row and scales it with a bf16 hidden-size weight.
+// normalizes each contiguous weight-sized group and scales it with the bf16 weight.
 [[nodiscard]] result<void, tensor_op_errc> rms_norm(const metal_context& context,
                                                     const metal_tensor& input,
                                                     const metal_tensor& weight,
                                                     float epsilon,
                                                     metal_tensor& output);
-
-// normalizes each contiguous head using one shared head-dimension weight.
-[[nodiscard]] result<void, tensor_op_errc> rms_norm_heads(const metal_context& context,
-                                                          const metal_tensor& input,
-                                                          const metal_tensor& weight,
-                                                          float epsilon,
-                                                          metal_tensor& output);
 
 // applies silu to gate and multiplies it elementwise by up.
 [[nodiscard]] result<void, tensor_op_errc> silu_mul(const metal_context& context,

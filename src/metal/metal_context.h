@@ -51,16 +51,6 @@ public:
     make_shared_buffer(std::size_t size_bytes) const;
 
 private:
-    friend result<void, tensor_op_errc> matmul(const metal_context& context,
-                                               const metal_tensor& lhs,
-                                               const metal_tensor& rhs,
-                                               metal_tensor& output);
-
-    friend result<void, tensor_op_errc> linear(const metal_context& context,
-                                               const metal_tensor& input,
-                                               const metal_tensor& weight,
-                                               metal_tensor& output);
-
     friend result<void, tensor_op_errc> linear_add(const metal_context& context,
                                                    const metal_tensor& input,
                                                    const metal_tensor& weight,
@@ -82,12 +72,6 @@ private:
                                                  const metal_tensor& weight,
                                                  float epsilon,
                                                  metal_tensor& output);
-
-    friend result<void, tensor_op_errc> rms_norm_heads(const metal_context& context,
-                                                       const metal_tensor& input,
-                                                       const metal_tensor& weight,
-                                                       float epsilon,
-                                                       metal_tensor& output);
 
     friend result<metal_tensor, qwen_output_errc>
     encode_qwen_greedy(const metal_context& context,
@@ -136,20 +120,6 @@ private:
     static constexpr std::size_t greedy_argmax_outputs_per_threadgroup = 64;
 
     explicit metal_context(std::unique_ptr<implementation> implementation) noexcept;
-
-    [[nodiscard]] result<void, metal_error> dispatch_matmul(const metal_buffer& lhs,
-                                                            const metal_buffer& rhs,
-                                                            metal_buffer& output,
-                                                            std::size_t rows,
-                                                            std::size_t inner_dimension,
-                                                            std::size_t columns) const;
-
-    [[nodiscard]] result<void, metal_error> dispatch_linear_bf16(const metal_buffer& input,
-                                                                 const metal_buffer& weight,
-                                                                 metal_buffer& output,
-                                                                 std::size_t rows,
-                                                                 std::size_t input_features,
-                                                                 std::size_t output_features) const;
 
     [[nodiscard]] result<void, metal_error>
     dispatch_linear_add_bf16(const metal_buffer& input,

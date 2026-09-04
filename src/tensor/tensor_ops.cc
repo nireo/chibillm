@@ -11,88 +11,6 @@
 namespace chibillm {
 
 result<void, tensor_op_errc>
-matmul(const metal_context& context,
-       const metal_tensor& lhs,
-       const metal_tensor& rhs,
-       metal_tensor& output)
-{
-    const auto& lshape = lhs.descriptor().shape();
-    const auto& rshape = rhs.descriptor().shape();
-    const auto& oshape = output.descriptor().shape();
-
-    if (lshape.rank() != 2 || rshape.rank() != 2 || oshape.rank() != 2) {
-        return fail(tensor_op_errc::invalid_rank);
-    }
-
-    if (lhs.descriptor().type() != dtype::f32
-        || rhs.descriptor().type() != dtype::f32
-        || output.descriptor().type() != dtype::f32) {
-        return fail(tensor_op_errc::unsupported_dtype);
-    }
-
-    const auto m = lshape.dimensions()[0];
-    const auto k = lshape.dimensions()[1];
-    const auto n = rshape.dimensions()[1];
-
-    if (k != rshape.dimensions()[0]) {
-        return fail(tensor_op_errc::inner_dimension_mismatch);
-    }
-
-    if (oshape.dimensions()[0] != m || oshape.dimensions()[1] != n) {
-        return fail(tensor_op_errc::output_shape_mismatch);
-    }
-
-    const auto dispatched =
-        context.dispatch_matmul(lhs.buffer(), rhs.buffer(), output.buffer(), m, k, n);
-    if (!dispatched) {
-        return fail(tensor_op_errc::backend_failure);
-    }
-
-    return {};
-}
-
-result<void, tensor_op_errc>
-linear(const metal_context& context,
-       const metal_tensor& input,
-       const metal_tensor& weight,
-       metal_tensor& output)
-{
-    const auto& input_shape = input.descriptor().shape();
-    const auto& weight_shape = weight.descriptor().shape();
-    const auto& output_shape = output.descriptor().shape();
-
-    if (input_shape.rank() != 2 || weight_shape.rank() != 2 || output_shape.rank() != 2) {
-        return fail(tensor_op_errc::invalid_rank);
-    }
-
-    if (input.descriptor().type() != dtype::f32
-        || weight.descriptor().type() != dtype::bf16
-        || output.descriptor().type() != dtype::f32) {
-        return fail(tensor_op_errc::unsupported_dtype);
-    }
-
-    const auto rows = input_shape.dimensions()[0];
-    const auto input_features = input_shape.dimensions()[1];
-    const auto output_features = weight_shape.dimensions()[0];
-
-    if (weight_shape.dimensions()[1] != input_features) {
-        return fail(tensor_op_errc::inner_dimension_mismatch);
-    }
-
-    if (output_shape.dimensions()[0] != rows || output_shape.dimensions()[1] != output_features) {
-        return fail(tensor_op_errc::output_shape_mismatch);
-    }
-
-    const auto dispatched = context.dispatch_linear_bf16(
-        input.buffer(), weight.buffer(), output.buffer(), rows, input_features, output_features);
-    if (!dispatched) {
-        return fail(tensor_op_errc::backend_failure);
-    }
-
-    return {};
-}
-
-result<void, tensor_op_errc>
 linear_add(const metal_context& context,
            const metal_tensor& input,
            const metal_tensor& weight,
@@ -132,9 +50,16 @@ linear_add(const metal_context& context,
     }
 
     if (rows != 1) {
-        auto operation = linear(context, input, weight, output);
-        if (!operation) {
-            return operation;
+        const std::array<metal_buffer*, 3> output_buffers {
+            &output.buffer(),
+            &output.buffer(),
+            &output.buffer(),
+        };
+        const std::array<std::size_t, 3> widths { output_features, 0, 0 };
+        const auto dispatched = context.dispatch_linear_split_bf16(
+            input.buffer(), weight.buffer(), output_buffers, rows, input_features, widths);
+        if (!dispatched) {
+            return fail(tensor_op_errc::backend_failure);
         }
         return add(context, residual, output, output);
     }
@@ -281,7 +206,8 @@ rms_norm(const metal_context& context,
     const auto rows = input_shape.dimensions()[0];
     const auto hidden_size = input_shape.dimensions()[1];
 
-    if (weight_shape.dimensions()[0] != hidden_size) {
+    const auto group_size = weight_shape.dimensions()[0];
+    if (hidden_size % group_size != 0) {
         return fail(tensor_op_errc::inner_dimension_mismatch);
     }
 
@@ -293,56 +219,14 @@ rms_norm(const metal_context& context,
         return fail(tensor_op_errc::invalid_epsilon);
     }
 
-    const auto dispatched = context.dispatch_rms_norm_bf16(
-        input.buffer(), weight.buffer(), output.buffer(), rows, hidden_size, epsilon);
-    if (!dispatched) {
-        return fail(tensor_op_errc::backend_failure);
-    }
-
-    return {};
-}
-
-result<void, tensor_op_errc>
-rms_norm_heads(const metal_context& context,
-               const metal_tensor& input,
-               const metal_tensor& weight,
-               float epsilon,
-               metal_tensor& output)
-{
-    const auto& input_shape = input.descriptor().shape();
-    const auto& weight_shape = weight.descriptor().shape();
-    const auto& output_shape = output.descriptor().shape();
-
-    if (input_shape.rank() != 2 || weight_shape.rank() != 1 || output_shape.rank() != 2) {
-        return fail(tensor_op_errc::invalid_rank);
-    }
-    if (input.descriptor().type() != dtype::f32
-        || weight.descriptor().type() != dtype::bf16
-        || output.descriptor().type() != dtype::f32) {
-        return fail(tensor_op_errc::unsupported_dtype);
-    }
-    if (input_shape.dimensions()[0] != output_shape.dimensions()[0]
-        || input_shape.dimensions()[1] != output_shape.dimensions()[1]) {
-        return fail(tensor_op_errc::output_shape_mismatch);
-    }
-
-    const auto rows = input_shape.dimensions()[0];
-    const auto width = input_shape.dimensions()[1];
-    const auto head_dimension = weight_shape.dimensions()[0];
-    if (width % head_dimension != 0) {
-        return fail(tensor_op_errc::invalid_head_dimension);
-    }
-    if (!std::isfinite(epsilon) || epsilon <= 0.0F) {
-        return fail(tensor_op_errc::invalid_epsilon);
-    }
-
-    const auto head_count = width / head_dimension;
+    const auto groups_per_row = hidden_size / group_size;
     const auto dispatched =
         context.dispatch_rms_norm_bf16(input.buffer(), weight.buffer(), output.buffer(),
-                                       rows * head_count, head_dimension, epsilon);
+                                       rows * groups_per_row, group_size, epsilon);
     if (!dispatched) {
         return fail(tensor_op_errc::backend_failure);
     }
+
     return {};
 }
 

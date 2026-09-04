@@ -71,6 +71,28 @@ adaptive_2d_threadgroup_size(id<MTLComputePipelineState> pipeline,
     return MTLSizeMake(threadgroup_width, threadgroup_height, 1);
 }
 
+result<id<MTLComputePipelineState>, metal_error>
+make_compute_pipeline(id<MTLDevice> device, id<MTLLibrary> library, NSString* name)
+{
+    const char* utf8_name = name.UTF8String;
+    const std::string function_name = utf8_name == nullptr ? "unknown" : utf8_name;
+    id<MTLFunction> function = [library newFunctionWithName:name];
+    if (function == nil) {
+        return fail(make_error(metal_errc::shader_function_not_found,
+                               "the Metal shader library does not contain " + function_name));
+    }
+
+    NSError* error = nil;
+    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function
+                                                                                 error:&error];
+    if (pipeline == nil) {
+        return fail(make_error(
+            metal_errc::pipeline_creation_failed,
+            message_from_error(error, "failed to create the " + function_name + " pipeline")));
+    }
+    return pipeline;
+}
+
 // Exact-size freelists for temporary buffers created while a compute pass is
 // open. Released buffers stay pending until the command buffer completes, so a
 // later pass can reuse them without aliasing resources inside one encoder.
@@ -169,9 +191,6 @@ struct metal_context::implementation {
     id<MTLDevice> device;
     id<MTLCommandQueue> command_queue;
     id<MTLLibrary> shader_library;
-    id<MTLComputePipelineState> matmul_f32_pipeline;
-    id<MTLComputePipelineState> linear_bf16_pipeline;
-    id<MTLComputePipelineState> linear_bf16_decode_pipeline;
     id<MTLComputePipelineState> linear_add_bf16_decode_pipeline;
     id<MTLComputePipelineState> linear_bf16_tensorops_pipeline;
     id<MTLComputePipelineState> linear_split_bf16_pipeline;
@@ -384,77 +403,16 @@ metal_context::make(std::string_view shader_source)
                 message_from_error(library_error, "failed to compile the Metal shader library")));
         }
 
-        id<MTLFunction> matmul_f32 = [library newFunctionWithName:@"matmul_f32"];
-        if (matmul_f32 == nil) {
-            return fail(make_error(metal_errc::shader_function_not_found,
-                                   "the Metal shader library does not contain matmul_f32"));
-        }
-
-        NSError* pipeline_error = nil;
-        id<MTLComputePipelineState> matmul_f32_pipeline =
-            [device newComputePipelineStateWithFunction:matmul_f32 error:&pipeline_error];
-        if (matmul_f32_pipeline == nil) {
-            return fail(make_error(
-                metal_errc::pipeline_creation_failed,
-                message_from_error(pipeline_error, "failed to create the matmul_f32 pipeline")));
-        }
-
-        id<MTLFunction> linear_bf16 = [library newFunctionWithName:@"linear_bf16"];
-        if (linear_bf16 == nil) {
-            return fail(make_error(metal_errc::shader_function_not_found,
-                                   "the Metal shader library does not contain linear_bf16"));
-        }
-
-        pipeline_error = nil;
-        id<MTLComputePipelineState> linear_bf16_pipeline =
-            [device newComputePipelineStateWithFunction:linear_bf16 error:&pipeline_error];
-        if (linear_bf16_pipeline == nil) {
-            return fail(make_error(
-                metal_errc::pipeline_creation_failed,
-                message_from_error(pipeline_error, "failed to create the linear_bf16 pipeline")));
-        }
-
-        id<MTLFunction> linear_bf16_decode = [library newFunctionWithName:@"linear_bf16_decode"];
-        if (linear_bf16_decode == nil) {
-            return fail(make_error(metal_errc::shader_function_not_found,
-                                   "the Metal shader library does not contain linear_bf16_decode"));
-        }
-
-        pipeline_error = nil;
-        id<MTLComputePipelineState> linear_bf16_decode_pipeline =
-            [device newComputePipelineStateWithFunction:linear_bf16_decode error:&pipeline_error];
-        if (linear_bf16_decode_pipeline == nil) {
-            return fail(
-                make_error(metal_errc::pipeline_creation_failed,
-                           message_from_error(pipeline_error,
-                                              "failed to create the linear_bf16_decode pipeline")));
-        }
-
-        id<MTLFunction> linear_add_bf16_decode =
-            [library newFunctionWithName:@"linear_add_bf16_decode"];
-        if (linear_add_bf16_decode == nil) {
-            return fail(
-                make_error(metal_errc::shader_function_not_found,
-                           "the Metal shader library does not contain linear_add_bf16_decode"));
-        }
-
-        pipeline_error = nil;
-        id<MTLComputePipelineState> linear_add_bf16_decode_pipeline =
-            [device newComputePipelineStateWithFunction:linear_add_bf16_decode
-                                                  error:&pipeline_error];
-        if (linear_add_bf16_decode_pipeline == nil) {
-            return fail(make_error(
-                metal_errc::pipeline_creation_failed,
-                message_from_error(pipeline_error,
-                                   "failed to create the linear_add_bf16_decode pipeline")));
-        }
+        id<MTLComputePipelineState> linear_add_bf16_decode_pipeline = nil;
+        CL_TRY_ASSIGN(linear_add_bf16_decode_pipeline,
+                      make_compute_pipeline(device, library, @"linear_add_bf16_decode"));
 
         id<MTLComputePipelineState> linear_bf16_tensorops_pipeline = nil;
         if (compiled_metal4) {
             id<MTLFunction> linear_bf16_tensorops =
                 [library newFunctionWithName:@"linear_bf16_tensorops"];
             if (linear_bf16_tensorops != nil) {
-                pipeline_error = nil;
+                NSError* pipeline_error = nil;
                 MTLComputePipelineDescriptor* descriptor =
                     [[MTLComputePipelineDescriptor alloc] init];
                 descriptor.computeFunction = linear_bf16_tensorops;
@@ -472,247 +430,58 @@ metal_context::make(std::string_view shader_source)
             }
         }
 
-        id<MTLFunction> linear_split_bf16 = [library newFunctionWithName:@"linear_split_bf16"];
-        if (linear_split_bf16 == nil) {
-            return fail(make_error(metal_errc::shader_function_not_found,
-                                   "the Metal shader library does not contain linear_split_bf16"));
-        }
+        id<MTLComputePipelineState> linear_split_bf16_pipeline = nil;
+        CL_TRY_ASSIGN(linear_split_bf16_pipeline,
+                      make_compute_pipeline(device, library, @"linear_split_bf16"));
+        id<MTLComputePipelineState> linear_split_bf16_decode_pipeline = nil;
+        CL_TRY_ASSIGN(linear_split_bf16_decode_pipeline,
+                      make_compute_pipeline(device, library, @"linear_split_bf16_decode"));
+        id<MTLComputePipelineState> embedding_bf16_pipeline = nil;
+        CL_TRY_ASSIGN(embedding_bf16_pipeline,
+                      make_compute_pipeline(device, library, @"embedding_bf16"));
+        id<MTLComputePipelineState> rms_norm_bf16_pipeline = nil;
+        CL_TRY_ASSIGN(rms_norm_bf16_pipeline,
+                      make_compute_pipeline(device, library, @"rms_norm_bf16"));
 
-        pipeline_error = nil;
-        id<MTLComputePipelineState> linear_split_bf16_pipeline =
-            [device newComputePipelineStateWithFunction:linear_split_bf16 error:&pipeline_error];
-        if (linear_split_bf16_pipeline == nil) {
-            return fail(
-                make_error(metal_errc::pipeline_creation_failed,
-                           message_from_error(pipeline_error,
-                                              "failed to create the linear_split_bf16 pipeline")));
-        }
+        id<MTLComputePipelineState> gather_rows_f32_pipeline = nil;
+        CL_TRY_ASSIGN(gather_rows_f32_pipeline,
+                      make_compute_pipeline(device, library, @"gather_rows_f32"));
+        id<MTLComputePipelineState> linear_bf16_partial_argmax_pipeline = nil;
+        CL_TRY_ASSIGN(linear_bf16_partial_argmax_pipeline,
+                      make_compute_pipeline(device, library, @"linear_bf16_partial_argmax"));
+        id<MTLComputePipelineState> reduce_argmax_pipeline = nil;
+        CL_TRY_ASSIGN(reduce_argmax_pipeline,
+                      make_compute_pipeline(device, library, @"reduce_argmax"));
 
-        id<MTLFunction> linear_split_bf16_decode =
-            [library newFunctionWithName:@"linear_split_bf16_decode"];
-        if (linear_split_bf16_decode == nil) {
-            return fail(
-                make_error(metal_errc::shader_function_not_found,
-                           "the Metal shader library does not contain linear_split_bf16_decode"));
-        }
+        id<MTLComputePipelineState> silu_mul_f32_pipeline = nil;
+        CL_TRY_ASSIGN(silu_mul_f32_pipeline,
+                      make_compute_pipeline(device, library, @"silu_mul_f32"));
+        id<MTLComputePipelineState> add_f32_pipeline = nil;
+        CL_TRY_ASSIGN(add_f32_pipeline, make_compute_pipeline(device, library, @"add_f32"));
+        id<MTLComputePipelineState> rope_f32_pipeline = nil;
+        CL_TRY_ASSIGN(rope_f32_pipeline, make_compute_pipeline(device, library, @"rope_f32"));
+        id<MTLComputePipelineState> store_kv_f32_pipeline = nil;
+        CL_TRY_ASSIGN(store_kv_f32_pipeline,
+                      make_compute_pipeline(device, library, @"store_kv_f32"));
 
-        pipeline_error = nil;
-        id<MTLComputePipelineState> linear_split_bf16_decode_pipeline =
-            [device newComputePipelineStateWithFunction:linear_split_bf16_decode
-                                                  error:&pipeline_error];
-        if (linear_split_bf16_decode_pipeline == nil) {
-            return fail(make_error(
-                metal_errc::pipeline_creation_failed,
-                message_from_error(pipeline_error,
-                                   "failed to create the linear_split_bf16_decode pipeline")));
-        }
-
-        id<MTLFunction> embedding_bf16 = [library newFunctionWithName:@"embedding_bf16"];
-        if (embedding_bf16 == nil) {
-            return fail(make_error(metal_errc::shader_function_not_found,
-                                   "the Metal shader library does not contain embedding_bf16"));
-        }
-
-        pipeline_error = nil;
-        id<MTLComputePipelineState> embedding_bf16_pipeline =
-            [device newComputePipelineStateWithFunction:embedding_bf16 error:&pipeline_error];
-        if (embedding_bf16_pipeline == nil) {
-            return fail(
-                make_error(metal_errc::pipeline_creation_failed,
-                           message_from_error(pipeline_error,
-                                              "failed to create the embedding_bf16 pipeline")));
-        }
-
-        id<MTLFunction> rms_norm_bf16 = [library newFunctionWithName:@"rms_norm_bf16"];
-        if (rms_norm_bf16 == nil) {
-            return fail(make_error(metal_errc::shader_function_not_found,
-                                   "the Metal shader library does not contain rms_norm_bf16"));
-        }
-
-        pipeline_error = nil;
-        id<MTLComputePipelineState> rms_norm_bf16_pipeline =
-            [device newComputePipelineStateWithFunction:rms_norm_bf16 error:&pipeline_error];
-        if (rms_norm_bf16_pipeline == nil) {
-            return fail(make_error(
-                metal_errc::pipeline_creation_failed,
-                message_from_error(pipeline_error, "failed to create the rms_norm_bf16 pipeline")));
-        }
-
-        id<MTLFunction> gather_rows_f32 = [library newFunctionWithName:@"gather_rows_f32"];
-        id<MTLFunction> linear_bf16_partial_argmax =
-            [library newFunctionWithName:@"linear_bf16_partial_argmax"];
-        id<MTLFunction> reduce_argmax = [library newFunctionWithName:@"reduce_argmax"];
-        if (gather_rows_f32 == nil || linear_bf16_partial_argmax == nil || reduce_argmax == nil) {
-            return fail(make_error(metal_errc::shader_function_not_found,
-                                   "the Metal shader library is missing GPU sampling kernels"));
-        }
-        pipeline_error = nil;
-        id<MTLComputePipelineState> gather_rows_f32_pipeline =
-            [device newComputePipelineStateWithFunction:gather_rows_f32 error:&pipeline_error];
-        if (gather_rows_f32_pipeline == nil) {
-            return fail(make_error(
-                metal_errc::pipeline_creation_failed,
-                message_from_error(pipeline_error, "failed to create the row gather pipeline")));
-        }
-        pipeline_error = nil;
-        id<MTLComputePipelineState> linear_bf16_partial_argmax_pipeline =
-            [device newComputePipelineStateWithFunction:linear_bf16_partial_argmax
-                                                  error:&pipeline_error];
-        if (linear_bf16_partial_argmax_pipeline == nil) {
-            return fail(
-                make_error(metal_errc::pipeline_creation_failed,
-                           message_from_error(pipeline_error,
-                                              "failed to create the partial argmax pipeline")));
-        }
-        pipeline_error = nil;
-        id<MTLComputePipelineState> reduce_argmax_pipeline =
-            [device newComputePipelineStateWithFunction:reduce_argmax error:&pipeline_error];
-        if (reduce_argmax_pipeline == nil) {
-            return fail(make_error(
-                metal_errc::pipeline_creation_failed,
-                message_from_error(pipeline_error, "failed to create the argmax pipeline")));
-        }
-
-        id<MTLFunction> silu_mul_f32 = [library newFunctionWithName:@"silu_mul_f32"];
-        if (silu_mul_f32 == nil) {
-            return fail(make_error(metal_errc::shader_function_not_found,
-                                   "the Metal shader library does not contain silu_mul_f32"));
-        }
-
-        pipeline_error = nil;
-        id<MTLComputePipelineState> silu_mul_f32_pipeline =
-            [device newComputePipelineStateWithFunction:silu_mul_f32 error:&pipeline_error];
-        if (silu_mul_f32_pipeline == nil) {
-            return fail(make_error(
-                metal_errc::pipeline_creation_failed,
-                message_from_error(pipeline_error, "failed to create the silu_mul_f32 pipeline")));
-        }
-
-        id<MTLFunction> add_f32 = [library newFunctionWithName:@"add_f32"];
-        if (add_f32 == nil) {
-            return fail(make_error(metal_errc::shader_function_not_found,
-                                   "the Metal shader library does not contain add_f32"));
-        }
-
-        pipeline_error = nil;
-        id<MTLComputePipelineState> add_f32_pipeline =
-            [device newComputePipelineStateWithFunction:add_f32 error:&pipeline_error];
-        if (add_f32_pipeline == nil) {
-            return fail(make_error(
-                metal_errc::pipeline_creation_failed,
-                message_from_error(pipeline_error, "failed to create the add_f32 pipeline")));
-        }
-
-        id<MTLFunction> rope_f32 = [library newFunctionWithName:@"rope_f32"];
-        if (rope_f32 == nil) {
-            return fail(make_error(metal_errc::shader_function_not_found,
-                                   "the Metal shader library does not contain rope_f32"));
-        }
-
-        pipeline_error = nil;
-        id<MTLComputePipelineState> rope_f32_pipeline =
-            [device newComputePipelineStateWithFunction:rope_f32 error:&pipeline_error];
-        if (rope_f32_pipeline == nil) {
-            return fail(make_error(
-                metal_errc::pipeline_creation_failed,
-                message_from_error(pipeline_error, "failed to create the rope_f32 pipeline")));
-        }
-
-        id<MTLFunction> store_kv_f32 = [library newFunctionWithName:@"store_kv_f32"];
-        if (store_kv_f32 == nil) {
-            return fail(make_error(metal_errc::shader_function_not_found,
-                                   "the Metal shader library does not contain store_kv_f32"));
-        }
-
-        pipeline_error = nil;
-        id<MTLComputePipelineState> store_kv_f32_pipeline =
-            [device newComputePipelineStateWithFunction:store_kv_f32 error:&pipeline_error];
-        if (store_kv_f32_pipeline == nil) {
-            return fail(make_error(
-                metal_errc::pipeline_creation_failed,
-                message_from_error(pipeline_error, "failed to create the store_kv_f32 pipeline")));
-        }
-
-        id<MTLFunction> paged_attention_f32 = [library newFunctionWithName:@"paged_attention_f32"];
-        if (paged_attention_f32 == nil) {
-            return fail(
-                make_error(metal_errc::shader_function_not_found,
-                           "the Metal shader library does not contain paged_attention_f32"));
-        }
-
-        pipeline_error = nil;
-        id<MTLComputePipelineState> paged_attention_f32_pipeline =
-            [device newComputePipelineStateWithFunction:paged_attention_f32 error:&pipeline_error];
-        if (paged_attention_f32_pipeline == nil) {
-            return fail(make_error(
-                metal_errc::pipeline_creation_failed,
-                message_from_error(pipeline_error,
-                                   "failed to create the paged_attention_f32 pipeline")));
-        }
-
-        id<MTLFunction> paged_flash_attention_prefill_f32 =
-            [library newFunctionWithName:@"paged_flash_attention_prefill_f32"];
-        if (paged_flash_attention_prefill_f32 == nil) {
-            return fail(make_error(
-                metal_errc::shader_function_not_found,
-                "the Metal shader library does not contain paged_flash_attention_prefill_f32"));
-        }
-
-        pipeline_error = nil;
-        id<MTLComputePipelineState> paged_flash_attention_prefill_f32_pipeline =
-            [device newComputePipelineStateWithFunction:paged_flash_attention_prefill_f32
-                                                  error:&pipeline_error];
-        if (paged_flash_attention_prefill_f32_pipeline == nil) {
-            return fail(make_error(
-                metal_errc::pipeline_creation_failed,
-                message_from_error(pipeline_error,
-                                   "failed to create paged_flash_attention_prefill_f32 pipeline")));
-        }
-
-        id<MTLFunction> paged_attention_partial_f32 =
-            [library newFunctionWithName:@"paged_attention_partial_f32"];
-        if (paged_attention_partial_f32 == nil) {
-            return fail(make_error(
-                metal_errc::shader_function_not_found,
-                "the Metal shader library does not contain paged_attention_partial_f32"));
-        }
-        pipeline_error = nil;
-        id<MTLComputePipelineState> paged_attention_partial_f32_pipeline =
-            [device newComputePipelineStateWithFunction:paged_attention_partial_f32
-                                                  error:&pipeline_error];
-        if (paged_attention_partial_f32_pipeline == nil) {
-            return fail(make_error(
-                metal_errc::pipeline_creation_failed,
-                message_from_error(pipeline_error,
-                                   "failed to create paged_attention_partial_f32 pipeline")));
-        }
-
-        id<MTLFunction> paged_attention_reduce_f32 =
-            [library newFunctionWithName:@"paged_attention_reduce_f32"];
-        if (paged_attention_reduce_f32 == nil) {
-            return fail(
-                make_error(metal_errc::shader_function_not_found,
-                           "the Metal shader library does not contain paged_attention_reduce_f32"));
-        }
-        pipeline_error = nil;
-        id<MTLComputePipelineState> paged_attention_reduce_f32_pipeline =
-            [device newComputePipelineStateWithFunction:paged_attention_reduce_f32
-                                                  error:&pipeline_error];
-        if (paged_attention_reduce_f32_pipeline == nil) {
-            return fail(make_error(
-                metal_errc::pipeline_creation_failed,
-                message_from_error(pipeline_error,
-                                   "failed to create paged_attention_reduce_f32 pipeline")));
-        }
+        id<MTLComputePipelineState> paged_attention_f32_pipeline = nil;
+        CL_TRY_ASSIGN(paged_attention_f32_pipeline,
+                      make_compute_pipeline(device, library, @"paged_attention_f32"));
+        id<MTLComputePipelineState> paged_flash_attention_prefill_f32_pipeline = nil;
+        CL_TRY_ASSIGN(paged_flash_attention_prefill_f32_pipeline,
+                      make_compute_pipeline(device, library, @"paged_flash_attention_prefill_f32"));
+        id<MTLComputePipelineState> paged_attention_partial_f32_pipeline = nil;
+        CL_TRY_ASSIGN(paged_attention_partial_f32_pipeline,
+                      make_compute_pipeline(device, library, @"paged_attention_partial_f32"));
+        id<MTLComputePipelineState> paged_attention_reduce_f32_pipeline = nil;
+        CL_TRY_ASSIGN(paged_attention_reduce_f32_pipeline,
+                      make_compute_pipeline(device, library, @"paged_attention_reduce_f32"));
 
         const char* device_name = device.name.UTF8String;
         auto implementation = std::make_unique<metal_context::implementation>();
         implementation->device = device;
         implementation->command_queue = command_queue;
         implementation->shader_library = library;
-        implementation->matmul_f32_pipeline = matmul_f32_pipeline;
-        implementation->linear_bf16_pipeline = linear_bf16_pipeline;
-        implementation->linear_bf16_decode_pipeline = linear_bf16_decode_pipeline;
         implementation->linear_add_bf16_decode_pipeline = linear_add_bf16_decode_pipeline;
         implementation->linear_bf16_tensorops_pipeline = linear_bf16_tensorops_pipeline;
         implementation->linear_split_bf16_pipeline = linear_split_bf16_pipeline;
@@ -876,142 +645,6 @@ metal_context::make_shared_buffer(std::size_t size_bytes) const
             buffer_implementation->arena = implementation_->arena;
         }
         return metal_buffer { std::move(buffer_implementation) };
-    }
-}
-
-result<void, metal_error>
-metal_context::dispatch_matmul(const metal_buffer& lhs,
-                               const metal_buffer& rhs,
-                               metal_buffer& output,
-                               std::size_t rows,
-                               std::size_t inner_dimension,
-                               std::size_t columns) const
-{
-    @autoreleasepool {
-        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
-        if (rows > max_shader_dimension
-            || inner_dimension > max_shader_dimension
-            || columns > max_shader_dimension) {
-            return fail(make_error(metal_errc::invalid_input,
-                                   "matmul dimensions exceed the shader uint range"));
-        }
-
-        const auto shader_rows = static_cast<std::uint32_t>(rows);
-        const auto shader_inner_dimension = static_cast<std::uint32_t>(inner_dimension);
-        const auto shader_columns = static_cast<std::uint32_t>(columns);
-
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened) {
-            return fail(opened.error());
-        }
-        id<MTLComputeCommandEncoder> encoder = opened->encoder;
-
-        [encoder setComputePipelineState:implementation_->matmul_f32_pipeline];
-        [encoder setBuffer:lhs.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:rhs.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:3];
-        [encoder setBytes:&shader_inner_dimension length:sizeof(shader_inner_dimension) atIndex:4];
-        [encoder setBytes:&shader_columns length:sizeof(shader_columns) atIndex:5];
-
-        [encoder dispatchThreads:MTLSizeMake(columns, rows, 1)
-            threadsPerThreadgroup:adaptive_2d_threadgroup_size(implementation_->matmul_f32_pipeline,
-                                                               columns, rows)];
-        return implementation_->complete_dispatch_encoder(*opened, "matmul");
-    }
-}
-
-result<void, metal_error>
-metal_context::dispatch_linear_bf16(const metal_buffer& input,
-                                    const metal_buffer& weight,
-                                    metal_buffer& output,
-                                    std::size_t rows,
-                                    std::size_t input_features,
-                                    std::size_t output_features) const
-{
-    @autoreleasepool {
-        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
-        if (rows > max_shader_dimension
-            || input_features > max_shader_dimension
-            || output_features > max_shader_dimension) {
-            return fail(make_error(metal_errc::invalid_input,
-                                   "linear dimensions exceed the shader uint range"));
-        }
-
-        const auto shader_rows = static_cast<std::uint32_t>(rows);
-        const auto shader_input_features = static_cast<std::uint32_t>(input_features);
-        const auto shader_output_features = static_cast<std::uint32_t>(output_features);
-
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened) {
-            return fail(opened.error());
-        }
-        id<MTLComputeCommandEncoder> encoder = opened->encoder;
-
-        const bool use_tensorops = implementation_->tensorops_enabled && rows > 1;
-        const auto pipeline = use_tensorops ? implementation_->linear_bf16_tensorops_pipeline
-            : rows == 1                     ? implementation_->linear_bf16_decode_pipeline
-                                            : implementation_->linear_bf16_pipeline;
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:weight.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:2];
-        if (use_tensorops) {
-            [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:3];
-            [encoder setBytes:&shader_input_features
-                       length:sizeof(shader_input_features)
-                      atIndex:4];
-            [encoder setBytes:&shader_output_features
-                       length:sizeof(shader_output_features)
-                      atIndex:5];
-            const auto simd_width = static_cast<std::size_t>(pipeline.threadExecutionWidth);
-            [encoder
-                 dispatchThreadgroups:MTLSizeMake((output_features + 63) / 64, (rows + 63) / 64, 1)
-                threadsPerThreadgroup:MTLSizeMake(4 * simd_width, 1, 1)];
-        } else if (rows == 1) {
-            const auto simd_width = static_cast<std::size_t>(pipeline.threadExecutionWidth);
-            constexpr std::size_t preferred_thread_count = 64;
-            auto thread_count =
-                std::min(preferred_thread_count,
-                         static_cast<std::size_t>(pipeline.maxTotalThreadsPerThreadgroup));
-            thread_count -= thread_count % simd_width;
-            const auto outputs_per_threadgroup = thread_count / simd_width;
-            const auto threadgroup_count = (output_features - 1) / outputs_per_threadgroup + 1;
-            const auto shader_outputs_per_threadgroup =
-                static_cast<std::uint32_t>(outputs_per_threadgroup);
-            const auto shader_simd_width = static_cast<std::uint32_t>(simd_width);
-
-            [encoder setBytes:&shader_input_features
-                       length:sizeof(shader_input_features)
-                      atIndex:3];
-            [encoder setBytes:&shader_output_features
-                       length:sizeof(shader_output_features)
-                      atIndex:4];
-            [encoder setBytes:&shader_outputs_per_threadgroup
-                       length:sizeof(shader_outputs_per_threadgroup)
-                      atIndex:5];
-            [encoder setBytes:&shader_simd_width length:sizeof(shader_simd_width) atIndex:6];
-            [encoder dispatchThreadgroups:MTLSizeMake(threadgroup_count, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
-        } else {
-            [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:3];
-            [encoder setBytes:&shader_input_features
-                       length:sizeof(shader_input_features)
-                      atIndex:4];
-            [encoder setBytes:&shader_output_features
-                       length:sizeof(shader_output_features)
-                      atIndex:5];
-            [encoder dispatchThreads:MTLSizeMake(output_features, rows, 1)
-                threadsPerThreadgroup:adaptive_2d_threadgroup_size(
-                                          implementation_->linear_bf16_pipeline, output_features,
-                                          rows)];
-        }
-        const auto profile_name = use_tensorops ? "linear_tensorops"
-            : rows != 1                         ? "linear_prefill"
-            : output_features > 10'000          ? "linear_decode_vocab"
-            : input_features > output_features  ? "linear_decode_contract"
-                                                : "linear_decode_square";
-        return implementation_->complete_dispatch_encoder(*opened, profile_name);
     }
 }
 
@@ -1260,7 +893,7 @@ metal_context::dispatch_rms_norm_bf16(const metal_buffer& input,
 
         [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
-        const auto profile_name = hidden_size <= 256 ? "rms_norm_heads" : "rms_norm_hidden";
+        const auto profile_name = hidden_size <= 256 ? "rms_norm_grouped" : "rms_norm_hidden";
         return implementation_->complete_dispatch_encoder(*opened, profile_name);
     }
 }

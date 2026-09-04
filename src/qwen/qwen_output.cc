@@ -93,18 +93,4 @@ read_qwen_greedy(const metal_tensor& token_ids)
     return tokens;
 }
 
-result<std::vector<token_id>, qwen_output_errc>
-sample_qwen_greedy(const metal_context& context,
-                   const qwen3_config& config,
-                   const qwen_weights& weights,
-                   const metal_tensor& hidden_states,
-                   std::span<const std::size_t> logits_indices)
-{
-    auto encoded = encode_qwen_greedy(context, config, weights, hidden_states, logits_indices);
-    if (!encoded) {
-        return fail(encoded.error());
-    }
-    return read_qwen_greedy(*encoded);
-}
-
 } // namespace chibillm

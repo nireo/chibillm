@@ -78,64 +78,6 @@ linear_bf16_tensorops(device float* input [[buffer(0)]],
 }
 #endif
 
-kernel void
-matmul_f32(device const float* lhs [[buffer(0)]],
-           device const float* rhs [[buffer(1)]],
-           device float* output [[buffer(2)]],
-           constant uint& rows [[buffer(3)]],
-           constant uint& inner_dimension [[buffer(4)]],
-           constant uint& columns [[buffer(5)]],
-           uint2 position [[thread_position_in_grid]])
-{
-    if (position.x >= columns || position.y >= rows) {
-        return;
-    }
-
-    const ulong row = position.y;
-    const ulong column = position.x;
-    const ulong k_count = inner_dimension;
-    const ulong column_count = columns;
-
-    float accumulator = 0.0F;
-    for (ulong k = 0; k < k_count; ++k) {
-        const ulong lhs_index = row * k_count + k;
-        const ulong rhs_index = k * column_count + column;
-        accumulator += lhs[lhs_index] * rhs[rhs_index];
-    }
-
-    output[row * column_count + column] = accumulator;
-}
-
-kernel void
-linear_bf16(device const float* input [[buffer(0)]],
-            device const bf16_storage* weight [[buffer(1)]],
-            device float* output [[buffer(2)]],
-            constant uint& rows [[buffer(3)]],
-            constant uint& input_features [[buffer(4)]],
-            constant uint& output_features [[buffer(5)]],
-            uint2 position [[thread_position_in_grid]])
-{
-    if (position.x >= output_features || position.y >= rows) {
-        return;
-    }
-
-    const ulong row = position.y;
-    const ulong output_feature = position.x;
-    const ulong k_count = input_features;
-
-    float accumulator = 0.0F;
-    for (ulong k = 0; k < k_count; ++k) {
-        const ulong input_index = row * k_count + k;
-        const ulong weight_index = output_feature * k_count + k;
-
-        const float value = load_bf16(weight[weight_index]);
-
-        accumulator += input[input_index] * value;
-    }
-
-    output[row * ulong(output_features) + output_feature] = accumulator;
-}
-
 static inline float
 linear_bf16_decode_dot(device const float* input,
                        device const bf16_storage* weight,
@@ -161,30 +103,6 @@ linear_bf16_decode_dot(device const float* input,
         accumulator += input[k] * value;
     }
     return simd_sum(accumulator);
-}
-
-kernel void
-linear_bf16_decode(device const float* input [[buffer(0)]],
-                   device const bf16_storage* weight [[buffer(1)]],
-                   device float* output [[buffer(2)]],
-                   constant uint& input_features [[buffer(3)]],
-                   constant uint& output_features [[buffer(4)]],
-                   constant uint& outputs_per_threadgroup [[buffer(5)]],
-                   constant uint& simd_width [[buffer(6)]],
-                   uint lane [[thread_index_in_simdgroup]],
-                   uint simdgroup [[simdgroup_index_in_threadgroup]],
-                   uint3 threadgroup_position [[threadgroup_position_in_grid]])
-{
-    const uint output_feature = threadgroup_position.x * outputs_per_threadgroup + simdgroup;
-    if (output_feature >= output_features) {
-        return;
-    }
-
-    const float accumulator =
-        linear_bf16_decode_dot(input, weight, input_features, output_feature, lane, simd_width);
-    if (lane == 0) {
-        output[output_feature] = accumulator;
-    }
 }
 
 kernel void

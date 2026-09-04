@@ -36,13 +36,4 @@ encode_qwen_greedy(const metal_context& context,
 // Reads token IDs after the command buffer containing encode_qwen_greedy has completed.
 [[nodiscard]] std::vector<token_id> read_qwen_greedy(const metal_tensor& token_ids);
 
-// Standalone convenience wrapper. When no compute pass is open, encoding waits
-// for its one command buffer and this returns its token IDs immediately.
-[[nodiscard]] result<std::vector<token_id>, qwen_output_errc>
-sample_qwen_greedy(const metal_context& context,
-                   const qwen3_config& config,
-                   const qwen_weights& weights,
-                   const metal_tensor& hidden_states,
-                   std::span<const std::size_t> logits_indices);
-
 } // namespace chibillm

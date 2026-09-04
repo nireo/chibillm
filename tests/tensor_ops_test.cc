@@ -11,17 +11,15 @@
 #include <utility>
 #include <vector>
 
-#include "metal_test_support.h"
 #include "metal/metal_kv_cache.h"
+#include "metal_test_support.h"
 #include "tensor/tensor_ops.h"
 
 using chibillm::add;
 using chibillm::bf16;
 using chibillm::dtype;
 using chibillm::embedding_lookup;
-using chibillm::linear;
 using chibillm::linear_add;
-using chibillm::matmul;
 using chibillm::metal_context;
 using chibillm::metal_kv_cache;
 using chibillm::metal_tensor;
@@ -52,59 +50,6 @@ make_kv_cache(const metal_context& context)
 
 } // namespace
 
-
-TEST_CASE("matmul computes a rectangular matrix product")
-{
-    const auto& context = test_context();
-
-    auto lhs = make_tensor(context, dtype::f32, { 2, 3 });
-    auto rhs = make_tensor(context, dtype::f32, { 3, 4 });
-    auto output = make_tensor(context, dtype::f32, { 2, 4 });
-    write_floats(lhs, { 1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F });
-    write_floats(rhs,
-                 { 1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F, 9.0F, 10.0F, 11.0F, 12.0F });
-
-    auto multiplied = matmul(context, lhs, rhs, output);
-    REQUIRE(multiplied.has_value());
-
-    const auto values = read_floats(output);
-    REQUIRE(values.size() == 8);
-    CHECK(values[0] == doctest::Approx(38.0F));
-    CHECK(values[1] == doctest::Approx(44.0F));
-    CHECK(values[2] == doctest::Approx(50.0F));
-    CHECK(values[3] == doctest::Approx(56.0F));
-    CHECK(values[4] == doctest::Approx(83.0F));
-    CHECK(values[5] == doctest::Approx(98.0F));
-    CHECK(values[6] == doctest::Approx(113.0F));
-    CHECK(values[7] == doctest::Approx(128.0F));
-}
-
-TEST_CASE("linear projects f32 input with row-major bf16 weights")
-{
-    const auto* context = &test_context();
-
-    auto input = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto weight = make_tensor(*context, dtype::bf16, { 4, 3 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 4 });
-    write_floats(input, { 1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F });
-    write_bf16(weight,
-               { 1.0F, 5.0F, 9.0F, 2.0F, 6.0F, 10.0F, 3.0F, 7.0F, 11.0F, 4.0F, 8.0F, 12.0F });
-
-    auto projected = linear(*context, input, weight, output);
-    REQUIRE(projected.has_value());
-
-    const auto values = read_floats(output);
-    REQUIRE(values.size() == 8);
-    CHECK(values[0] == doctest::Approx(38.0F));
-    CHECK(values[1] == doctest::Approx(44.0F));
-    CHECK(values[2] == doctest::Approx(50.0F));
-    CHECK(values[3] == doctest::Approx(56.0F));
-    CHECK(values[4] == doctest::Approx(83.0F));
-    CHECK(values[5] == doctest::Approx(98.0F));
-    CHECK(values[6] == doctest::Approx(113.0F));
-    CHECK(values[7] == doctest::Approx(128.0F));
-}
-
 TEST_CASE("linear add fuses decode residuals and supports prefill rows")
 {
     const auto* context = &test_context();
@@ -130,8 +75,7 @@ TEST_CASE("linear add fuses decode residuals and supports prefill rows")
     auto prefill_residual = make_tensor(*context, dtype::f32, { 2, 4 });
     auto prefill_output = make_tensor(*context, dtype::f32, { 2, 4 });
     write_floats(prefill_input, { 1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F });
-    write_floats(prefill_residual,
-                 { 10.0F, 20.0F, 30.0F, 40.0F, 100.0F, 200.0F, 300.0F, 400.0F });
+    write_floats(prefill_residual, { 10.0F, 20.0F, 30.0F, 40.0F, 100.0F, 200.0F, 300.0F, 400.0F });
     REQUIRE(
         linear_add(*context, prefill_input, weight, prefill_residual, prefill_output).has_value());
     const auto prefill_values = read_floats(prefill_output);
@@ -144,44 +88,6 @@ TEST_CASE("linear add fuses decode residuals and supports prefill rows")
     CHECK(prefill_values[5] == doctest::Approx(298.0F));
     CHECK(prefill_values[6] == doctest::Approx(413.0F));
     CHECK(prefill_values[7] == doctest::Approx(528.0F));
-}
-
-TEST_CASE("linear validates tensor ranks, dtypes, and shapes")
-{
-    const auto& context = test_context();
-
-    auto valid_in = make_tensor(context, dtype::f32, { 2, 3 });
-    auto valid_w = make_tensor(context, dtype::bf16, { 4, 3 });
-    auto valid_out = make_tensor(context, dtype::f32, { 2, 4 });
-
-    auto bad_rank = make_tensor(context, dtype::f32, { 6 });
-    CHECK(linear(context, bad_rank, valid_w, valid_out).error() == tensor_op_errc::invalid_rank);
-
-    auto bad_dtype = make_tensor(context, dtype::f32, { 4, 3 });
-    CHECK(linear(context, valid_in, bad_dtype, valid_out).error() == tensor_op_errc::unsupported_dtype);
-
-    auto bad_dim = make_tensor(context, dtype::bf16, { 4, 2 });
-    CHECK(linear(context, valid_in, bad_dim, valid_out).error() == tensor_op_errc::inner_dimension_mismatch);
-
-    auto bad_out = make_tensor(context, dtype::f32, { 2, 3 });
-    CHECK(linear(context, valid_in, valid_w, bad_out).error() == tensor_op_errc::output_shape_mismatch);
-}
-
-TEST_CASE("linear decode handles signed fractional weights with a vectorized body and scalar tail")
-{
-    const auto* context = &test_context();
-
-    auto input = make_tensor(*context, dtype::f32, { 1, 5 });
-    auto weight = make_tensor(*context, dtype::bf16, { 2, 5 });
-    auto output = make_tensor(*context, dtype::f32, { 1, 2 });
-    write_floats(input, { 1.0F, 2.0F, 3.0F, 4.0F, 5.0F });
-    write_bf16(weight, { 0.5F, -1.25F, 1.0F, 1.0F, 1.0F, -1.0F, 2.0F, -3.0F, 4.0F, -5.0F });
-
-    REQUIRE(linear(*context, input, weight, output).has_value());
-    const auto values = read_floats(output);
-    REQUIRE(values.size() == 2);
-    CHECK(values[0] == doctest::Approx(10.0F));
-    CHECK(values[1] == doctest::Approx(-15.0F));
 }
 
 TEST_CASE("linear split projects multiple rows into separate outputs")
@@ -241,25 +147,31 @@ TEST_CASE("embedding lookup validates inputs and bounds")
     auto valid_out = make_tensor(context, dtype::f32, { 2, 4 });
 
     auto bad_id_rank = make_tensor(context, dtype::i32, { 1, 2 });
-    CHECK(embedding_lookup(context, bad_id_rank, valid_w, valid_out).error() == tensor_op_errc::invalid_rank);
+    CHECK(embedding_lookup(context, bad_id_rank, valid_w, valid_out).error()
+          == tensor_op_errc::invalid_rank);
 
     auto bad_id_dtype = make_tensor(context, dtype::f32, { 2 });
-    CHECK(embedding_lookup(context, bad_id_dtype, valid_w, valid_out).error() == tensor_op_errc::unsupported_dtype);
+    CHECK(embedding_lookup(context, bad_id_dtype, valid_w, valid_out).error()
+          == tensor_op_errc::unsupported_dtype);
 
     auto bad_w_dtype = make_tensor(context, dtype::f32, { 3, 4 });
-    CHECK(embedding_lookup(context, valid_ids, bad_w_dtype, valid_out).error() == tensor_op_errc::unsupported_dtype);
+    CHECK(embedding_lookup(context, valid_ids, bad_w_dtype, valid_out).error()
+          == tensor_op_errc::unsupported_dtype);
 
     auto bad_out_shape = make_tensor(context, dtype::f32, { 1, 4 });
-    CHECK(embedding_lookup(context, valid_ids, valid_w, bad_out_shape).error() == tensor_op_errc::output_shape_mismatch);
+    CHECK(embedding_lookup(context, valid_ids, valid_w, bad_out_shape).error()
+          == tensor_op_errc::output_shape_mismatch);
 
     write_i32(valid_ids, { 0, -1 });
-    CHECK(embedding_lookup(context, valid_ids, valid_w, valid_out).error() == tensor_op_errc::token_out_of_range);
+    CHECK(embedding_lookup(context, valid_ids, valid_w, valid_out).error()
+          == tensor_op_errc::token_out_of_range);
 
     write_i32(valid_ids, { 0, 3 });
-    CHECK(embedding_lookup(context, valid_ids, valid_w, valid_out).error() == tensor_op_errc::token_out_of_range);
+    CHECK(embedding_lookup(context, valid_ids, valid_w, valid_out).error()
+          == tensor_op_errc::token_out_of_range);
 }
 
-TEST_CASE("rms norm normalizes and scales each row independently")
+TEST_CASE("rms norm normalizes full rows and repeated groups")
 {
     const auto* context = &test_context();
 
@@ -278,6 +190,16 @@ TEST_CASE("rms norm normalizes and scales each row independently")
     for (std::size_t index = 0; index < values.size(); ++index) {
         CHECK(values[index] == doctest::Approx(expected[index]));
     }
+
+    auto grouped_input = make_tensor(*context, dtype::f32, { 1, 4 });
+    auto grouped_weight = make_tensor(*context, dtype::bf16, { 2 });
+    auto grouped_output = make_tensor(*context, dtype::f32, { 1, 4 });
+    write_floats(grouped_input, { 1.0F, 1.0F, 2.0F, 2.0F });
+    write_bf16(grouped_weight, { 1.0F, 1.0F });
+    REQUIRE(rms_norm(*context, grouped_input, grouped_weight, 1.0F, grouped_output).has_value());
+    check_floats(grouped_output,
+                 { 1.0F / std::sqrt(2.0F), 1.0F / std::sqrt(2.0F), 2.0F / std::sqrt(5.0F),
+                   2.0F / std::sqrt(5.0F) });
 }
 
 TEST_CASE("rms norm validates inputs, shapes, and epsilon")
@@ -289,19 +211,25 @@ TEST_CASE("rms norm validates inputs, shapes, and epsilon")
     auto valid_out = make_tensor(context, dtype::f32, { 2, 3 });
 
     auto bad_rank = make_tensor(context, dtype::f32, { 6 });
-    CHECK(rms_norm(context, bad_rank, valid_w, 1.0F, valid_out).error() == tensor_op_errc::invalid_rank);
+    CHECK(rms_norm(context, bad_rank, valid_w, 1.0F, valid_out).error()
+          == tensor_op_errc::invalid_rank);
 
     auto bad_dtype = make_tensor(context, dtype::bf16, { 2, 3 });
-    CHECK(rms_norm(context, bad_dtype, valid_w, 1.0F, valid_out).error() == tensor_op_errc::unsupported_dtype);
+    CHECK(rms_norm(context, bad_dtype, valid_w, 1.0F, valid_out).error()
+          == tensor_op_errc::unsupported_dtype);
 
     auto bad_w_dim = make_tensor(context, dtype::bf16, { 4 });
-    CHECK(rms_norm(context, valid_in, bad_w_dim, 1.0F, valid_out).error() == tensor_op_errc::inner_dimension_mismatch);
+    CHECK(rms_norm(context, valid_in, bad_w_dim, 1.0F, valid_out).error()
+          == tensor_op_errc::inner_dimension_mismatch);
 
     auto bad_out_shape = make_tensor(context, dtype::f32, { 1, 3 });
-    CHECK(rms_norm(context, valid_in, valid_w, 1.0F, bad_out_shape).error() == tensor_op_errc::output_shape_mismatch);
+    CHECK(rms_norm(context, valid_in, valid_w, 1.0F, bad_out_shape).error()
+          == tensor_op_errc::output_shape_mismatch);
 
-    for (const auto epsilon : { 0.0F, -1.0F, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN() }) {
-        CHECK(rms_norm(context, valid_in, valid_w, epsilon, valid_out).error() == tensor_op_errc::invalid_epsilon);
+    for (const auto epsilon : { 0.0F, -1.0F, std::numeric_limits<float>::infinity(),
+                                std::numeric_limits<float>::quiet_NaN() }) {
+        CHECK(rms_norm(context, valid_in, valid_w, epsilon, valid_out).error()
+              == tensor_op_errc::invalid_epsilon);
     }
 }
 
@@ -359,7 +287,8 @@ TEST_CASE("binary elementwise ops validate shapes and dtypes")
         CHECK(op(context, bad_rank, valid, valid).error() == tensor_op_errc::invalid_rank);
         CHECK(op(context, bad_dtype, valid, valid).error() == tensor_op_errc::unsupported_dtype);
         CHECK(op(context, valid, bad_shape, valid).error() == tensor_op_errc::input_shape_mismatch);
-        CHECK(op(context, valid, valid, bad_shape).error() == tensor_op_errc::output_shape_mismatch);
+        CHECK(op(context, valid, valid, bad_shape).error()
+              == tensor_op_errc::output_shape_mismatch);
     };
     test_validation(silu_mul);
     test_validation(add);
@@ -420,17 +349,23 @@ TEST_CASE("rope validates inputs, shapes, and theta")
         auto positions = make_tensor(context, dtype::u32, { 2 });
         auto output = make_tensor(context, dtype::f32, { 2, 4 });
 
-        CHECK(rope(context, make_tensor(context, dtype::f32, { 8 }), positions, 1, 10'000.0F, output).error()
-              == tensor_op_errc::invalid_rank);
-        CHECK(rope(context, input, make_tensor(context, dtype::u32, { 1, 2 }), 1, 10'000.0F, output).error()
+        CHECK(
+            rope(context, make_tensor(context, dtype::f32, { 8 }), positions, 1, 10'000.0F, output)
+                .error()
+            == tensor_op_errc::invalid_rank);
+        CHECK(rope(context, input, make_tensor(context, dtype::u32, { 1, 2 }), 1, 10'000.0F, output)
+                  .error()
               == tensor_op_errc::invalid_rank);
         auto bad_rank_out = make_tensor(context, dtype::f32, { 8 });
         CHECK(rope(context, input, positions, 1, 10'000.0F, bad_rank_out).error()
               == tensor_op_errc::invalid_rank);
 
-        CHECK(rope(context, make_tensor(context, dtype::bf16, { 2, 4 }), positions, 1, 10'000.0F, output).error()
+        CHECK(rope(context, make_tensor(context, dtype::bf16, { 2, 4 }), positions, 1, 10'000.0F,
+                   output)
+                  .error()
               == tensor_op_errc::unsupported_dtype);
-        CHECK(rope(context, input, make_tensor(context, dtype::i32, { 2 }), 1, 10'000.0F, output).error()
+        CHECK(rope(context, input, make_tensor(context, dtype::i32, { 2 }), 1, 10'000.0F, output)
+                  .error()
               == tensor_op_errc::unsupported_dtype);
         auto bad_dtype_out = make_tensor(context, dtype::bf16, { 2, 4 });
         CHECK(rope(context, input, positions, 1, 10'000.0F, bad_dtype_out).error()
@@ -443,7 +378,8 @@ TEST_CASE("rope validates inputs, shapes, and theta")
         auto positions = make_tensor(context, dtype::u32, { 2 });
         auto output = make_tensor(context, dtype::f32, { 2, 8 });
 
-        CHECK(rope(context, input, make_tensor(context, dtype::u32, { 1 }), 1, 10'000.0F, output).error()
+        CHECK(rope(context, input, make_tensor(context, dtype::u32, { 1 }), 1, 10'000.0F, output)
+                  .error()
               == tensor_op_errc::position_count_mismatch);
         CHECK(rope(context, input, positions, 0, 10'000.0F, output).error()
               == tensor_op_errc::invalid_head_count);
@@ -506,32 +442,42 @@ TEST_CASE("kv cache store validates inputs, shapes, and slots")
 
     SUBCASE("ranks and dtypes")
     {
-        CHECK(store_kv(context, make_tensor(context, dtype::f32, { 4 }), values, slots, 0, cache).error()
+        CHECK(store_kv(context, make_tensor(context, dtype::f32, { 4 }), values, slots, 0, cache)
+                  .error()
               == tensor_op_errc::invalid_rank);
-        CHECK(store_kv(context, keys, make_tensor(context, dtype::f32, { 4 }), slots, 0, cache).error()
+        CHECK(store_kv(context, keys, make_tensor(context, dtype::f32, { 4 }), slots, 0, cache)
+                  .error()
               == tensor_op_errc::invalid_rank);
-        CHECK(store_kv(context, keys, values, make_tensor(context, dtype::u32, { 1, 2 }), 0, cache).error()
+        CHECK(store_kv(context, keys, values, make_tensor(context, dtype::u32, { 1, 2 }), 0, cache)
+                  .error()
               == tensor_op_errc::invalid_rank);
 
-        CHECK(store_kv(context, make_tensor(context, dtype::bf16, { 2, 2 }), values, slots, 0, cache).error()
+        CHECK(
+            store_kv(context, make_tensor(context, dtype::bf16, { 2, 2 }), values, slots, 0, cache)
+                .error()
+            == tensor_op_errc::unsupported_dtype);
+        CHECK(store_kv(context, keys, make_tensor(context, dtype::bf16, { 2, 2 }), slots, 0, cache)
+                  .error()
               == tensor_op_errc::unsupported_dtype);
-        CHECK(store_kv(context, keys, make_tensor(context, dtype::bf16, { 2, 2 }), slots, 0, cache).error()
-              == tensor_op_errc::unsupported_dtype);
-        CHECK(store_kv(context, keys, values, make_tensor(context, dtype::i32, { 2 }), 0, cache).error()
+        CHECK(store_kv(context, keys, values, make_tensor(context, dtype::i32, { 2 }), 0, cache)
+                  .error()
               == tensor_op_errc::unsupported_dtype);
     }
 
     SUBCASE("shapes, layers, and slot bounds")
     {
         // mismatched key/value shapes
-        CHECK(store_kv(context, keys, make_tensor(context, dtype::f32, { 1, 2 }), slots, 0, cache).error()
+        CHECK(store_kv(context, keys, make_tensor(context, dtype::f32, { 1, 2 }), slots, 0, cache)
+                  .error()
               == tensor_op_errc::input_shape_mismatch);
         // slot count mismatch
-        CHECK(store_kv(context, keys, values, make_tensor(context, dtype::u32, { 1 }), 0, cache).error()
+        CHECK(store_kv(context, keys, values, make_tensor(context, dtype::u32, { 1 }), 0, cache)
+                  .error()
               == tensor_op_errc::cache_slot_count_mismatch);
         // feature dimension mismatch
         CHECK(store_kv(context, make_tensor(context, dtype::f32, { 2, 3 }),
-                       make_tensor(context, dtype::f32, { 2, 3 }), slots, 0, cache).error()
+                       make_tensor(context, dtype::f32, { 2, 3 }), slots, 0, cache)
+                  .error()
               == tensor_op_errc::cache_feature_count_mismatch);
         // layer out of range
         CHECK(store_kv(context, keys, values, slots, 2, cache).error()
@@ -781,12 +727,12 @@ TEST_CASE("paged attention validates inputs and metadata")
 
     SUBCASE("ranks and dtypes")
     {
-        CHECK(paged_attention(context, make_tensor(context, dtype::f32, { 2 }), positions, table, offsets,
-                              lengths, 0, 1, cache, output)
+        CHECK(paged_attention(context, make_tensor(context, dtype::f32, { 2 }), positions, table,
+                              offsets, lengths, 0, 1, cache, output)
                   .error()
               == tensor_op_errc::invalid_rank);
-        CHECK(paged_attention(context, queries, positions, make_tensor(context, dtype::i32, { 1 }), offsets,
-                              lengths, 0, 1, cache, output)
+        CHECK(paged_attention(context, queries, positions, make_tensor(context, dtype::i32, { 1 }),
+                              offsets, lengths, 0, 1, cache, output)
                   .error()
               == tensor_op_errc::unsupported_dtype);
     }
@@ -795,7 +741,8 @@ TEST_CASE("paged attention validates inputs and metadata")
     {
         auto q2 = make_tensor(context, dtype::f32, { 2, 2 });
         auto out2 = make_tensor(context, dtype::f32, { 2, 2 });
-        CHECK(paged_attention(context, q2, positions, table, make_tensor(context, dtype::u32, { 2 }),
+        CHECK(paged_attention(context, q2, positions, table,
+                              make_tensor(context, dtype::u32, { 2 }),
                               make_tensor(context, dtype::u32, { 2 }), 0, 1, cache, out2)
                   .error()
               == tensor_op_errc::position_count_mismatch);
@@ -807,7 +754,8 @@ TEST_CASE("paged attention validates inputs and metadata")
 
     SUBCASE("heads and dimensions")
     {
-        CHECK(paged_attention(context, queries, positions, table, offsets, lengths, 0, 0, cache, output)
+        CHECK(paged_attention(context, queries, positions, table, offsets, lengths, 0, 0, cache,
+                              output)
                   .error()
               == tensor_op_errc::invalid_head_count);
         auto dim5 = make_tensor(context, dtype::f32, { 1, 5 });
@@ -819,14 +767,16 @@ TEST_CASE("paged attention validates inputs and metadata")
                   .error()
               == tensor_op_errc::cache_head_dimension_mismatch);
 
-        auto gqa_cache = metal_kv_cache::make(context, { .layer_count = 1,
-                                                          .block_count = 1,
-                                                          .block_size = 1,
-                                                          .kv_head_count = 2,
-                                                          .head_dimension = 2 });
+        auto gqa_cache = metal_kv_cache::make(context,
+                                              { .layer_count = 1,
+                                                .block_count = 1,
+                                                .block_size = 1,
+                                                .kv_head_count = 2,
+                                                .head_dimension = 2 });
         REQUIRE(gqa_cache.has_value());
         auto dim6 = make_tensor(context, dtype::f32, { 1, 6 });
-        CHECK(paged_attention(context, dim6, positions, table, offsets, lengths, 0, 3, *gqa_cache, dim6)
+        CHECK(paged_attention(context, dim6, positions, table, offsets, lengths, 0, 3, *gqa_cache,
+                              dim6)
                   .error()
               == tensor_op_errc::invalid_kv_head_mapping);
     }
@@ -834,10 +784,12 @@ TEST_CASE("paged attention validates inputs and metadata")
     SUBCASE("output and layer")
     {
         auto bad_out = make_tensor(context, dtype::f32, { 2, 1 });
-        CHECK(paged_attention(context, queries, positions, table, offsets, lengths, 0, 1, cache, bad_out)
+        CHECK(paged_attention(context, queries, positions, table, offsets, lengths, 0, 1, cache,
+                              bad_out)
                   .error()
               == tensor_op_errc::output_shape_mismatch);
-        CHECK(paged_attention(context, queries, positions, table, offsets, lengths, 2, 1, cache, output)
+        CHECK(paged_attention(context, queries, positions, table, offsets, lengths, 2, 1, cache,
+                              output)
                   .error()
               == tensor_op_errc::cache_layer_out_of_range);
     }
@@ -849,7 +801,8 @@ TEST_CASE("paged attention validates inputs and metadata")
         write_u32(offsets, { 0 });
         write_u32(lengths, { 1 });
         write_u32(table, { 0 });
-        CHECK(paged_attention(context, queries, positions, table, offsets, lengths, 0, 1, cache, output)
+        CHECK(paged_attention(context, queries, positions, table, offsets, lengths, 0, 1, cache,
+                              output)
                   .error()
               == tensor_op_errc::block_table_range_out_of_bounds);
 
@@ -859,16 +812,18 @@ TEST_CASE("paged attention validates inputs and metadata")
         write_u32(lengths, { 2 });
         auto t2 = make_tensor(context, dtype::u32, { 2 });
         write_u32(t2, { 0, 1 });
-        CHECK(paged_attention(context, queries, positions, t2, offsets, lengths, 0, 1, cache, output)
-                  .error()
-              == tensor_op_errc::block_table_range_out_of_bounds);
+        CHECK(
+            paged_attention(context, queries, positions, t2, offsets, lengths, 0, 1, cache, output)
+                .error()
+            == tensor_op_errc::block_table_range_out_of_bounds);
 
         // physical block out of range
         write_u32(positions, { 0 });
         write_u32(offsets, { 0 });
         write_u32(lengths, { 1 });
         write_u32(table, { 2 });
-        CHECK(paged_attention(context, queries, positions, table, offsets, lengths, 0, 1, cache, output)
+        CHECK(paged_attention(context, queries, positions, table, offsets, lengths, 0, 1, cache,
+                              output)
                   .error()
               == tensor_op_errc::cache_block_out_of_range);
     }

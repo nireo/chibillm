@@ -196,53 +196,19 @@ normalize_qwen_qk(const metal_context& context,
     auto query = make_tensor(context, dtype::f32, { rows, config.query_width() });
     if (!query)
         return fail(query.error());
-    auto operation =
-        rms_norm_heads(context, qkv.query, weights.query_norm, config.rms_epsilon, *query);
+    auto operation = rms_norm(context, qkv.query, weights.query_norm, config.rms_epsilon, *query);
     if (!operation) {
         return fail(operation_error(operation.error()));
     }
     auto key = make_tensor(context, dtype::f32, { rows, config.kv_width() });
     if (!key)
         return fail(key.error());
-    operation = rms_norm_heads(context, qkv.key, weights.key_norm, config.rms_epsilon, *key);
+    operation = rms_norm(context, qkv.key, weights.key_norm, config.rms_epsilon, *key);
     if (!operation) {
         return fail(operation_error(operation.error()));
     }
 
     return qwen_qkv { std::move(*query), std::move(*key), std::move(qkv.value) };
-}
-
-result<qwen_qkv, qwen_layer_errc>
-apply_qwen_rope(const metal_context& context,
-                const qwen3_config& config,
-                qwen_qkv qkv,
-                std::span<const std::uint32_t> positions)
-{
-    if (positions.empty()) {
-        return fail(qwen_layer_errc::invalid_input);
-    }
-
-    auto position_tensor = upload_u32(context, positions);
-    if (!position_tensor)
-        return fail(position_tensor.error());
-    return apply_rope(context, config, std::move(qkv), *position_tensor);
-}
-
-result<metal_tensor, qwen_layer_errc>
-run_qwen_attention(const metal_context& context,
-                   const qwen3_config& config,
-                   const qwen_layer_weights& weights,
-                   std::size_t layer,
-                   const metal_tensor& hidden_states,
-                   qwen_qkv qkv,
-                   qwen_attention_metadata metadata,
-                   metal_kv_cache& cache)
-{
-    auto uploaded = upload_attention_metadata(context, metadata);
-    if (!uploaded)
-        return fail(uploaded.error());
-    return run_attention(context, config, weights, layer, hidden_states, std::move(qkv), *uploaded,
-                         cache);
 }
 
 result<metal_tensor, qwen_layer_errc>

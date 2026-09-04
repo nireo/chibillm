@@ -44,22 +44,6 @@ struct qwen_attention_metadata {
                                                                   const qwen_layer_weights& weights,
                                                                   qwen_qkv qkv);
 
-[[nodiscard]] result<qwen_qkv, qwen_layer_errc>
-apply_qwen_rope(const metal_context& context,
-                const qwen3_config& config,
-                qwen_qkv qkv,
-                std::span<const std::uint32_t> positions);
-
-[[nodiscard]] result<metal_tensor, qwen_layer_errc>
-run_qwen_attention(const metal_context& context,
-                   const qwen3_config& config,
-                   const qwen_layer_weights& weights,
-                   std::size_t layer,
-                   const metal_tensor& hidden_states,
-                   qwen_qkv qkv,
-                   qwen_attention_metadata metadata,
-                   metal_kv_cache& cache);
-
 [[nodiscard]] result<metal_tensor, qwen_layer_errc> run_qwen_mlp(const metal_context& context,
                                                                  const qwen3_config& config,
                                                                  const qwen_layer_weights& weights,

@@ -31,6 +31,7 @@
 
 using chibillm::bf16;
 using chibillm::embed_qwen_tokens;
+using chibillm::encode_qwen_greedy;
 using chibillm::load_qwen3_5_config;
 using chibillm::load_qwen3_5_weights;
 using chibillm::load_qwen_weights;
@@ -45,9 +46,9 @@ using chibillm::qwen3_config;
 using chibillm::qwen_attention_metadata;
 using chibillm::qwen_model_runner;
 using chibillm::qwen_weights_errc;
+using chibillm::read_qwen_greedy;
 using chibillm::run_qwen_layers;
 using chibillm::safetensors_file;
-using chibillm::sample_qwen_greedy;
 using chibillm::validate_qwen3_5_weights;
 using chibillm::validate_qwen_weights;
 using safetensors_test::temporary_file;
@@ -493,12 +494,12 @@ TEST_CASE("Qwen output selects requested rows and samples their largest logits")
     REQUIRE(hidden_states.has_value());
 
     const std::vector<std::size_t> logits_indices { 2, 0 };
-    auto sampled = sample_qwen_greedy(*context, config, *weights, *hidden_states, logits_indices);
+    auto sampled = encode_qwen_greedy(*context, config, *weights, *hidden_states, logits_indices);
     REQUIRE(sampled.has_value());
-    CHECK(*sampled == std::vector<chibillm::token_id> { 5, 3 });
+    CHECK(read_qwen_greedy(*sampled) == std::vector<chibillm::token_id> { 5, 3 });
 
     const std::vector<std::size_t> invalid_indices { input_tokens.size() };
-    auto invalid = sample_qwen_greedy(*context, config, *weights, *hidden_states, invalid_indices);
+    auto invalid = encode_qwen_greedy(*context, config, *weights, *hidden_states, invalid_indices);
     REQUIRE_FALSE(invalid.has_value());
     CHECK(invalid.error() == chibillm::qwen_output_errc::logits_index_out_of_range);
 }
