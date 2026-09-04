@@ -1393,6 +1393,143 @@ TEST_CASE("paged attention follows block tables and shares kv heads")
     }
 }
 
+TEST_CASE("paged FlashAttention tiles causal query rows over paged keys and values")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+    auto cache_result = metal_kv_cache::make(*context,
+                                             {
+                                                 .layer_count = 1,
+                                                 .block_count = 2,
+                                                 .block_size = 2,
+                                                 .kv_head_count = 1,
+                                                 .head_dimension = 2,
+                                             });
+    REQUIRE(cache_result.has_value());
+    auto cache = std::move(*cache_result);
+
+    // Logical tokens 0..3 are physically paged as block 1 followed by block 0.
+    const std::vector<float> key_values {
+        0.25F, 0.75F, -0.5F, 1.0F, 1.0F, 0.0F, 0.5F, -0.25F,
+    };
+    const std::vector<float> value_values {
+        30.0F, 3.0F, 40.0F, 4.0F, 10.0F, 1.0F, 20.0F, 2.0F,
+    };
+    write_floats(cache.keys(), key_values);
+    write_floats(cache.values(), value_values);
+
+    auto queries = make_tensor(*context, dtype::f32, { 4, 4 });
+    auto positions = make_tensor(*context, dtype::u32, { 4 });
+    auto block_table = make_tensor(*context, dtype::u32, { 2 });
+    auto table_offsets = make_tensor(*context, dtype::u32, { 4 });
+    auto table_lengths = make_tensor(*context, dtype::u32, { 4 });
+    auto output = make_tensor(*context, dtype::f32, { 4, 4 });
+    const std::vector<float> query_values {
+        1.0F,  0.5F,  -0.5F, 1.0F, 0.25F, 1.0F,  1.0F,   -0.25F,
+        -0.5F, 0.75F, 0.5F,  0.5F, 1.0F,  -1.0F, -0.25F, 0.75F,
+    };
+    write_floats(queries, query_values);
+    write_u32(positions, { 0, 1, 2, 3 });
+    write_u32(block_table, { 1, 0 });
+    write_u32(table_offsets, { 0, 0, 0, 0 });
+    write_u32(table_lengths, { 2, 2, 2, 2 });
+
+    REQUIRE(paged_attention(*context, queries, positions, block_table, table_offsets, table_lengths,
+                            0, 2, cache, output)
+                .has_value());
+
+    std::vector<float> expected(query_values.size(), 0.0F);
+    constexpr std::array<std::uint32_t, 2> physical_blocks { 1, 0 };
+    const float scale = 1.0F / std::sqrt(2.0F);
+    for (std::size_t row = 0; row < 4; ++row) {
+        for (std::size_t head = 0; head < 2; ++head) {
+            std::vector<float> scores(row + 1);
+            float maximum = -std::numeric_limits<float>::infinity();
+            for (std::size_t token = 0; token <= row; ++token) {
+                const auto block = physical_blocks[token / 2];
+                const auto offset = token % 2;
+                float score = 0.0F;
+                for (std::size_t feature = 0; feature < 2; ++feature) {
+                    const auto cache_index = *cache.element_offset(0, block, offset, 0, feature);
+                    score += query_values[row * 4 + head * 2 + feature] * key_values[cache_index];
+                }
+                scores[token] = score * scale;
+                maximum = std::max(maximum, scores[token]);
+            }
+
+            float denominator = 0.0F;
+            for (std::size_t token = 0; token <= row; ++token) {
+                const auto weight = std::exp(scores[token] - maximum);
+                denominator += weight;
+                const auto block = physical_blocks[token / 2];
+                const auto offset = token % 2;
+                for (std::size_t feature = 0; feature < 2; ++feature) {
+                    const auto cache_index = *cache.element_offset(0, block, offset, 0, feature);
+                    expected[row * 4 + head * 2 + feature] += weight * value_values[cache_index];
+                }
+            }
+            for (std::size_t feature = 0; feature < 2; ++feature) {
+                expected[row * 4 + head * 2 + feature] /= denominator;
+            }
+        }
+    }
+
+    const auto actual = read_floats(output);
+    REQUIRE(actual.size() == expected.size());
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+        CHECK(actual[index] == doctest::Approx(expected[index]).epsilon(1e-5));
+    }
+}
+
+TEST_CASE("paged FlashAttention merges key tiles across a cached prefix")
+{
+    auto context = metal_context::make(load_shader_source());
+    REQUIRE(context.has_value());
+    auto cache_result = metal_kv_cache::make(*context,
+                                             {
+                                                 .layer_count = 1,
+                                                 .block_count = 2,
+                                                 .block_size = 16,
+                                                 .kv_head_count = 1,
+                                                 .head_dimension = 2,
+                                             });
+    REQUIRE(cache_result.has_value());
+    auto cache = std::move(*cache_result);
+
+    write_floats(cache.keys(), std::vector<float>(cache.element_count(), 0.0F));
+    std::vector<float> values;
+    values.reserve(cache.element_count());
+    for (std::size_t token = 0; token < 32; ++token) {
+        values.push_back(static_cast<float>(token));
+        values.push_back(static_cast<float>(2 * token));
+    }
+    write_floats(cache.values(), values);
+
+    auto queries = make_tensor(*context, dtype::f32, { 8, 2 });
+    auto positions = make_tensor(*context, dtype::u32, { 8 });
+    auto block_table = make_tensor(*context, dtype::u32, { 2 });
+    auto table_offsets = make_tensor(*context, dtype::u32, { 8 });
+    auto table_lengths = make_tensor(*context, dtype::u32, { 8 });
+    auto output = make_tensor(*context, dtype::f32, { 8, 2 });
+    write_floats(queries, std::vector<float>(16, 1.0F));
+    write_u32(positions, { 16, 17, 18, 19, 20, 21, 22, 23 });
+    write_u32(block_table, { 0, 1 });
+    write_u32(table_offsets, std::vector<std::uint32_t>(8, 0));
+    write_u32(table_lengths, std::vector<std::uint32_t>(8, 2));
+
+    REQUIRE(paged_attention(*context, queries, positions, block_table, table_offsets, table_lengths,
+                            0, 1, cache, output)
+                .has_value());
+
+    const auto actual = read_floats(output);
+    REQUIRE(actual.size() == 16);
+    for (std::size_t row = 0; row < 8; ++row) {
+        const auto position = static_cast<float>(16 + row);
+        CHECK(actual[row * 2] == doctest::Approx(position / 2.0F).epsilon(1e-5));
+        CHECK(actual[row * 2 + 1] == doctest::Approx(position).epsilon(1e-5));
+    }
+}
+
 TEST_CASE("paged attention combines multiple context chunks")
 {
     auto context = metal_context::make(load_shader_source());

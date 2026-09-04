@@ -719,6 +719,211 @@ paged_attention_f32(device const float* queries [[buffer(0)]],
     output[query_base + ulong(thread_index)] = value_accumulator / softmax_state[1];
 }
 
+// Paged FlashAttention-style prefill. One SIMD group owns one query-head tile,
+// keeps eight query/output rows in registers, and streams sixteen-key tiles
+// through a small threadgroup score buffer. Keys and values are therefore read
+// once per query tile instead of once per query row, while the online-softmax
+// recurrence avoids ever materializing the complete attention matrix.
+kernel void
+paged_flash_attention_prefill_f32(device const float* queries [[buffer(0)]],
+                                  device const uint* positions [[buffer(1)]],
+                                  device const uint* block_table [[buffer(2)]],
+                                  device const uint* block_table_offsets [[buffer(3)]],
+                                  device const uint* block_table_lengths [[buffer(4)]],
+                                  device const float* key_cache [[buffer(5)]],
+                                  device const float* value_cache [[buffer(6)]],
+                                  device const uint* query_tile_starts [[buffer(7)]],
+                                  device const uint* query_tile_lengths [[buffer(8)]],
+                                  device float* output [[buffer(9)]],
+                                  constant uint& row_count [[buffer(10)]],
+                                  constant uint& query_head_count [[buffer(11)]],
+                                  constant uint& kv_head_count [[buffer(12)]],
+                                  constant uint& head_dimension [[buffer(13)]],
+                                  constant uint& block_size [[buffer(14)]],
+                                  constant uint& slot_count [[buffer(15)]],
+                                  constant uint& layer [[buffer(16)]],
+                                  constant uint& block_table_entry_count [[buffer(17)]],
+                                  constant uint& query_tile_count [[buffer(18)]],
+                                  constant uint& simd_width [[buffer(19)]],
+                                  threadgroup float* scores [[threadgroup(0)]],
+                                  threadgroup float* accumulator_rescales [[threadgroup(1)]],
+                                  threadgroup float* normalizers [[threadgroup(2)]],
+                                  uint lane [[thread_index_in_simdgroup]],
+                                  uint3 threadgroup_position [[threadgroup_position_in_grid]])
+{
+    constexpr uint query_tile_size = 8;
+    constexpr uint key_tile_size = 16;
+    constexpr uint features_per_lane = 4;
+
+    const uint query_head = threadgroup_position.x;
+    const uint query_tile = threadgroup_position.y;
+    if (query_head >= query_head_count || query_tile >= query_tile_count) {
+        return;
+    }
+
+    const uint row_start = query_tile_starts[query_tile];
+    const uint tile_rows = query_tile_lengths[query_tile];
+    if (tile_rows == 0
+        || tile_rows > query_tile_size
+        || row_start >= row_count
+        || tile_rows > row_count - row_start
+        || head_dimension > simd_width * features_per_lane) {
+        return;
+    }
+
+    const uint table_offset = block_table_offsets[row_start];
+    const uint table_length = block_table_lengths[row_start];
+    uint query_positions[query_tile_size];
+    ulong query_bases[query_tile_size];
+    float query_features[query_tile_size][features_per_lane];
+    float output_accumulators[query_tile_size][features_per_lane];
+
+    for (uint query = 0; query < query_tile_size; ++query) {
+        const bool active = query < tile_rows;
+        const uint row = active ? row_start + query : row_start;
+        query_positions[query] = active ? positions[row] : 0;
+        query_bases[query] =
+            (ulong(row) * ulong(query_head_count) + ulong(query_head)) * ulong(head_dimension);
+        for (uint component = 0; component < features_per_lane; ++component) {
+            const uint feature = lane + component * simd_width;
+            query_features[query][component] = active && feature < head_dimension
+                ? queries[query_bases[query] + ulong(feature)]
+                : 0.0F;
+            output_accumulators[query][component] = 0.0F;
+        }
+    }
+
+    const uint final_position = query_positions[tile_rows - 1];
+    const uint final_logical_block = final_position / block_size;
+    if (table_offset > block_table_entry_count
+        || table_length > block_table_entry_count - table_offset
+        || final_logical_block >= table_length) {
+        return;
+    }
+
+    const uint kv_group_size = query_head_count / kv_head_count;
+    const uint kv_head = query_head / kv_group_size;
+    const float attention_scale = rsqrt(float(head_dimension));
+    float running_maxima[query_tile_size];
+    float running_sums[query_tile_size];
+    for (uint query = 0; query < query_tile_size; ++query) {
+        running_maxima[query] = -INFINITY;
+        running_sums[query] = 0.0F;
+    }
+
+    for (uint key_tile_begin = 0; key_tile_begin <= final_position;
+         key_tile_begin += key_tile_size) {
+        const uint tile_keys = min(key_tile_size, final_position + 1 - key_tile_begin);
+
+        // Compute the BQ x BK score tile. A lane owns up to four head
+        // features; the SIMD reduction produces a complete q dot k score.
+        for (uint key = 0; key < tile_keys; ++key) {
+            const uint token_position = key_tile_begin + key;
+            const uint logical_block = token_position / block_size;
+            const uint token_offset = token_position % block_size;
+            const uint physical_block = block_table[table_offset + logical_block];
+            const uint slot = physical_block * block_size + token_offset;
+            const ulong cache_base =
+                ((ulong(layer) * ulong(slot_count) + ulong(slot)) * ulong(kv_head_count)
+                 + ulong(kv_head))
+                * ulong(head_dimension);
+
+            float key_features[features_per_lane];
+            for (uint component = 0; component < features_per_lane; ++component) {
+                const uint feature = lane + component * simd_width;
+                key_features[component] =
+                    feature < head_dimension ? key_cache[cache_base + ulong(feature)] : 0.0F;
+            }
+
+            for (uint query = 0; query < tile_rows; ++query) {
+                float partial_score = 0.0F;
+                for (uint component = 0; component < features_per_lane; ++component) {
+                    partial_score += query_features[query][component] * key_features[component];
+                }
+                const float score = simd_sum(partial_score) * attention_scale;
+                if (lane == 0) {
+                    scores[query * key_tile_size + key] =
+                        token_position <= query_positions[query] ? score : -INFINITY;
+                }
+            }
+        }
+
+        // Lane zero merges this score tile into each row's stable online
+        // softmax state and replaces scores with the value weights referenced
+        // to the new running maximum.
+        if (lane == 0) {
+            for (uint query = 0; query < tile_rows; ++query) {
+                float tile_maximum = -INFINITY;
+                for (uint key = 0; key < tile_keys; ++key) {
+                    tile_maximum = max(tile_maximum, scores[query * key_tile_size + key]);
+                }
+
+                const float new_maximum = max(running_maxima[query], tile_maximum);
+                const float old_rescale = exp(running_maxima[query] - new_maximum);
+                float tile_sum = 0.0F;
+                for (uint key = 0; key < tile_keys; ++key) {
+                    const float weight = exp(scores[query * key_tile_size + key] - new_maximum);
+                    scores[query * key_tile_size + key] = weight;
+                    tile_sum += weight;
+                }
+
+                running_maxima[query] = new_maximum;
+                running_sums[query] = running_sums[query] * old_rescale + tile_sum;
+                accumulator_rescales[query] = old_rescale;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Reuse every loaded value across all query rows.
+        for (uint component = 0; component < features_per_lane; ++component) {
+            const uint feature = lane + component * simd_width;
+            if (feature >= head_dimension) {
+                continue;
+            }
+            for (uint query = 0; query < tile_rows; ++query) {
+                output_accumulators[query][component] *= accumulator_rescales[query];
+            }
+            for (uint key = 0; key < tile_keys; ++key) {
+                const uint token_position = key_tile_begin + key;
+                const uint logical_block = token_position / block_size;
+                const uint token_offset = token_position % block_size;
+                const uint physical_block = block_table[table_offset + logical_block];
+                const uint slot = physical_block * block_size + token_offset;
+                const ulong cache_index =
+                    (((ulong(layer) * ulong(slot_count) + ulong(slot)) * ulong(kv_head_count)
+                      + ulong(kv_head))
+                     * ulong(head_dimension))
+                    + ulong(feature);
+                const float value = value_cache[cache_index];
+                for (uint query = 0; query < tile_rows; ++query) {
+                    output_accumulators[query][component] +=
+                        scores[query * key_tile_size + key] * value;
+                }
+            }
+        }
+        // All lanes must consume the score/weight tile before lane zero
+        // overwrites it during the next key tile.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0) {
+        for (uint query = 0; query < tile_rows; ++query) {
+            normalizers[query] = running_sums[query];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint query = 0; query < tile_rows; ++query) {
+        for (uint component = 0; component < features_per_lane; ++component) {
+            const uint feature = lane + component * simd_width;
+            if (feature < head_dimension) {
+                output[query_bases[query] + ulong(feature)] =
+                    output_accumulators[query][component] / normalizers[query];
+            }
+        }
+    }
+}
+
 kernel void
 paged_attention_partial_f32(device const float* queries [[buffer(0)]],
                             device const uint* positions [[buffer(1)]],

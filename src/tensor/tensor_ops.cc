@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <vector>
 
 namespace chibillm {
 
@@ -650,13 +651,64 @@ paged_attention(const metal_context& context,
     }
 
     const auto slot_count = cache.block_count() * cache.block_size();
-    const auto dispatched = context.dispatch_paged_attention_f32(
-        queries.buffer(), positions.buffer(), block_table.buffer(), block_table_offsets.buffer(),
-        block_table_lengths.buffer(), cache.keys().buffer(), cache.values().buffer(),
-        output.buffer(), rows, query_head_count, cache.kv_head_count(), head_dimension,
-        cache.block_size(), slot_count, layer, table_entry_count);
-    if (!dispatched) {
-        return fail(tensor_op_errc::backend_failure);
+
+    // Consecutive query rows from the same sequence share a block table and
+    // can reuse each paged K/V tile. Ragged batches are split at sequence or
+    // position discontinuities so a tile never crosses logical sequences.
+    constexpr std::size_t flash_query_tile_size = 8;
+    std::vector<std::uint32_t> query_tile_starts;
+    std::vector<std::uint32_t> query_tile_lengths;
+    query_tile_starts.reserve((rows + flash_query_tile_size - 1) / flash_query_tile_size);
+    query_tile_lengths.reserve(query_tile_starts.capacity());
+    bool has_shared_query_tile = false;
+    for (std::size_t row = 0; row < rows;) {
+        std::size_t tile_rows = 1;
+        const auto first_table_offset = read_u32(offset_bytes, row);
+        const auto first_table_length = read_u32(length_bytes, row);
+        while (tile_rows < flash_query_tile_size && row + tile_rows < rows) {
+            const auto candidate = row + tile_rows;
+            const auto previous_position = read_u32(position_bytes, candidate - 1);
+            const auto candidate_position = read_u32(position_bytes, candidate);
+            if (read_u32(offset_bytes, candidate) != first_table_offset
+                || read_u32(length_bytes, candidate) != first_table_length
+                || candidate_position != previous_position + 1) {
+                break;
+            }
+            ++tile_rows;
+        }
+        query_tile_starts.push_back(static_cast<std::uint32_t>(row));
+        query_tile_lengths.push_back(static_cast<std::uint32_t>(tile_rows));
+        has_shared_query_tile = has_shared_query_tile || tile_rows > 1;
+        row += tile_rows;
+    }
+
+    if (has_shared_query_tile && head_dimension <= 128) {
+        const auto tile_bytes = query_tile_starts.size() * sizeof(std::uint32_t);
+        auto tile_starts = context.make_shared_buffer(tile_bytes);
+        auto tile_lengths = context.make_shared_buffer(tile_bytes);
+        if (!tile_starts || !tile_lengths) {
+            return fail(tensor_op_errc::backend_failure);
+        }
+        std::memcpy(tile_starts->bytes().data(), query_tile_starts.data(), tile_bytes);
+        std::memcpy(tile_lengths->bytes().data(), query_tile_lengths.data(), tile_bytes);
+        const auto dispatched = context.dispatch_paged_flash_attention_prefill_f32(
+            queries.buffer(), positions.buffer(), block_table.buffer(),
+            block_table_offsets.buffer(), block_table_lengths.buffer(), cache.keys().buffer(),
+            cache.values().buffer(), *tile_starts, *tile_lengths, output.buffer(), rows,
+            query_head_count, cache.kv_head_count(), head_dimension, cache.block_size(), slot_count,
+            layer, table_entry_count, query_tile_starts.size());
+        if (!dispatched) {
+            return fail(tensor_op_errc::backend_failure);
+        }
+    } else {
+        const auto dispatched = context.dispatch_paged_attention_f32(
+            queries.buffer(), positions.buffer(), block_table.buffer(),
+            block_table_offsets.buffer(), block_table_lengths.buffer(), cache.keys().buffer(),
+            cache.values().buffer(), output.buffer(), rows, query_head_count, cache.kv_head_count(),
+            head_dimension, cache.block_size(), slot_count, layer, table_entry_count);
+        if (!dispatched) {
+            return fail(tensor_op_errc::backend_failure);
+        }
     }
 
     return {};

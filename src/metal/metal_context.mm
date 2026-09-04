@@ -186,6 +186,7 @@ struct metal_context::implementation {
     id<MTLComputePipelineState> rope_f32_pipeline;
     id<MTLComputePipelineState> store_kv_f32_pipeline;
     id<MTLComputePipelineState> paged_attention_f32_pipeline;
+    id<MTLComputePipelineState> paged_flash_attention_prefill_f32_pipeline;
     id<MTLComputePipelineState> paged_attention_partial_f32_pipeline;
     id<MTLComputePipelineState> paged_attention_reduce_f32_pipeline;
     // one open "pass" collects many dispatches into a single command buffer.
@@ -196,6 +197,7 @@ struct metal_context::implementation {
     std::string device_name;
     bool profiling_enabled = false;
     bool tensorops_enabled = false;
+    bool flash_attention_enabled = false;
     std::map<std::string, profile_stats> profile;
     std::mutex rope_frequency_mutex;
     std::map<std::pair<std::uint32_t, std::uint32_t>, id<MTLBuffer>> rope_frequency_buffers;
@@ -648,6 +650,25 @@ metal_context::make(std::string_view shader_source)
                                    "failed to create the paged_attention_f32 pipeline")));
         }
 
+        id<MTLFunction> paged_flash_attention_prefill_f32 =
+            [library newFunctionWithName:@"paged_flash_attention_prefill_f32"];
+        if (paged_flash_attention_prefill_f32 == nil) {
+            return fail(make_error(
+                metal_errc::shader_function_not_found,
+                "the Metal shader library does not contain paged_flash_attention_prefill_f32"));
+        }
+
+        pipeline_error = nil;
+        id<MTLComputePipelineState> paged_flash_attention_prefill_f32_pipeline =
+            [device newComputePipelineStateWithFunction:paged_flash_attention_prefill_f32
+                                                  error:&pipeline_error];
+        if (paged_flash_attention_prefill_f32_pipeline == nil) {
+            return fail(make_error(
+                metal_errc::pipeline_creation_failed,
+                message_from_error(pipeline_error,
+                                   "failed to create paged_flash_attention_prefill_f32 pipeline")));
+        }
+
         id<MTLFunction> paged_attention_partial_f32 =
             [library newFunctionWithName:@"paged_attention_partial_f32"];
         if (paged_attention_partial_f32 == nil) {
@@ -706,16 +727,22 @@ metal_context::make(std::string_view shader_source)
         implementation->rope_f32_pipeline = rope_f32_pipeline;
         implementation->store_kv_f32_pipeline = store_kv_f32_pipeline;
         implementation->paged_attention_f32_pipeline = paged_attention_f32_pipeline;
+        implementation->paged_flash_attention_prefill_f32_pipeline =
+            paged_flash_attention_prefill_f32_pipeline;
         implementation->paged_attention_partial_f32_pipeline = paged_attention_partial_f32_pipeline;
         implementation->paged_attention_reduce_f32_pipeline = paged_attention_reduce_f32_pipeline;
         implementation->device_name = device_name == nullptr ? "unknown Metal device" : device_name;
         implementation->profiling_enabled = environment_flag("CHIBILLM_PROFILE");
         implementation->tensorops_enabled = linear_bf16_tensorops_pipeline != nil
             && !environment_flag("CHIBILLM_DISABLE_TENSOROPS");
+        implementation->flash_attention_enabled =
+            !environment_flag("CHIBILLM_DISABLE_FLASH_ATTENTION");
 
-        std::fprintf(stderr, "[metal] device=%s shaders=%s tensorops=%s profile=%s\n",
+        std::fprintf(stderr,
+                     "[metal] device=%s shaders=%s tensorops=%s flash-attention=%s profile=%s\n",
                      implementation->device_name.c_str(), compiled_metal4 ? "Metal 4" : "legacy",
                      implementation->tensorops_enabled ? "enabled" : "disabled",
+                     implementation->flash_attention_enabled ? "enabled" : "disabled",
                      implementation->profiling_enabled ? "detailed" : "off");
 
         return metal_context { std::move(implementation) };
@@ -1534,6 +1561,123 @@ metal_context::dispatch_store_kv_f32(const metal_buffer& keys,
             threadsPerThreadgroup:adaptive_2d_threadgroup_size(
                                       implementation_->store_kv_f32_pipeline, feature_count, rows)];
         return implementation_->complete_dispatch_encoder(*opened, "store_kv");
+    }
+}
+
+result<void, metal_error>
+metal_context::dispatch_paged_flash_attention_prefill_f32(const metal_buffer& queries,
+                                                          const metal_buffer& positions,
+                                                          const metal_buffer& block_table,
+                                                          const metal_buffer& block_table_offsets,
+                                                          const metal_buffer& block_table_lengths,
+                                                          const metal_buffer& key_cache,
+                                                          const metal_buffer& value_cache,
+                                                          const metal_buffer& query_tile_starts,
+                                                          const metal_buffer& query_tile_lengths,
+                                                          metal_buffer& output,
+                                                          std::size_t rows,
+                                                          std::size_t query_head_count,
+                                                          std::size_t kv_head_count,
+                                                          std::size_t head_dimension,
+                                                          std::size_t block_size,
+                                                          std::size_t slot_count,
+                                                          std::size_t layer,
+                                                          std::size_t block_table_entry_count,
+                                                          std::size_t query_tile_count) const
+{
+    @autoreleasepool {
+        const auto simd_width = static_cast<std::size_t>(
+            implementation_->paged_flash_attention_prefill_f32_pipeline.threadExecutionWidth);
+        constexpr std::size_t features_per_lane = 4;
+        if (!implementation_->flash_attention_enabled
+            || head_dimension > simd_width * features_per_lane) {
+            return dispatch_paged_attention_f32(
+                queries, positions, block_table, block_table_offsets, block_table_lengths,
+                key_cache, value_cache, output, rows, query_head_count, kv_head_count,
+                head_dimension, block_size, slot_count, layer, block_table_entry_count);
+        }
+
+        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
+        if (rows > max_shader_dimension
+            || query_head_count > max_shader_dimension
+            || kv_head_count > max_shader_dimension
+            || head_dimension > max_shader_dimension
+            || block_size > max_shader_dimension
+            || slot_count > max_shader_dimension
+            || layer > max_shader_dimension
+            || block_table_entry_count > max_shader_dimension
+            || query_tile_count > max_shader_dimension
+            || simd_width > max_shader_dimension
+            || query_tile_count == 0
+            || query_tile_starts.size_bytes() < query_tile_count * sizeof(std::uint32_t)
+            || query_tile_lengths.size_bytes() < query_tile_count * sizeof(std::uint32_t)) {
+            return fail(make_error(metal_errc::invalid_input,
+                                   "paged FlashAttention dimensions are invalid"));
+        }
+
+        const auto max_threads =
+            static_cast<std::size_t>(implementation_->paged_flash_attention_prefill_f32_pipeline
+                                         .maxTotalThreadsPerThreadgroup);
+        if (simd_width == 0 || simd_width > max_threads) {
+            return fail(
+                make_error(metal_errc::invalid_input,
+                           "paged FlashAttention SIMD width exceeds the threadgroup limit"));
+        }
+
+        const auto shader_rows = static_cast<std::uint32_t>(rows);
+        const auto shader_query_head_count = static_cast<std::uint32_t>(query_head_count);
+        const auto shader_kv_head_count = static_cast<std::uint32_t>(kv_head_count);
+        const auto shader_head_dimension = static_cast<std::uint32_t>(head_dimension);
+        const auto shader_block_size = static_cast<std::uint32_t>(block_size);
+        const auto shader_slot_count = static_cast<std::uint32_t>(slot_count);
+        const auto shader_layer = static_cast<std::uint32_t>(layer);
+        const auto shader_block_table_entry_count =
+            static_cast<std::uint32_t>(block_table_entry_count);
+        const auto shader_query_tile_count = static_cast<std::uint32_t>(query_tile_count);
+        const auto shader_simd_width = static_cast<std::uint32_t>(simd_width);
+
+        auto opened = implementation_->open_dispatch_encoder();
+        if (!opened) {
+            return fail(opened.error());
+        }
+        id<MTLComputeCommandEncoder> encoder = opened->encoder;
+        [encoder
+            setComputePipelineState:implementation_->paged_flash_attention_prefill_f32_pipeline];
+        [encoder setBuffer:queries.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:positions.implementation_->buffer offset:0 atIndex:1];
+        [encoder setBuffer:block_table.implementation_->buffer offset:0 atIndex:2];
+        [encoder setBuffer:block_table_offsets.implementation_->buffer offset:0 atIndex:3];
+        [encoder setBuffer:block_table_lengths.implementation_->buffer offset:0 atIndex:4];
+        [encoder setBuffer:key_cache.implementation_->buffer offset:0 atIndex:5];
+        [encoder setBuffer:value_cache.implementation_->buffer offset:0 atIndex:6];
+        [encoder setBuffer:query_tile_starts.implementation_->buffer offset:0 atIndex:7];
+        [encoder setBuffer:query_tile_lengths.implementation_->buffer offset:0 atIndex:8];
+        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:9];
+        [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:10];
+        [encoder setBytes:&shader_query_head_count
+                   length:sizeof(shader_query_head_count)
+                  atIndex:11];
+        [encoder setBytes:&shader_kv_head_count length:sizeof(shader_kv_head_count) atIndex:12];
+        [encoder setBytes:&shader_head_dimension length:sizeof(shader_head_dimension) atIndex:13];
+        [encoder setBytes:&shader_block_size length:sizeof(shader_block_size) atIndex:14];
+        [encoder setBytes:&shader_slot_count length:sizeof(shader_slot_count) atIndex:15];
+        [encoder setBytes:&shader_layer length:sizeof(shader_layer) atIndex:16];
+        [encoder setBytes:&shader_block_table_entry_count
+                   length:sizeof(shader_block_table_entry_count)
+                  atIndex:17];
+        [encoder setBytes:&shader_query_tile_count
+                   length:sizeof(shader_query_tile_count)
+                  atIndex:18];
+        [encoder setBytes:&shader_simd_width length:sizeof(shader_simd_width) atIndex:19];
+        constexpr std::size_t query_tile_size = 8;
+        constexpr std::size_t key_tile_size = 16;
+        [encoder setThreadgroupMemoryLength:query_tile_size * key_tile_size * sizeof(float)
+                                    atIndex:0];
+        [encoder setThreadgroupMemoryLength:query_tile_size * sizeof(float) atIndex:1];
+        [encoder setThreadgroupMemoryLength:query_tile_size * sizeof(float) atIndex:2];
+        [encoder dispatchThreadgroups:MTLSizeMake(query_head_count, query_tile_count, 1)
+                threadsPerThreadgroup:MTLSizeMake(simd_width, 1, 1)];
+        return implementation_->complete_dispatch_encoder(*opened, "paged_flash_attention_prefill");
     }
 }
 
