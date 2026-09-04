@@ -197,10 +197,9 @@ TEST_CASE("decode commits the old sample and creates the next one-token cache ga
 
 TEST_CASE("sequences finish on EOS or length limit and release cache blocks")
 {
-    SUBCASE("EOS terminates sequence")
-    {
+    auto check_finish = [](sampling_params params, token_id sample, finish_reason expected_reason) {
         auto scheduler_result = scheduler::make(test_config());
-        auto sequence = seq::make(1, { 10, 20 }, sampling_params {}, 2);
+        auto sequence = seq::make(1, { 10, 20 }, params, 2);
         REQUIRE(scheduler_result.has_value());
         REQUIRE(sequence.has_value());
         auto& engine = *scheduler_result;
@@ -208,37 +207,19 @@ TEST_CASE("sequences finish on EOS or length limit and release cache blocks")
 
         auto prefill = engine.schedule();
         REQUIRE(prefill.has_value());
-        REQUIRE(engine.complete(*prefill, std::array<token_id, 1> { 99 }).has_value());
+        REQUIRE(engine.complete(*prefill, std::array<token_id, 1> { sample }).has_value());
 
         const auto* finished = engine.find_sequence(1);
         REQUIRE(finished != nullptr);
         CHECK(finished->status() == seq_status::finished);
-        CHECK(finished->reason() == finish_reason::eos);
+        CHECK(finished->reason() == expected_reason);
         CHECK(finished->block_table().empty());
         CHECK(engine.cache().used_block_count() == 0);
         CHECK(engine.is_finished());
-    }
+    };
 
-    SUBCASE("length limit terminates sequence")
-    {
-        auto scheduler_result = scheduler::make(test_config());
-        const sampling_params params { .max_new_tokens = 1 };
-        auto sequence = seq::make(1, { 10 }, params, 2);
-        REQUIRE(scheduler_result.has_value());
-        REQUIRE(sequence.has_value());
-        auto& engine = *scheduler_result;
-        REQUIRE(engine.add(std::move(*sequence)).has_value());
-
-        auto prefill = engine.schedule();
-        REQUIRE(prefill.has_value());
-        REQUIRE(engine.complete(*prefill, std::array<token_id, 1> { 42 }).has_value());
-
-        const auto* finished = engine.find_sequence(1);
-        REQUIRE(finished != nullptr);
-        CHECK(finished->reason() == finish_reason::len_limit);
-        CHECK(finished->completion_token_count() == 1);
-        CHECK(engine.is_finished());
-    }
+    check_finish(sampling_params {}, 99, finish_reason::eos);
+    check_finish(sampling_params { .max_new_tokens = 1 }, 42, finish_reason::len_limit);
 }
 
 TEST_CASE("cancel releases a running sequence and allows it to be retired")

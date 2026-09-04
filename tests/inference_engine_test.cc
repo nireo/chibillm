@@ -34,8 +34,13 @@ test_config()
     };
 }
 
-class test_model_runner : public model_runner {
+class stub_model_runner final : public model_runner {
 public:
+    explicit stub_model_runner(result<std::vector<token_id>, model_runner_errc> response)
+        : response_(std::move(response))
+    {
+    }
+
     const chibillm::model_info&
     info() const noexcept override
     {
@@ -58,24 +63,15 @@ public:
     {
         return chibillm::fail(model_runner_errc::backend_failure);
     }
-};
 
-class failing_model_runner final : public test_model_runner {
-public:
     result<std::vector<token_id>, model_runner_errc>
     execute(const model_batch&) override
     {
-        return chibillm::fail(model_runner_errc::backend_failure);
+        return response_;
     }
-};
 
-class empty_result_model_runner final : public test_model_runner {
-public:
-    result<std::vector<token_id>, model_runner_errc>
-    execute(const model_batch&) override
-    {
-        return std::vector<token_id> {};
-    }
+private:
+    result<std::vector<token_id>, model_runner_errc> response_;
 };
 
 } // namespace
@@ -133,42 +129,31 @@ TEST_CASE("engine runs chunked prefill and decode until the length limit")
     CHECK(finished->completion_tokens()[2] == 42);
 }
 
-TEST_CASE("model failure aborts the scheduler reservation")
+TEST_CASE("runner failures abort the scheduler reservation")
 {
-    failing_model_runner runner;
-    auto engine = inference_engine::make(test_config(), runner);
-    auto sequence = seq::make(1, { 10 }, sampling_params {}, 2);
-    REQUIRE(engine.has_value());
-    REQUIRE(sequence.has_value());
-    REQUIRE(engine->add(std::move(*sequence)).has_value());
+    auto check_failure = [](result<std::vector<token_id>, model_runner_errc> response,
+                            inference_engine_errc expected) {
+        stub_model_runner runner(std::move(response));
+        auto engine = inference_engine::make(test_config(), runner);
+        auto sequence = seq::make(1, { 10 }, sampling_params {}, 2);
+        REQUIRE(engine.has_value());
+        REQUIRE(sequence.has_value());
+        REQUIRE(engine->add(std::move(*sequence)).has_value());
 
-    auto stepped = engine->step();
-    REQUIRE_FALSE(stepped.has_value());
-    CHECK(stepped.error() == inference_engine_errc::model_execution_failed);
-    CHECK_FALSE(engine->has_in_flight_batch());
+        auto stepped = engine->step();
+        REQUIRE_FALSE(stepped.has_value());
+        CHECK(stepped.error() == expected);
+        CHECK_FALSE(engine->has_in_flight_batch());
 
-    const auto* unchanged = engine->find_sequence(1);
-    REQUIRE(unchanged != nullptr);
-    CHECK(unchanged->cached_token_count() == 0);
-    CHECK(unchanged->scheduled_token_count() == 0);
-    CHECK(unchanged->status() == seq_status::waiting);
-}
+        const auto* unchanged = engine->find_sequence(1);
+        REQUIRE(unchanged != nullptr);
+        CHECK(unchanged->cached_token_count() == 0);
+        CHECK(unchanged->scheduled_token_count() == 0);
+        CHECK(unchanged->status() == seq_status::waiting);
+    };
 
-TEST_CASE("wrong runner result count aborts the scheduler reservation")
-{
-    empty_result_model_runner runner;
-    auto engine = inference_engine::make(test_config(), runner);
-    auto sequence = seq::make(1, { 10 }, sampling_params {}, 2);
-    REQUIRE(engine.has_value());
-    REQUIRE(sequence.has_value());
-    REQUIRE(engine->add(std::move(*sequence)).has_value());
-
-    auto stepped = engine->step();
-    REQUIRE_FALSE(stepped.has_value());
-    CHECK(stepped.error() == inference_engine_errc::runner_result_count_mismatch);
-    CHECK_FALSE(engine->has_in_flight_batch());
-
-    const auto* unchanged = engine->find_sequence(1);
-    REQUIRE(unchanged != nullptr);
-    CHECK(unchanged->scheduled_token_count() == 0);
+    check_failure(chibillm::fail(model_runner_errc::backend_failure),
+                  inference_engine_errc::model_execution_failed);
+    check_failure(std::vector<token_id> {},
+                  inference_engine_errc::runner_result_count_mismatch);
 }

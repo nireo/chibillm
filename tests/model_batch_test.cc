@@ -35,7 +35,7 @@ test_config()
 
 } // namespace
 
-TEST_CASE("prefill input contains the scheduled token slice and absolute positions")
+TEST_CASE("model batch builds chunked prefill and subsequent decode batches")
 {
     auto config = test_config();
     config.max_batch_tokens = 2;
@@ -45,79 +45,58 @@ TEST_CASE("prefill input contains the scheduled token slice and absolute positio
     REQUIRE(sequence.has_value());
     REQUIRE(engine->add(std::move(*sequence)).has_value());
 
-    auto scheduled = engine->schedule();
-    REQUIRE(scheduled.has_value());
-    auto built = build_model_batch(*scheduled, *engine);
-    REQUIRE(built.has_value());
+    // Chunk 1: first prefill slice [10, 20]
+    auto first = engine->schedule();
+    REQUIRE(first.has_value());
+    auto first_batch = build_model_batch(*first, *engine);
+    REQUIRE(first_batch.has_value());
 
-    CHECK(built->id == scheduled->id);
-    CHECK(built->phase == batch_phase::prefill);
-    CHECK(built->kv_block_size == 2);
-    CHECK(built->tokens == std::vector<token_id> { 10, 20 });
-    CHECK(built->positions == std::vector<position_id> { 0, 1 });
-    REQUIRE(built->items.size() == 1);
-    CHECK(built->items[0].id == 1);
-    CHECK(built->items[0].token_offset == 0);
-    CHECK(built->items[0].token_count == 2);
-    CHECK(built->items[0].logits_index == 1);
-    CHECK(built->items[0].block_table.size() == 2);
+    CHECK(first_batch->id == first->id);
+    CHECK(first_batch->phase == batch_phase::prefill);
+    CHECK(first_batch->kv_block_size == 2);
+    CHECK(first_batch->tokens == std::vector<token_id> { 10, 20 });
+    CHECK(first_batch->positions == std::vector<position_id> { 0, 1 });
+    REQUIRE(first_batch->items.size() == 1);
+    CHECK(first_batch->items[0].id == 1);
+    CHECK(first_batch->items[0].token_offset == 0);
+    CHECK(first_batch->items[0].token_count == 2);
+    CHECK(first_batch->items[0].logits_index == 1);
+    CHECK(first_batch->items[0].block_table.size() == 2);
 
     const auto* unchanged = engine->find_sequence(1);
     REQUIRE(unchanged != nullptr);
     CHECK(unchanged->cached_token_count() == 0);
     CHECK(unchanged->scheduled_token_count() == 2);
-}
 
-TEST_CASE("later prefill chunks start at the cached prefix")
-{
-    auto config = test_config();
-    config.max_batch_tokens = 2;
-    auto engine = scheduler::make(config);
-    auto sequence = seq::make(1, { 10, 20, 30 }, sampling_params {}, 2);
-    REQUIRE(engine.has_value());
-    REQUIRE(sequence.has_value());
-    REQUIRE(engine->add(std::move(*sequence)).has_value());
-
-    auto first = engine->schedule();
-    REQUIRE(first.has_value());
+    // Chunk 2: remaining prefill slice [30] starting at cached prefix position 2
     const std::array<token_id, 1> ignored_sample { 77 };
     REQUIRE(engine->complete(*first, ignored_sample).has_value());
 
     auto second = engine->schedule();
     REQUIRE(second.has_value());
-    auto built = build_model_batch(*second, *engine);
-    REQUIRE(built.has_value());
-    CHECK(built->tokens == std::vector<token_id> { 30 });
-    CHECK(built->positions == std::vector<position_id> { 2 });
-    REQUIRE(built->items.size() == 1);
-    CHECK(built->items[0].token_offset == 0);
-    CHECK(built->items[0].token_count == 1);
-    CHECK(built->items[0].logits_index == 0);
-}
+    auto second_batch = build_model_batch(*second, *engine);
+    REQUIRE(second_batch.has_value());
+    CHECK(second_batch->tokens == std::vector<token_id> { 30 });
+    CHECK(second_batch->positions == std::vector<position_id> { 2 });
+    REQUIRE(second_batch->items.size() == 1);
+    CHECK(second_batch->items[0].token_offset == 0);
+    CHECK(second_batch->items[0].token_count == 1);
+    CHECK(second_batch->items[0].logits_index == 0);
 
-TEST_CASE("decode input contains the previous model sample")
-{
-    auto engine = scheduler::make(test_config());
-    auto sequence = seq::make(1, { 10, 20 }, sampling_params {}, 2);
-    REQUIRE(engine.has_value());
-    REQUIRE(sequence.has_value());
-    REQUIRE(engine->add(std::move(*sequence)).has_value());
-
-    auto prefill = engine->schedule();
-    REQUIRE(prefill.has_value());
-    const std::array<token_id, 1> first_sample { 30 };
-    REQUIRE(engine->complete(*prefill, first_sample).has_value());
+    // Decode: subsequent step feeds the previous sample (30) at position 3
+    const std::array<token_id, 1> decode_sample { 40 };
+    REQUIRE(engine->complete(*second, decode_sample).has_value());
 
     auto decode = engine->schedule();
     REQUIRE(decode.has_value());
-    auto built = build_model_batch(*decode, *engine);
-    REQUIRE(built.has_value());
-    CHECK(built->phase == batch_phase::decode);
-    CHECK(built->tokens == std::vector<token_id> { 30 });
-    CHECK(built->positions == std::vector<position_id> { 2 });
-    REQUIRE(built->items.size() == 1);
-    CHECK(built->items[0].logits_index == 0);
-    CHECK(built->items[0].block_table.size() == 2);
+    auto decode_batch = build_model_batch(*decode, *engine);
+    REQUIRE(decode_batch.has_value());
+    CHECK(decode_batch->phase == batch_phase::decode);
+    CHECK(decode_batch->tokens == std::vector<token_id> { 40 });
+    CHECK(decode_batch->positions == std::vector<position_id> { 3 });
+    REQUIRE(decode_batch->items.size() == 1);
+    CHECK(decode_batch->items[0].logits_index == 0);
+    CHECK(decode_batch->items[0].block_table.size() == 2);
 }
 
 TEST_CASE("ragged prefill is flattened in scheduled order")

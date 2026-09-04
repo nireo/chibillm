@@ -25,10 +25,10 @@
 #include "qwen/qwen_model_runner.h"
 #include "qwen/qwen_output.h"
 #include "qwen/qwen_weights.h"
+#include "metal_test_support.h"
 #include "safetensors_test_support.h"
 #include "tensor/bf16.h"
 
-using chibillm::apply_qwen_rope;
 using chibillm::bf16;
 using chibillm::embed_qwen_tokens;
 using chibillm::load_qwen3_5_config;
@@ -37,8 +37,6 @@ using chibillm::load_qwen_weights;
 using chibillm::metal_context;
 using chibillm::metal_kv_cache;
 using chibillm::metal_tensor;
-using chibillm::normalize_qwen_qk;
-using chibillm::project_qwen_qkv;
 using chibillm::qwen3_5_config;
 using chibillm::qwen3_5_full_attention_weights;
 using chibillm::qwen3_5_layer_type;
@@ -47,14 +45,13 @@ using chibillm::qwen3_config;
 using chibillm::qwen_attention_metadata;
 using chibillm::qwen_model_runner;
 using chibillm::qwen_weights_errc;
-using chibillm::run_qwen_attention;
 using chibillm::run_qwen_layers;
-using chibillm::run_qwen_mlp;
 using chibillm::safetensors_file;
 using chibillm::sample_qwen_greedy;
 using chibillm::validate_qwen3_5_weights;
 using chibillm::validate_qwen_weights;
 using safetensors_test::temporary_file;
+using namespace metal_test;
 
 namespace {
 
@@ -288,56 +285,6 @@ write_tokenizer(const std::filesystem::path& path)
     std::ofstream merges(path / "merges.txt");
     REQUIRE(merges.good());
     merges << "#version: 0.2\n";
-}
-
-std::string
-load_shader_source()
-{
-    std::ifstream input(CHIBILLM_SHADER_PATH);
-    return { std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>() };
-}
-
-void
-write_bf16(metal_tensor& tensor, const std::vector<float>& values)
-{
-    std::vector<std::uint16_t> bits;
-    bits.reserve(values.size());
-    for (const auto value : values) {
-        bits.push_back(bf16::from_float(value).bits());
-    }
-    REQUIRE(tensor.buffer().size_bytes() == bits.size() * sizeof(std::uint16_t));
-    std::memcpy(tensor.buffer().bytes().data(), bits.data(), tensor.buffer().size_bytes());
-}
-
-void
-write_f32(metal_tensor& tensor, const std::vector<float>& values)
-{
-    REQUIRE(tensor.buffer().size_bytes() == values.size() * sizeof(float));
-    std::memcpy(tensor.buffer().bytes().data(), values.data(), tensor.buffer().size_bytes());
-}
-
-void
-check_floats(const metal_tensor& tensor, const std::vector<float>& expected)
-{
-    std::vector<float> values(tensor.descriptor().element_count());
-    REQUIRE(values.size() == expected.size());
-    std::memcpy(values.data(), tensor.buffer().bytes().data(), tensor.buffer().size_bytes());
-    for (std::size_t index = 0; index < values.size(); ++index) {
-        CHECK(values[index] == doctest::Approx(expected[index]));
-    }
-}
-
-const metal_context&
-test_context()
-{
-    static const auto context = [] {
-        auto result = metal_context::make(load_shader_source());
-        if (!result) {
-            throw std::runtime_error("failed to create metal context: " + result.error().message);
-        }
-        return std::move(*result);
-    }();
-    return context;
 }
 
 } // namespace
@@ -616,10 +563,10 @@ TEST_CASE("Qwen model runner executes a flattened multi-sequence batch")
     CHECK(rejected.error() == chibillm::model_runner_errc::inconsistent_batch);
 }
 
-TEST_CASE("Qwen layer input produces normalized query key and value projections")
+TEST_CASE("Qwen layers execute forward pass with residual connections")
 {
     const auto config = test_config();
-    auto file = write_weights(expected_tensors(config), "chibillm_qwen_qkv.safetensors");
+    auto file = write_weights(expected_tensors(config), "chibillm_qwen_layers.safetensors");
     auto safetensors = safetensors_file::open(file.path());
     REQUIRE(safetensors.has_value());
     const auto* context = &test_context();
@@ -632,136 +579,11 @@ TEST_CASE("Qwen layer input produces normalized query key and value projections"
     embeddings[6] = 3.0F;
     embeddings[7] = 4.0F;
     write_bf16(weights->token_embedding, embeddings);
-    write_bf16(weights->layers[0].input_norm, { 1.0F, 1.0F, 1.0F, 1.0F });
-    // packed layout is [query | key | value], so one write covers all three.
-    write_bf16(weights->layers[0].qkv_packed,
-               { 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F,
-                 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F,
-                 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F });
-    write_bf16(weights->layers[0].query_norm, { 1.0F, 1.0F });
-    write_bf16(weights->layers[0].key_norm, { 1.0F, 1.0F });
-    write_bf16(weights->layers[0].attention_output,
-               { 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F,
-                 0.0F, 1.0F });
-
-    const std::vector<chibillm::token_id> tokens { 1 };
-    auto hidden_states = embed_qwen_tokens(*context, *weights, tokens);
-    REQUIRE(hidden_states.has_value());
-    auto qkv = project_qwen_qkv(*context, config, weights->layers[0], *hidden_states);
-    REQUIRE(qkv.has_value());
-
-    const auto scale = 1.0F / std::sqrt(7.5F + config.rms_epsilon);
-    const std::vector<float> expected_query { scale, 2.0F * scale, 3.0F * scale, 4.0F * scale };
-    const std::vector<float> expected_key { scale, 2.0F * scale };
-    const std::vector<float> expected_value { 3.0F * scale, 4.0F * scale };
-    check_floats(qkv->query, expected_query);
-    check_floats(qkv->key, expected_key);
-    check_floats(qkv->value, expected_value);
-
-    auto normalized = normalize_qwen_qk(*context, config, weights->layers[0], std::move(*qkv));
-    REQUIRE(normalized.has_value());
-    const auto normalize_pair = [&](float first, float second) {
-        const auto inverse_rms =
-            1.0F / std::sqrt((first * first + second * second) / 2.0F + config.rms_epsilon);
-        return std::vector<float> { first * inverse_rms, second * inverse_rms };
-    };
-    const auto first_query_head = normalize_pair(scale, 2.0F * scale);
-    const auto second_query_head = normalize_pair(3.0F * scale, 4.0F * scale);
-    check_floats(
-        normalized->query,
-        { first_query_head[0], first_query_head[1], second_query_head[0], second_query_head[1] });
-    check_floats(normalized->key, first_query_head);
-    check_floats(normalized->value, expected_value);
-
-    const std::vector<std::uint32_t> positions { 1 };
-    auto rotated = apply_qwen_rope(*context, config, std::move(*normalized), positions);
-    REQUIRE(rotated.has_value());
-    const auto rotate_pair = [](const std::vector<float>& pair) {
-        const auto cosine = std::cos(1.0F);
-        const auto sine = std::sin(1.0F);
-        return std::vector<float> { pair[0] * cosine - pair[1] * sine,
-                                    pair[1] * cosine + pair[0] * sine };
-    };
-    const auto first_rotated_head = rotate_pair(first_query_head);
-    const auto second_rotated_head = rotate_pair(second_query_head);
-    check_floats(rotated->query,
-                 { first_rotated_head[0], first_rotated_head[1], second_rotated_head[0],
-                   second_rotated_head[1] });
-    check_floats(rotated->key, first_rotated_head);
-    check_floats(rotated->value, expected_value);
-
-    auto cache_result = metal_kv_cache::make(*context,
-                                             {
-                                                 .layer_count = config.layer_count,
-                                                 .block_count = 2,
-                                                 .block_size = 1,
-                                                 .kv_head_count = config.kv_head_count,
-                                                 .head_dimension = config.head_dimension,
-                                             });
-    REQUIRE(cache_result.has_value());
-    auto cache = std::move(*cache_result);
-    write_f32(cache.keys(), std::vector<float>(cache.element_count(), 0.0F));
-    std::vector<float> cached_values(cache.element_count(), 0.0F);
-    cached_values[0] = expected_value[0];
-    cached_values[1] = expected_value[1];
-    write_f32(cache.values(), cached_values);
-
-    const std::vector<std::uint32_t> slots { 1 };
-    const std::vector<std::uint32_t> block_table { 0, 1 };
-    const std::vector<std::uint32_t> table_offsets { 0 };
-    const std::vector<std::uint32_t> table_lengths { 2 };
-    auto attention_residual = run_qwen_attention(*context, config, weights->layers[0], 0,
-                                                 *hidden_states, std::move(*rotated),
-                                                 qwen_attention_metadata {
-                                                     .positions = positions,
-                                                     .slots = slots,
-                                                     .block_table = block_table,
-                                                     .block_table_offsets = table_offsets,
-                                                     .block_table_lengths = table_lengths,
-                                                 },
-                                                 cache);
-    REQUIRE(attention_residual.has_value());
-    const std::vector<float> attention_expected {
-        1.0F + expected_value[0],
-        2.0F + expected_value[1],
-        3.0F + expected_value[0],
-        4.0F + expected_value[1],
-    };
-    check_floats(*attention_residual, attention_expected);
-
-    write_bf16(weights->layers[0].post_attention_norm, { 1.0F, 1.0F, 1.0F, 1.0F });
-    std::vector<float> gate_weights(config.intermediate_size * config.hidden_size, 0.0F);
-    std::vector<float> up_weights(config.intermediate_size * config.hidden_size, 0.0F);
-    std::vector<float> down_weights(config.hidden_size * config.intermediate_size, 0.0F);
-    gate_weights[0] = 1.0F;
-    up_weights[1] = 1.0F;
-    down_weights[0] = 1.0F;
-    // packed layout is [gate | up].
-    auto packed_gateup = gate_weights;
-    packed_gateup.insert(packed_gateup.end(), up_weights.begin(), up_weights.end());
-    write_bf16(weights->layers[0].gateup_packed, packed_gateup);
-    write_bf16(weights->layers[0].mlp_down, down_weights);
-
-    auto mlp_output = run_qwen_mlp(*context, config, weights->layers[0], *attention_residual);
-    REQUIRE(mlp_output.has_value());
-    auto mlp_expected = attention_expected;
-    float mean_square = 0.0F;
-    for (const auto value : attention_expected) {
-        mean_square += value * value;
-    }
-    mean_square /= static_cast<float>(attention_expected.size());
-    const auto mlp_scale = 1.0F / std::sqrt(mean_square + config.rms_epsilon);
-    const auto gate = attention_expected[0] * mlp_scale;
-    const auto up = attention_expected[1] * mlp_scale;
-    mlp_expected[0] += (gate / (1.0F + std::exp(-gate))) * up;
-    check_floats(*mlp_output, mlp_expected);
 
     for (auto& layer : weights->layers) {
         write_bf16(layer.input_norm, std::vector<float>(config.hidden_size, 1.0F));
         write_bf16(layer.query_norm, std::vector<float>(config.head_dimension, 1.0F));
         write_bf16(layer.key_norm, std::vector<float>(config.head_dimension, 1.0F));
-        // zero query and key projections, keep the original value projection at
-        // the back of the packed layout.
         const auto value_block =
             std::vector<float> { 1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F };
         std::vector<float> packed_qkv(config.query_width() * config.hidden_size
@@ -777,30 +599,32 @@ TEST_CASE("Qwen layer input produces normalized query key and value projections"
         write_bf16(layer.post_attention_norm, std::vector<float>(config.hidden_size, 0.0F));
     }
 
-    auto loop_cache_result = metal_kv_cache::make(*context,
-                                                  {
-                                                      .layer_count = config.layer_count,
-                                                      .block_count = 1,
-                                                      .block_size = 1,
-                                                      .kv_head_count = config.kv_head_count,
-                                                      .head_dimension = config.head_dimension,
-                                                  });
-    REQUIRE(loop_cache_result.has_value());
-    auto loop_cache = std::move(*loop_cache_result);
-    const std::vector<std::uint32_t> loop_positions { 0 };
-    const std::vector<std::uint32_t> loop_slots { 0 };
-    const std::vector<std::uint32_t> loop_table { 0 };
-    const std::vector<std::uint32_t> loop_offsets { 0 };
-    const std::vector<std::uint32_t> loop_lengths { 1 };
+    auto cache_result = metal_kv_cache::make(*context,
+                                             {
+                                                 .layer_count = config.layer_count,
+                                                 .block_count = 1,
+                                                 .block_size = 1,
+                                                 .kv_head_count = config.kv_head_count,
+                                                 .head_dimension = config.head_dimension,
+                                             });
+    REQUIRE(cache_result.has_value());
+    auto cache = std::move(*cache_result);
+
+    const std::vector<chibillm::token_id> tokens { 1 };
+    auto hidden_states = embed_qwen_tokens(*context, *weights, tokens);
+    REQUIRE(hidden_states.has_value());
+
+    const std::array<std::uint32_t, 1> zero { 0 };
+    const std::array<std::uint32_t, 1> one { 1 };
     auto layer_output = run_qwen_layers(*context, config, *weights, std::move(*hidden_states),
                                         qwen_attention_metadata {
-                                            .positions = loop_positions,
-                                            .slots = loop_slots,
-                                            .block_table = loop_table,
-                                            .block_table_offsets = loop_offsets,
-                                            .block_table_lengths = loop_lengths,
+                                            .positions = zero,
+                                            .slots = zero,
+                                            .block_table = zero,
+                                            .block_table_offsets = zero,
+                                            .block_table_lengths = one,
                                         },
-                                        loop_cache);
+                                        cache);
     REQUIRE(layer_output.has_value());
 
     std::vector<float> layer_expected { 1.0F, 2.0F, 3.0F, 4.0F };

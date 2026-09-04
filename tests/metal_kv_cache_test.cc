@@ -1,12 +1,10 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-#include <fstream>
-#include <iterator>
-#include <limits>
-#include <string>
+#include "metal_test_support.h"
 
-#include "metal/metal_context.h"
+#include <limits>
+
 #include "metal/metal_kv_cache.h"
 #include "tensor/dtype.h"
 
@@ -17,16 +15,6 @@ using chibillm::metal_context;
 using chibillm::metal_kv_cache;
 
 namespace {
-
-std::string
-load_shader_source()
-{
-    std::ifstream input(CHIBILLM_SHADER_PATH);
-    return {
-        std::istreambuf_iterator<char>(input),
-        std::istreambuf_iterator<char>(),
-    };
-}
 
 kv_cache_config
 valid_config()
@@ -44,10 +32,8 @@ valid_config()
 
 TEST_CASE("metal kv cache allocates matching key and value tensors")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto cache = metal_kv_cache::make(*context, valid_config());
+    const auto& context = metal_test::test_context();
+    auto cache = metal_kv_cache::make(context, valid_config());
     REQUIRE(cache.has_value());
 
     CHECK(cache->layer_count() == 2);
@@ -76,39 +62,26 @@ TEST_CASE("metal kv cache allocates matching key and value tensors")
 
 TEST_CASE("metal kv cache rejects zero and overflowing dimensions")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto& context = metal_test::test_context();
+    auto check_invalid = [&](auto mutator, kv_cache_errc expected) {
+        auto cfg = valid_config();
+        mutator(cfg);
+        CHECK(metal_kv_cache::make(context, cfg).error() == expected);
+    };
 
-    auto cfg = valid_config();
-    cfg.layer_count = 0;
-    CHECK(metal_kv_cache::make(*context, cfg).error() == kv_cache_errc::invalid_layer_count);
-
-    cfg = valid_config();
-    cfg.block_count = 0;
-    CHECK(metal_kv_cache::make(*context, cfg).error() == kv_cache_errc::invalid_block_count);
-
-    cfg = valid_config();
-    cfg.block_size = 0;
-    CHECK(metal_kv_cache::make(*context, cfg).error() == kv_cache_errc::invalid_block_size);
-
-    cfg = valid_config();
-    cfg.kv_head_count = 0;
-    CHECK(metal_kv_cache::make(*context, cfg).error() == kv_cache_errc::invalid_kv_head_count);
-
-    cfg = valid_config();
-    cfg.head_dimension = 0;
-    CHECK(metal_kv_cache::make(*context, cfg).error() == kv_cache_errc::invalid_head_dimension);
-
-    cfg = valid_config();
-    cfg.layer_count = std::numeric_limits<std::size_t>::max();
-    CHECK(metal_kv_cache::make(*context, cfg).error() == kv_cache_errc::layout_size_overflow);
+    check_invalid([](auto& c) { c.layer_count = 0; }, kv_cache_errc::invalid_layer_count);
+    check_invalid([](auto& c) { c.block_count = 0; }, kv_cache_errc::invalid_block_count);
+    check_invalid([](auto& c) { c.block_size = 0; }, kv_cache_errc::invalid_block_size);
+    check_invalid([](auto& c) { c.kv_head_count = 0; }, kv_cache_errc::invalid_kv_head_count);
+    check_invalid([](auto& c) { c.head_dimension = 0; }, kv_cache_errc::invalid_head_dimension);
+    check_invalid([](auto& c) { c.layer_count = std::numeric_limits<std::size_t>::max(); },
+                  kv_cache_errc::layout_size_overflow);
 }
 
-TEST_CASE("metal kv cache flattens coordinates in layout order")
+TEST_CASE("metal kv cache flattens coordinates in layout order and rejects invalid coordinates")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-    auto cache = metal_kv_cache::make(*context, valid_config());
+    const auto& context = metal_test::test_context();
+    auto cache = metal_kv_cache::make(context, valid_config());
     REQUIRE(cache.has_value());
 
     CHECK(cache->element_offset(0, 0, 0, 0, 0) == 0);
@@ -118,14 +91,6 @@ TEST_CASE("metal kv cache flattens coordinates in layout order")
     CHECK(cache->element_offset(0, 1, 0, 0, 0) == 64);
     CHECK(cache->element_offset(1, 0, 0, 0, 0) == 192);
     CHECK(cache->element_offset(1, 2, 3, 1, 7) == 383);
-}
-
-TEST_CASE("metal kv cache rejects invalid coordinates")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-    auto cache = metal_kv_cache::make(*context, valid_config());
-    REQUIRE(cache.has_value());
 
     CHECK(cache->element_offset(2, 0, 0, 0, 0).error() == kv_cache_errc::layer_out_of_range);
     CHECK(cache->element_offset(0, 3, 0, 0, 0).error() == kv_cache_errc::block_out_of_range);
@@ -133,3 +98,4 @@ TEST_CASE("metal kv cache rejects invalid coordinates")
     CHECK(cache->element_offset(0, 0, 0, 2, 0).error() == kv_cache_errc::kv_head_out_of_range);
     CHECK(cache->element_offset(0, 0, 0, 0, 8).error() == kv_cache_errc::head_feature_out_of_range);
 }
+

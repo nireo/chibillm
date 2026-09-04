@@ -37,31 +37,16 @@ TEST_CASE("a sequence owns its prompt and starts waiting")
 
 TEST_CASE("invalid construction arguments return specific errors")
 {
-    auto empty = seq::make(1, {}, sampling_params {}, 16);
-    REQUIRE_FALSE(empty.has_value());
-    CHECK(empty.error() == seq_errc::empty_prompt);
+    CHECK(seq::make(1, {}, sampling_params {}, 16).error() == seq_errc::empty_prompt);
+    CHECK(seq::make(1, { 1 }, sampling_params { .max_new_tokens = 0 }, 16).error()
+          == seq_errc::invalid_max_new_tokens);
+    CHECK(seq::make(1, { 1 }, sampling_params {}, 0).error() == seq_errc::invalid_block_size);
 
-    auto zero_temperature = seq::make(1, { 1 }, sampling_params { .temperature = 0.0f }, 16);
-    REQUIRE_FALSE(zero_temperature.has_value());
-    CHECK(zero_temperature.error() == seq_errc::invalid_temperature);
-
-    auto nan_temperature = seq::make(
-        1, { 1 }, sampling_params { .temperature = std::numeric_limits<float>::quiet_NaN() }, 16);
-    REQUIRE_FALSE(nan_temperature.has_value());
-    CHECK(nan_temperature.error() == seq_errc::invalid_temperature);
-
-    auto infinite_temperature = seq::make(
-        1, { 1 }, sampling_params { .temperature = std::numeric_limits<float>::infinity() }, 16);
-    REQUIRE_FALSE(infinite_temperature.has_value());
-    CHECK(infinite_temperature.error() == seq_errc::invalid_temperature);
-
-    auto zero_output = seq::make(1, { 1 }, sampling_params { .max_new_tokens = 0 }, 16);
-    REQUIRE_FALSE(zero_output.has_value());
-    CHECK(zero_output.error() == seq_errc::invalid_max_new_tokens);
-
-    auto zero_block = seq::make(1, { 1 }, sampling_params {}, 0);
-    REQUIRE_FALSE(zero_block.has_value());
-    CHECK(zero_block.error() == seq_errc::invalid_block_size);
+    for (const auto temp :
+         { 0.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity() }) {
+        CHECK(seq::make(1, { 1 }, sampling_params { .temperature = temp }, 16).error()
+              == seq_errc::invalid_temperature);
+    }
 }
 
 TEST_CASE("prefill and decode maintain the one-token cache gap")

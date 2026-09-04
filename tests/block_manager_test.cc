@@ -50,18 +50,17 @@ TEST_CASE("new block manager starts with every block free")
     }
 }
 
-TEST_CASE("block requirements and capacity are calculated without mutation")
+TEST_CASE("block manager calculates capacity requirements and assigns physical blocks")
 {
     auto manager_result = block_manager::make(4, 2);
     auto sequence_result = seq::make(1, { 1, 2, 3 }, sampling_params {}, 2);
     REQUIRE(manager_result.has_value());
     REQUIRE(sequence_result.has_value());
     auto& manager = *manager_result;
-    const auto& sequence = *sequence_result;
+    auto& sequence = *sequence_result;
 
     auto required = manager.additional_blocks_required(sequence);
     auto can_allocate = manager.can_ensure_capacity(sequence);
-
     REQUIRE(required.has_value());
     REQUIRE(can_allocate.has_value());
     CHECK(*required == 2);
@@ -72,16 +71,6 @@ TEST_CASE("block requirements and capacity are calculated without mutation")
     auto exhausted = block_manager::make(1, 2);
     REQUIRE(exhausted.has_value());
     CHECK(exhausted->can_ensure_capacity(sequence).value() == false);
-}
-
-TEST_CASE("ensure capacity assigns every missing physical block")
-{
-    auto manager_result = block_manager::make(4, 2);
-    auto sequence_result = seq::make(1, { 1, 2, 3 }, sampling_params {}, 2);
-    REQUIRE(manager_result.has_value());
-    REQUIRE(sequence_result.has_value());
-    auto& manager = *manager_result;
-    auto& sequence = *sequence_result;
 
     REQUIRE(manager.ensure_capacity(sequence).has_value());
     REQUIRE(sequence.block_table().size() == 2);
@@ -198,35 +187,25 @@ TEST_CASE("release rejects busy sequences without changing ownership")
     CHECK(manager.used_block_count() == 1);
 }
 
-TEST_CASE("manager rejects incompatible sequence geometry")
+TEST_CASE("block requirements validation rejects incompatible geometry and invalid block IDs")
 {
-    auto manager_result = block_manager::make(4, 4);
-    auto sequence_result = seq::make(1, { 1, 2 }, sampling_params {}, 2);
-    REQUIRE(manager_result.has_value());
-    REQUIRE(sequence_result.has_value());
+    auto manager = block_manager::make(2, 2);
+    REQUIRE(manager.has_value());
 
-    auto required = manager_result->additional_blocks_required(*sequence_result);
-    REQUIRE_FALSE(required.has_value());
-    CHECK(required.error() == block_manager_errc::incompatible_block_size);
-}
+    auto wrong_geometry = seq::make(1, { 1, 2 }, sampling_params {}, 4);
+    REQUIRE(wrong_geometry.has_value());
+    CHECK(manager->additional_blocks_required(*wrong_geometry).error()
+          == block_manager_errc::incompatible_block_size);
 
-TEST_CASE("existing block-table entries must reference live manager blocks")
-{
-    auto manager_result = block_manager::make(2, 2);
-    REQUIRE(manager_result.has_value());
-    auto& manager = *manager_result;
+    auto free_reference = seq::make(1, { 1 }, sampling_params {}, 2);
+    REQUIRE(free_reference.has_value());
+    REQUIRE(free_reference->append_physical_block(0).has_value());
+    CHECK(manager->additional_blocks_required(*free_reference).error()
+          == block_manager_errc::block_not_in_use);
 
-    auto free_reference_result = seq::make(1, { 1 }, sampling_params {}, 2);
-    REQUIRE(free_reference_result.has_value());
-    REQUIRE(free_reference_result->append_physical_block(0).has_value());
-    auto free_reference = manager.additional_blocks_required(*free_reference_result);
-    REQUIRE_FALSE(free_reference.has_value());
-    CHECK(free_reference.error() == block_manager_errc::block_not_in_use);
-
-    auto invalid_reference_result = seq::make(2, { 1 }, sampling_params {}, 2);
-    REQUIRE(invalid_reference_result.has_value());
-    REQUIRE(invalid_reference_result->append_physical_block(99).has_value());
-    auto invalid_reference = manager.additional_blocks_required(*invalid_reference_result);
-    REQUIRE_FALSE(invalid_reference.has_value());
-    CHECK(invalid_reference.error() == block_manager_errc::invalid_block_id);
+    auto invalid_reference = seq::make(2, { 1 }, sampling_params {}, 2);
+    REQUIRE(invalid_reference.has_value());
+    REQUIRE(invalid_reference->append_physical_block(99).has_value());
+    CHECK(manager->additional_blocks_required(*invalid_reference).error()
+          == block_manager_errc::invalid_block_id);
 }

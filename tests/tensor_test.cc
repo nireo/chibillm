@@ -11,11 +11,8 @@
 #include <string>
 #include <type_traits>
 #include <utility>
-#include <vector>
+#include "metal_test_support.h"
 
-#include "metal/metal_tensor.h"
-#include "tensor/bf16.h"
-#include "tensor/dtype.h"
 #include "tensor/tensor_descriptor.h"
 #include "tensor/tensor_shape.h"
 
@@ -27,20 +24,6 @@ using chibillm::metal_tensor;
 using chibillm::tensor_descriptor;
 using chibillm::tensor_errc;
 using chibillm::tensor_shape;
-
-namespace {
-
-std::string
-load_shader_source()
-{
-    std::ifstream input(CHIBILLM_SHADER_PATH);
-    return {
-        std::istreambuf_iterator<char>(input),
-        std::istreambuf_iterator<char>(),
-    };
-}
-
-} // namespace
 
 TEST_CASE("dtype sizes are explicit and invalid values are rejected")
 {
@@ -155,17 +138,15 @@ TEST_CASE("metal tensor allocates exactly the descriptor byte size")
     static_assert(!std::is_copy_constructible_v<metal_tensor>);
     static_assert(std::is_move_constructible_v<metal_tensor>);
 
-    const auto shader_source = load_shader_source();
-    auto context = metal_context::make(shader_source);
-    REQUIRE(context.has_value());
-    CHECK_FALSE(context->device_name().empty());
+    const auto& context = metal_test::test_context();
+    CHECK_FALSE(context.device_name().empty());
 
     auto shape = tensor_shape::make({ 2, 3 });
     REQUIRE(shape.has_value());
     auto descriptor = tensor_descriptor::make(dtype::bf16, std::move(*shape));
     REQUIRE(descriptor.has_value());
 
-    auto tensor = metal_tensor::make(*context, std::move(*descriptor));
+    auto tensor = metal_tensor::make(context, std::move(*descriptor));
     REQUIRE(tensor.has_value());
     CHECK(tensor->descriptor().type() == dtype::bf16);
     CHECK(tensor->descriptor().element_count() == 6);

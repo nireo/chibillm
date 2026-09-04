@@ -11,11 +11,8 @@
 #include <utility>
 #include <vector>
 
-#include "metal/metal_context.h"
+#include "metal_test_support.h"
 #include "metal/metal_kv_cache.h"
-#include "metal/metal_tensor.h"
-#include "tensor/bf16.h"
-#include "tensor/dtype.h"
 #include "tensor/tensor_ops.h"
 
 using chibillm::add;
@@ -34,76 +31,9 @@ using chibillm::rope;
 using chibillm::silu_mul;
 using chibillm::store_kv;
 using chibillm::tensor_op_errc;
+using namespace metal_test;
 
 namespace {
-
-std::string
-load_shader_source()
-{
-    std::ifstream input(CHIBILLM_SHADER_PATH);
-    return {
-        std::istreambuf_iterator<char>(input),
-        std::istreambuf_iterator<char>(),
-    };
-}
-
-metal_tensor
-make_tensor(const metal_context& context, dtype type, std::vector<std::size_t> dimensions)
-{
-    auto tensor = metal_tensor::make(context, type, std::move(dimensions));
-    REQUIRE(tensor.has_value());
-    return std::move(*tensor);
-}
-
-void
-write_floats(metal_tensor& tensor, const std::vector<float>& values)
-{
-    REQUIRE(tensor.descriptor().type() == dtype::f32);
-    REQUIRE(tensor.buffer().size_bytes() == values.size() * sizeof(float));
-    std::memcpy(tensor.buffer().bytes().data(), values.data(), tensor.buffer().size_bytes());
-}
-
-void
-write_bf16(metal_tensor& tensor, const std::vector<float>& values)
-{
-    REQUIRE(tensor.descriptor().type() == dtype::bf16);
-    REQUIRE(tensor.buffer().size_bytes() == values.size() * sizeof(std::uint16_t));
-
-    std::vector<std::uint16_t> bits;
-    bits.reserve(values.size());
-    for (const auto value : values) {
-        bits.push_back(bf16::from_float(value).bits());
-    }
-
-    std::memcpy(tensor.buffer().bytes().data(), bits.data(), tensor.buffer().size_bytes());
-}
-
-void
-write_i32(metal_tensor& tensor, const std::vector<std::int32_t>& values)
-{
-    REQUIRE(tensor.descriptor().type() == dtype::i32);
-    REQUIRE(tensor.buffer().size_bytes() == values.size() * sizeof(std::int32_t));
-    std::memcpy(tensor.buffer().bytes().data(), values.data(), tensor.buffer().size_bytes());
-}
-
-void
-write_u32(metal_tensor& tensor, const std::vector<std::uint32_t>& values)
-{
-    REQUIRE(tensor.descriptor().type() == dtype::u32);
-    REQUIRE(tensor.buffer().size_bytes() == values.size() * sizeof(std::uint32_t));
-    std::memcpy(tensor.buffer().bytes().data(), values.data(), tensor.buffer().size_bytes());
-}
-
-std::vector<float>
-read_floats(const metal_tensor& tensor)
-{
-    REQUIRE(tensor.descriptor().type() == dtype::f32);
-
-    std::vector<float> values(tensor.descriptor().element_count());
-    REQUIRE(tensor.buffer().size_bytes() == values.size() * sizeof(float));
-    std::memcpy(values.data(), tensor.buffer().bytes().data(), tensor.buffer().size_bytes());
-    return values;
-}
 
 metal_kv_cache
 make_kv_cache(const metal_context& context)
@@ -120,20 +50,8 @@ make_kv_cache(const metal_context& context)
     return std::move(*cache);
 }
 
-const metal_context&
-test_context()
-{
-    static const auto context = [] {
-        auto result = metal_context::make(load_shader_source());
-        if (!result) {
-            throw std::runtime_error("failed to create metal context: " + result.error().message);
-        }
-        return std::move(*result);
-    }();
-    return context;
-}
-
 } // namespace
+
 
 TEST_CASE("matmul computes a rectangular matrix product")
 {
@@ -249,26 +167,7 @@ TEST_CASE("linear validates tensor ranks, dtypes, and shapes")
     CHECK(linear(context, valid_in, valid_w, bad_out).error() == tensor_op_errc::output_shape_mismatch);
 }
 
-TEST_CASE("linear preserves signed fractional bf16 weights")
-{
-    const auto* context = &test_context();
-
-    auto input = make_tensor(*context, dtype::f32, { 1, 2 });
-    auto weight = make_tensor(*context, dtype::bf16, { 2, 2 });
-    auto output = make_tensor(*context, dtype::f32, { 1, 2 });
-    write_floats(input, { 1.0F, 2.0F });
-    write_bf16(weight, { 0.5F, -1.25F, -2.0F, 0.25F });
-
-    auto projected = linear(*context, input, weight, output);
-    REQUIRE(projected.has_value());
-
-    const auto values = read_floats(output);
-    REQUIRE(values.size() == 2);
-    CHECK(values[0] == doctest::Approx(-2.0F));
-    CHECK(values[1] == doctest::Approx(-1.5F));
-}
-
-TEST_CASE("linear decode handles a vectorized body and scalar tail")
+TEST_CASE("linear decode handles signed fractional weights with a vectorized body and scalar tail")
 {
     const auto* context = &test_context();
 
@@ -276,12 +175,12 @@ TEST_CASE("linear decode handles a vectorized body and scalar tail")
     auto weight = make_tensor(*context, dtype::bf16, { 2, 5 });
     auto output = make_tensor(*context, dtype::f32, { 1, 2 });
     write_floats(input, { 1.0F, 2.0F, 3.0F, 4.0F, 5.0F });
-    write_bf16(weight, { 1.0F, 1.0F, 1.0F, 1.0F, 1.0F, -1.0F, 2.0F, -3.0F, 4.0F, -5.0F });
+    write_bf16(weight, { 0.5F, -1.25F, 1.0F, 1.0F, 1.0F, -1.0F, 2.0F, -3.0F, 4.0F, -5.0F });
 
     REQUIRE(linear(*context, input, weight, output).has_value());
     const auto values = read_floats(output);
     REQUIRE(values.size() == 2);
-    CHECK(values[0] == doctest::Approx(15.0F));
+    CHECK(values[0] == doctest::Approx(10.0F));
     CHECK(values[1] == doctest::Approx(-15.0F));
 }
 
@@ -427,20 +326,6 @@ TEST_CASE("silu multiply gates the up projection elementwise")
     }
 }
 
-TEST_CASE("silu multiply validates shapes and dtypes")
-{
-    const auto& context = test_context();
-    auto valid = make_tensor(context, dtype::f32, { 2, 2 });
-    auto bad_rank = make_tensor(context, dtype::f32, { 4 });
-    auto bad_dtype = make_tensor(context, dtype::bf16, { 2, 2 });
-    auto bad_shape = make_tensor(context, dtype::f32, { 1, 4 });
-
-    CHECK(silu_mul(context, bad_rank, valid, valid).error() == tensor_op_errc::invalid_rank);
-    CHECK(silu_mul(context, bad_dtype, valid, valid).error() == tensor_op_errc::unsupported_dtype);
-    CHECK(silu_mul(context, valid, bad_shape, valid).error() == tensor_op_errc::input_shape_mismatch);
-    CHECK(silu_mul(context, valid, valid, bad_shape).error() == tensor_op_errc::output_shape_mismatch);
-}
-
 TEST_CASE("add sums corresponding tensor elements")
 {
     const auto& context = test_context();
@@ -462,7 +347,7 @@ TEST_CASE("add sums corresponding tensor elements")
     }
 }
 
-TEST_CASE("add validates shapes and dtypes")
+TEST_CASE("binary elementwise ops validate shapes and dtypes")
 {
     const auto& context = test_context();
     auto valid = make_tensor(context, dtype::f32, { 2, 2 });
@@ -470,10 +355,14 @@ TEST_CASE("add validates shapes and dtypes")
     auto bad_dtype = make_tensor(context, dtype::bf16, { 2, 2 });
     auto bad_shape = make_tensor(context, dtype::f32, { 1, 4 });
 
-    CHECK(add(context, bad_rank, valid, valid).error() == tensor_op_errc::invalid_rank);
-    CHECK(add(context, bad_dtype, valid, valid).error() == tensor_op_errc::unsupported_dtype);
-    CHECK(add(context, valid, bad_shape, valid).error() == tensor_op_errc::input_shape_mismatch);
-    CHECK(add(context, valid, valid, bad_shape).error() == tensor_op_errc::output_shape_mismatch);
+    auto test_validation = [&](auto op) {
+        CHECK(op(context, bad_rank, valid, valid).error() == tensor_op_errc::invalid_rank);
+        CHECK(op(context, bad_dtype, valid, valid).error() == tensor_op_errc::unsupported_dtype);
+        CHECK(op(context, valid, bad_shape, valid).error() == tensor_op_errc::input_shape_mismatch);
+        CHECK(op(context, valid, valid, bad_shape).error() == tensor_op_errc::output_shape_mismatch);
+    };
+    test_validation(silu_mul);
+    test_validation(add);
 }
 
 TEST_CASE("rope rotates split-half feature pairs for every head")

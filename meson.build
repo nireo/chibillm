@@ -230,12 +230,14 @@ chibillm_qwen_tokenizer_tests = executable(
 
 test('chibillm qwen tokenizer tests', chibillm_qwen_tokenizer_tests)
 
+tests_include = include_directories('tests')
+
 chibillm_safetensors_tests = executable(
   'chibillm_safetensors_tests',
   'tests/safetensors_test.cc',
   include_directories: [
     src_include,
-    include_directories('tests'),
+    tests_include,
   ],
   dependencies: [
     doctest_dep,
@@ -257,7 +259,7 @@ chibillm_qwen_weights_tests = executable(
   'tests/qwen_weights_test.cc',
   include_directories: [
     src_include,
-    include_directories('tests'),
+    tests_include,
   ],
   cpp_args: [
     '-DCHIBILLM_SHADER_PATH="' + metal_shader_path + '"',
@@ -283,7 +285,10 @@ test('chibillm qwen weights tests', chibillm_qwen_weights_tests)
 chibillm_kv_cache_tests = executable(
   'chibillm_kv_cache_tests',
   'tests/metal_kv_cache_test.cc',
-  include_directories: src_include,
+  include_directories: [
+    src_include,
+    tests_include,
+  ],
   cpp_args: [
     '-DCHIBILLM_SHADER_PATH="' + metal_shader_path + '"',
   ],
@@ -303,7 +308,10 @@ test('chibillm kv cache tests', chibillm_kv_cache_tests)
 chibillm_tensor_tests = executable(
   'chibillm_tensor_tests',
   'tests/tensor_test.cc',
-  include_directories: src_include,
+  include_directories: [
+    src_include,
+    tests_include,
+  ],
   cpp_args: [
     '-DCHIBILLM_SHADER_PATH="' + metal_shader_path + '"',
   ],
@@ -323,7 +331,10 @@ test('chibillm tensor tests', chibillm_tensor_tests)
 chibillm_tensor_ops_tests = executable(
   'chibillm_tensor_ops_tests',
   'tests/tensor_ops_test.cc',
-  include_directories: src_include,
+  include_directories: [
+    src_include,
+    tests_include,
+  ],
   cpp_args: [
     '-DCHIBILLM_SHADER_PATH="' + metal_shader_path + '"',
   ],
