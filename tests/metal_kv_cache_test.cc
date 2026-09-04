@@ -74,67 +74,34 @@ TEST_CASE("metal kv cache allocates matching key and value tensors")
     CHECK(dimensions[4] == 8);
 }
 
-TEST_CASE("metal kv cache rejects zero dimensions")
+TEST_CASE("metal kv cache rejects zero and overflowing dimensions")
 {
     auto context = metal_context::make(load_shader_source());
     REQUIRE(context.has_value());
 
-    SUBCASE("layers")
-    {
-        auto config = valid_config();
-        config.layer_count = 0;
-        auto cache = metal_kv_cache::make(*context, config);
-        REQUIRE_FALSE(cache.has_value());
-        CHECK(cache.error() == kv_cache_errc::invalid_layer_count);
-    }
+    auto cfg = valid_config();
+    cfg.layer_count = 0;
+    CHECK(metal_kv_cache::make(*context, cfg).error() == kv_cache_errc::invalid_layer_count);
 
-    SUBCASE("blocks")
-    {
-        auto config = valid_config();
-        config.block_count = 0;
-        auto cache = metal_kv_cache::make(*context, config);
-        REQUIRE_FALSE(cache.has_value());
-        CHECK(cache.error() == kv_cache_errc::invalid_block_count);
-    }
+    cfg = valid_config();
+    cfg.block_count = 0;
+    CHECK(metal_kv_cache::make(*context, cfg).error() == kv_cache_errc::invalid_block_count);
 
-    SUBCASE("block size")
-    {
-        auto config = valid_config();
-        config.block_size = 0;
-        auto cache = metal_kv_cache::make(*context, config);
-        REQUIRE_FALSE(cache.has_value());
-        CHECK(cache.error() == kv_cache_errc::invalid_block_size);
-    }
+    cfg = valid_config();
+    cfg.block_size = 0;
+    CHECK(metal_kv_cache::make(*context, cfg).error() == kv_cache_errc::invalid_block_size);
 
-    SUBCASE("kv heads")
-    {
-        auto config = valid_config();
-        config.kv_head_count = 0;
-        auto cache = metal_kv_cache::make(*context, config);
-        REQUIRE_FALSE(cache.has_value());
-        CHECK(cache.error() == kv_cache_errc::invalid_kv_head_count);
-    }
+    cfg = valid_config();
+    cfg.kv_head_count = 0;
+    CHECK(metal_kv_cache::make(*context, cfg).error() == kv_cache_errc::invalid_kv_head_count);
 
-    SUBCASE("head dimension")
-    {
-        auto config = valid_config();
-        config.head_dimension = 0;
-        auto cache = metal_kv_cache::make(*context, config);
-        REQUIRE_FALSE(cache.has_value());
-        CHECK(cache.error() == kv_cache_errc::invalid_head_dimension);
-    }
-}
+    cfg = valid_config();
+    cfg.head_dimension = 0;
+    CHECK(metal_kv_cache::make(*context, cfg).error() == kv_cache_errc::invalid_head_dimension);
 
-TEST_CASE("metal kv cache rejects an overflowing layout")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto config = valid_config();
-    config.layer_count = std::numeric_limits<std::size_t>::max();
-    auto cache = metal_kv_cache::make(*context, config);
-    REQUIRE_FALSE(cache.has_value());
-    CHECK(cache.error() == kv_cache_errc::layout_size_overflow);
+    cfg = valid_config();
+    cfg.layer_count = std::numeric_limits<std::size_t>::max();
+    CHECK(metal_kv_cache::make(*context, cfg).error() == kv_cache_errc::layout_size_overflow);
 }
 
 TEST_CASE("metal kv cache flattens coordinates in layout order")

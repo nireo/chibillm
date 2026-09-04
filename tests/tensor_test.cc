@@ -158,6 +158,7 @@ TEST_CASE("metal tensor allocates exactly the descriptor byte size")
     const auto shader_source = load_shader_source();
     auto context = metal_context::make(shader_source);
     REQUIRE(context.has_value());
+    CHECK_FALSE(context->device_name().empty());
 
     auto shape = tensor_shape::make({ 2, 3 });
     REQUIRE(shape.has_value());

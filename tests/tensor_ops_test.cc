@@ -120,21 +120,33 @@ make_kv_cache(const metal_context& context)
     return std::move(*cache);
 }
 
+const metal_context&
+test_context()
+{
+    static const auto context = [] {
+        auto result = metal_context::make(load_shader_source());
+        if (!result) {
+            throw std::runtime_error("failed to create metal context: " + result.error().message);
+        }
+        return std::move(*result);
+    }();
+    return context;
+}
+
 } // namespace
 
 TEST_CASE("matmul computes a rectangular matrix product")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto& context = test_context();
 
-    auto lhs = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto rhs = make_tensor(*context, dtype::f32, { 3, 4 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 4 });
+    auto lhs = make_tensor(context, dtype::f32, { 2, 3 });
+    auto rhs = make_tensor(context, dtype::f32, { 3, 4 });
+    auto output = make_tensor(context, dtype::f32, { 2, 4 });
     write_floats(lhs, { 1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F });
     write_floats(rhs,
                  { 1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F, 9.0F, 10.0F, 11.0F, 12.0F });
 
-    auto multiplied = matmul(*context, lhs, rhs, output);
+    auto multiplied = matmul(context, lhs, rhs, output);
     REQUIRE(multiplied.has_value());
 
     const auto values = read_floats(output);
@@ -149,69 +161,9 @@ TEST_CASE("matmul computes a rectangular matrix product")
     CHECK(values[7] == doctest::Approx(128.0F));
 }
 
-TEST_CASE("matmul requires rank-two tensors")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto lhs = make_tensor(*context, dtype::f32, { 6 });
-    auto rhs = make_tensor(*context, dtype::f32, { 3, 2 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 2 });
-
-    auto multiplied = matmul(*context, lhs, rhs, output);
-    REQUIRE_FALSE(multiplied.has_value());
-    CHECK(multiplied.error() == tensor_op_errc::invalid_rank);
-}
-
-TEST_CASE("matmul initially supports only f32 tensors")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto lhs = make_tensor(*context, dtype::bf16, { 2, 3 });
-    auto rhs = make_tensor(*context, dtype::f32, { 3, 2 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 2 });
-
-    auto multiplied = matmul(*context, lhs, rhs, output);
-    REQUIRE_FALSE(multiplied.has_value());
-    CHECK(multiplied.error() == tensor_op_errc::unsupported_dtype);
-}
-
-TEST_CASE("matmul requires matching inner dimensions")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto lhs = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto rhs = make_tensor(*context, dtype::f32, { 4, 2 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 2 });
-
-    auto multiplied = matmul(*context, lhs, rhs, output);
-    REQUIRE_FALSE(multiplied.has_value());
-    CHECK(multiplied.error() == tensor_op_errc::inner_dimension_mismatch);
-}
-
-TEST_CASE("matmul requires the exact output shape")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto lhs = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto rhs = make_tensor(*context, dtype::f32, { 3, 2 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 3 });
-
-    auto multiplied = matmul(*context, lhs, rhs, output);
-    REQUIRE_FALSE(multiplied.has_value());
-    CHECK(multiplied.error() == tensor_op_errc::output_shape_mismatch);
-}
-
 TEST_CASE("linear projects f32 input with row-major bf16 weights")
 {
-    auto context = metal_context::make(load_shader_source());
-    if (!context) {
-        MESSAGE(context.error().message);
-    }
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
 
     auto input = make_tensor(*context, dtype::f32, { 2, 3 });
     auto weight = make_tensor(*context, dtype::bf16, { 4, 3 });
@@ -237,8 +189,7 @@ TEST_CASE("linear projects f32 input with row-major bf16 weights")
 
 TEST_CASE("linear add fuses decode residuals and supports prefill rows")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
 
     auto weight = make_tensor(*context, dtype::bf16, { 4, 3 });
     write_bf16(weight,
@@ -261,77 +212,46 @@ TEST_CASE("linear add fuses decode residuals and supports prefill rows")
     auto prefill_residual = make_tensor(*context, dtype::f32, { 2, 4 });
     auto prefill_output = make_tensor(*context, dtype::f32, { 2, 4 });
     write_floats(prefill_input, { 1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F });
-    write_floats(prefill_residual, { 1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F });
+    write_floats(prefill_residual,
+                 { 10.0F, 20.0F, 30.0F, 40.0F, 100.0F, 200.0F, 300.0F, 400.0F });
     REQUIRE(
         linear_add(*context, prefill_input, weight, prefill_residual, prefill_output).has_value());
     const auto prefill_values = read_floats(prefill_output);
-    const std::vector<float> expected { 39.0F, 46.0F, 53.0F, 60.0F, 88.0F, 104.0F, 120.0F, 136.0F };
-    REQUIRE(prefill_values.size() == expected.size());
-    for (std::size_t index = 0; index < expected.size(); ++index) {
-        CHECK(prefill_values[index] == doctest::Approx(expected[index]));
-    }
+    REQUIRE(prefill_values.size() == 8);
+    CHECK(prefill_values[0] == doctest::Approx(48.0F));
+    CHECK(prefill_values[1] == doctest::Approx(64.0F));
+    CHECK(prefill_values[2] == doctest::Approx(80.0F));
+    CHECK(prefill_values[3] == doctest::Approx(96.0F));
+    CHECK(prefill_values[4] == doctest::Approx(183.0F));
+    CHECK(prefill_values[5] == doctest::Approx(298.0F));
+    CHECK(prefill_values[6] == doctest::Approx(413.0F));
+    CHECK(prefill_values[7] == doctest::Approx(528.0F));
 }
 
-TEST_CASE("linear requires rank-two tensors")
+TEST_CASE("linear validates tensor ranks, dtypes, and shapes")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto& context = test_context();
 
-    auto input = make_tensor(*context, dtype::f32, { 6 });
-    auto weight = make_tensor(*context, dtype::bf16, { 4, 3 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 4 });
+    auto valid_in = make_tensor(context, dtype::f32, { 2, 3 });
+    auto valid_w = make_tensor(context, dtype::bf16, { 4, 3 });
+    auto valid_out = make_tensor(context, dtype::f32, { 2, 4 });
 
-    auto projected = linear(*context, input, weight, output);
-    REQUIRE_FALSE(projected.has_value());
-    CHECK(projected.error() == tensor_op_errc::invalid_rank);
-}
+    auto bad_rank = make_tensor(context, dtype::f32, { 6 });
+    CHECK(linear(context, bad_rank, valid_w, valid_out).error() == tensor_op_errc::invalid_rank);
 
-TEST_CASE("linear requires f32 input and output with bf16 weights")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    auto bad_dtype = make_tensor(context, dtype::f32, { 4, 3 });
+    CHECK(linear(context, valid_in, bad_dtype, valid_out).error() == tensor_op_errc::unsupported_dtype);
 
-    auto input = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto weight = make_tensor(*context, dtype::f32, { 4, 3 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 4 });
+    auto bad_dim = make_tensor(context, dtype::bf16, { 4, 2 });
+    CHECK(linear(context, valid_in, bad_dim, valid_out).error() == tensor_op_errc::inner_dimension_mismatch);
 
-    auto projected = linear(*context, input, weight, output);
-    REQUIRE_FALSE(projected.has_value());
-    CHECK(projected.error() == tensor_op_errc::unsupported_dtype);
-}
-
-TEST_CASE("linear requires matching input feature dimensions")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto input = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto weight = make_tensor(*context, dtype::bf16, { 4, 2 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 4 });
-
-    auto projected = linear(*context, input, weight, output);
-    REQUIRE_FALSE(projected.has_value());
-    CHECK(projected.error() == tensor_op_errc::inner_dimension_mismatch);
-}
-
-TEST_CASE("linear requires output to match rows and output features")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto input = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto weight = make_tensor(*context, dtype::bf16, { 4, 3 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 3 });
-
-    auto projected = linear(*context, input, weight, output);
-    REQUIRE_FALSE(projected.has_value());
-    CHECK(projected.error() == tensor_op_errc::output_shape_mismatch);
+    auto bad_out = make_tensor(context, dtype::f32, { 2, 3 });
+    CHECK(linear(context, valid_in, valid_w, bad_out).error() == tensor_op_errc::output_shape_mismatch);
 }
 
 TEST_CASE("linear preserves signed fractional bf16 weights")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
 
     auto input = make_tensor(*context, dtype::f32, { 1, 2 });
     auto weight = make_tensor(*context, dtype::bf16, { 2, 2 });
@@ -350,8 +270,7 @@ TEST_CASE("linear preserves signed fractional bf16 weights")
 
 TEST_CASE("linear decode handles a vectorized body and scalar tail")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
 
     auto input = make_tensor(*context, dtype::f32, { 1, 5 });
     auto weight = make_tensor(*context, dtype::bf16, { 2, 5 });
@@ -368,8 +287,7 @@ TEST_CASE("linear decode handles a vectorized body and scalar tail")
 
 TEST_CASE("linear split projects multiple rows into separate outputs")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
 
     auto input = make_tensor(*context, dtype::f32, { 2, 4 });
     auto weight = make_tensor(*context, dtype::bf16, { 5, 4 });
@@ -393,8 +311,7 @@ TEST_CASE("linear split projects multiple rows into separate outputs")
 
 TEST_CASE("embedding lookup gathers token rows in input order")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
 
     auto token_ids = make_tensor(*context, dtype::i32, { 2 });
     auto weight = make_tensor(*context, dtype::bf16, { 3, 4 });
@@ -416,146 +333,36 @@ TEST_CASE("embedding lookup gathers token rows in input order")
     }
 }
 
-TEST_CASE("embedding lookup requires rank-one ids and rank-two matrices")
+TEST_CASE("embedding lookup validates inputs and bounds")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto& context = test_context();
 
-    SUBCASE("token ids")
-    {
-        auto token_ids = make_tensor(*context, dtype::i32, { 1, 2 });
-        auto weight = make_tensor(*context, dtype::bf16, { 3, 4 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 4 });
+    auto valid_ids = make_tensor(context, dtype::i32, { 2 });
+    auto valid_w = make_tensor(context, dtype::bf16, { 3, 4 });
+    auto valid_out = make_tensor(context, dtype::f32, { 2, 4 });
 
-        auto gathered = embedding_lookup(*context, token_ids, weight, output);
-        REQUIRE_FALSE(gathered.has_value());
-        CHECK(gathered.error() == tensor_op_errc::invalid_rank);
-    }
+    auto bad_id_rank = make_tensor(context, dtype::i32, { 1, 2 });
+    CHECK(embedding_lookup(context, bad_id_rank, valid_w, valid_out).error() == tensor_op_errc::invalid_rank);
 
-    SUBCASE("weight")
-    {
-        auto token_ids = make_tensor(*context, dtype::i32, { 2 });
-        auto weight = make_tensor(*context, dtype::bf16, { 12 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 4 });
+    auto bad_id_dtype = make_tensor(context, dtype::f32, { 2 });
+    CHECK(embedding_lookup(context, bad_id_dtype, valid_w, valid_out).error() == tensor_op_errc::unsupported_dtype);
 
-        auto gathered = embedding_lookup(*context, token_ids, weight, output);
-        REQUIRE_FALSE(gathered.has_value());
-        CHECK(gathered.error() == tensor_op_errc::invalid_rank);
-    }
+    auto bad_w_dtype = make_tensor(context, dtype::f32, { 3, 4 });
+    CHECK(embedding_lookup(context, valid_ids, bad_w_dtype, valid_out).error() == tensor_op_errc::unsupported_dtype);
 
-    SUBCASE("output")
-    {
-        auto token_ids = make_tensor(*context, dtype::i32, { 2 });
-        auto weight = make_tensor(*context, dtype::bf16, { 3, 4 });
-        auto output = make_tensor(*context, dtype::f32, { 8 });
+    auto bad_out_shape = make_tensor(context, dtype::f32, { 1, 4 });
+    CHECK(embedding_lookup(context, valid_ids, valid_w, bad_out_shape).error() == tensor_op_errc::output_shape_mismatch);
 
-        auto gathered = embedding_lookup(*context, token_ids, weight, output);
-        REQUIRE_FALSE(gathered.has_value());
-        CHECK(gathered.error() == tensor_op_errc::invalid_rank);
-    }
-}
+    write_i32(valid_ids, { 0, -1 });
+    CHECK(embedding_lookup(context, valid_ids, valid_w, valid_out).error() == tensor_op_errc::token_out_of_range);
 
-TEST_CASE("embedding lookup requires i32 ids bf16 weights and f32 output")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    SUBCASE("token ids")
-    {
-        auto token_ids = make_tensor(*context, dtype::f32, { 2 });
-        auto weight = make_tensor(*context, dtype::bf16, { 3, 4 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 4 });
-
-        auto gathered = embedding_lookup(*context, token_ids, weight, output);
-        REQUIRE_FALSE(gathered.has_value());
-        CHECK(gathered.error() == tensor_op_errc::unsupported_dtype);
-    }
-
-    SUBCASE("weight")
-    {
-        auto token_ids = make_tensor(*context, dtype::i32, { 2 });
-        auto weight = make_tensor(*context, dtype::f32, { 3, 4 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 4 });
-
-        auto gathered = embedding_lookup(*context, token_ids, weight, output);
-        REQUIRE_FALSE(gathered.has_value());
-        CHECK(gathered.error() == tensor_op_errc::unsupported_dtype);
-    }
-
-    SUBCASE("output")
-    {
-        auto token_ids = make_tensor(*context, dtype::i32, { 2 });
-        auto weight = make_tensor(*context, dtype::bf16, { 3, 4 });
-        auto output = make_tensor(*context, dtype::bf16, { 2, 4 });
-
-        auto gathered = embedding_lookup(*context, token_ids, weight, output);
-        REQUIRE_FALSE(gathered.has_value());
-        CHECK(gathered.error() == tensor_op_errc::unsupported_dtype);
-    }
-}
-
-TEST_CASE("embedding lookup requires an exact output shape")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    SUBCASE("token count")
-    {
-        auto token_ids = make_tensor(*context, dtype::i32, { 2 });
-        auto weight = make_tensor(*context, dtype::bf16, { 3, 4 });
-        auto output = make_tensor(*context, dtype::f32, { 1, 4 });
-
-        auto gathered = embedding_lookup(*context, token_ids, weight, output);
-        REQUIRE_FALSE(gathered.has_value());
-        CHECK(gathered.error() == tensor_op_errc::output_shape_mismatch);
-    }
-
-    SUBCASE("hidden size")
-    {
-        auto token_ids = make_tensor(*context, dtype::i32, { 2 });
-        auto weight = make_tensor(*context, dtype::bf16, { 3, 4 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 3 });
-
-        auto gathered = embedding_lookup(*context, token_ids, weight, output);
-        REQUIRE_FALSE(gathered.has_value());
-        CHECK(gathered.error() == tensor_op_errc::output_shape_mismatch);
-    }
-}
-
-TEST_CASE("embedding lookup rejects negative token ids")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto token_ids = make_tensor(*context, dtype::i32, { 2 });
-    auto weight = make_tensor(*context, dtype::bf16, { 3, 4 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 4 });
-    write_i32(token_ids, { 0, -1 });
-
-    auto gathered = embedding_lookup(*context, token_ids, weight, output);
-    REQUIRE_FALSE(gathered.has_value());
-    CHECK(gathered.error() == tensor_op_errc::token_out_of_range);
-}
-
-TEST_CASE("embedding lookup rejects token ids beyond the vocabulary")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto token_ids = make_tensor(*context, dtype::i32, { 2 });
-    auto weight = make_tensor(*context, dtype::bf16, { 3, 4 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 4 });
-    write_i32(token_ids, { 0, 3 });
-
-    auto gathered = embedding_lookup(*context, token_ids, weight, output);
-    REQUIRE_FALSE(gathered.has_value());
-    CHECK(gathered.error() == tensor_op_errc::token_out_of_range);
+    write_i32(valid_ids, { 0, 3 });
+    CHECK(embedding_lookup(context, valid_ids, valid_w, valid_out).error() == tensor_op_errc::token_out_of_range);
 }
 
 TEST_CASE("rms norm normalizes and scales each row independently")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
 
     auto input = make_tensor(*context, dtype::f32, { 2, 3 });
     auto weight = make_tensor(*context, dtype::bf16, { 3 });
@@ -574,153 +381,34 @@ TEST_CASE("rms norm normalizes and scales each row independently")
     }
 }
 
-TEST_CASE("rms norm requires rank-two activations and a rank-one weight")
+TEST_CASE("rms norm validates inputs, shapes, and epsilon")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto& context = test_context();
 
-    SUBCASE("input")
-    {
-        auto input = make_tensor(*context, dtype::f32, { 6 });
-        auto weight = make_tensor(*context, dtype::bf16, { 3 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto valid_in = make_tensor(context, dtype::f32, { 2, 3 });
+    auto valid_w = make_tensor(context, dtype::bf16, { 3 });
+    auto valid_out = make_tensor(context, dtype::f32, { 2, 3 });
 
-        auto normalized = rms_norm(*context, input, weight, 1.0F, output);
-        REQUIRE_FALSE(normalized.has_value());
-        CHECK(normalized.error() == tensor_op_errc::invalid_rank);
-    }
+    auto bad_rank = make_tensor(context, dtype::f32, { 6 });
+    CHECK(rms_norm(context, bad_rank, valid_w, 1.0F, valid_out).error() == tensor_op_errc::invalid_rank);
 
-    SUBCASE("weight")
-    {
-        auto input = make_tensor(*context, dtype::f32, { 2, 3 });
-        auto weight = make_tensor(*context, dtype::bf16, { 1, 3 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto bad_dtype = make_tensor(context, dtype::bf16, { 2, 3 });
+    CHECK(rms_norm(context, bad_dtype, valid_w, 1.0F, valid_out).error() == tensor_op_errc::unsupported_dtype);
 
-        auto normalized = rms_norm(*context, input, weight, 1.0F, output);
-        REQUIRE_FALSE(normalized.has_value());
-        CHECK(normalized.error() == tensor_op_errc::invalid_rank);
-    }
+    auto bad_w_dim = make_tensor(context, dtype::bf16, { 4 });
+    CHECK(rms_norm(context, valid_in, bad_w_dim, 1.0F, valid_out).error() == tensor_op_errc::inner_dimension_mismatch);
 
-    SUBCASE("output")
-    {
-        auto input = make_tensor(*context, dtype::f32, { 2, 3 });
-        auto weight = make_tensor(*context, dtype::bf16, { 3 });
-        auto output = make_tensor(*context, dtype::f32, { 6 });
+    auto bad_out_shape = make_tensor(context, dtype::f32, { 1, 3 });
+    CHECK(rms_norm(context, valid_in, valid_w, 1.0F, bad_out_shape).error() == tensor_op_errc::output_shape_mismatch);
 
-        auto normalized = rms_norm(*context, input, weight, 1.0F, output);
-        REQUIRE_FALSE(normalized.has_value());
-        CHECK(normalized.error() == tensor_op_errc::invalid_rank);
-    }
-}
-
-TEST_CASE("rms norm requires f32 activations and a bf16 weight")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    SUBCASE("input")
-    {
-        auto input = make_tensor(*context, dtype::bf16, { 2, 3 });
-        auto weight = make_tensor(*context, dtype::bf16, { 3 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 3 });
-
-        auto normalized = rms_norm(*context, input, weight, 1.0F, output);
-        REQUIRE_FALSE(normalized.has_value());
-        CHECK(normalized.error() == tensor_op_errc::unsupported_dtype);
-    }
-
-    SUBCASE("weight")
-    {
-        auto input = make_tensor(*context, dtype::f32, { 2, 3 });
-        auto weight = make_tensor(*context, dtype::f32, { 3 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 3 });
-
-        auto normalized = rms_norm(*context, input, weight, 1.0F, output);
-        REQUIRE_FALSE(normalized.has_value());
-        CHECK(normalized.error() == tensor_op_errc::unsupported_dtype);
-    }
-
-    SUBCASE("output")
-    {
-        auto input = make_tensor(*context, dtype::f32, { 2, 3 });
-        auto weight = make_tensor(*context, dtype::bf16, { 3 });
-        auto output = make_tensor(*context, dtype::bf16, { 2, 3 });
-
-        auto normalized = rms_norm(*context, input, weight, 1.0F, output);
-        REQUIRE_FALSE(normalized.has_value());
-        CHECK(normalized.error() == tensor_op_errc::unsupported_dtype);
-    }
-}
-
-TEST_CASE("rms norm requires the weight to match the hidden size")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto input = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto weight = make_tensor(*context, dtype::bf16, { 4 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 3 });
-
-    auto normalized = rms_norm(*context, input, weight, 1.0F, output);
-    REQUIRE_FALSE(normalized.has_value());
-    CHECK(normalized.error() == tensor_op_errc::inner_dimension_mismatch);
-}
-
-TEST_CASE("rms norm requires output to match the input shape")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    SUBCASE("row count")
-    {
-        auto input = make_tensor(*context, dtype::f32, { 2, 3 });
-        auto weight = make_tensor(*context, dtype::bf16, { 3 });
-        auto output = make_tensor(*context, dtype::f32, { 1, 3 });
-
-        auto normalized = rms_norm(*context, input, weight, 1.0F, output);
-        REQUIRE_FALSE(normalized.has_value());
-        CHECK(normalized.error() == tensor_op_errc::output_shape_mismatch);
-    }
-
-    SUBCASE("hidden size")
-    {
-        auto input = make_tensor(*context, dtype::f32, { 2, 3 });
-        auto weight = make_tensor(*context, dtype::bf16, { 3 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 4 });
-
-        auto normalized = rms_norm(*context, input, weight, 1.0F, output);
-        REQUIRE_FALSE(normalized.has_value());
-        CHECK(normalized.error() == tensor_op_errc::output_shape_mismatch);
-    }
-}
-
-TEST_CASE("rms norm requires a positive finite epsilon")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto input = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto weight = make_tensor(*context, dtype::bf16, { 3 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 3 });
-
-    const std::vector<float> invalid_values {
-        0.0F,
-        -1.0F,
-        std::numeric_limits<float>::infinity(),
-        std::numeric_limits<float>::quiet_NaN(),
-    };
-
-    for (const auto epsilon : invalid_values) {
-        auto normalized = rms_norm(*context, input, weight, epsilon, output);
-        REQUIRE_FALSE(normalized.has_value());
-        CHECK(normalized.error() == tensor_op_errc::invalid_epsilon);
+    for (const auto epsilon : { 0.0F, -1.0F, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN() }) {
+        CHECK(rms_norm(context, valid_in, valid_w, epsilon, valid_out).error() == tensor_op_errc::invalid_epsilon);
     }
 }
 
 TEST_CASE("silu multiply gates the up projection elementwise")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
 
     auto gate = make_tensor(*context, dtype::f32, { 2, 2 });
     auto up = make_tensor(*context, dtype::f32, { 2, 2 });
@@ -739,124 +427,31 @@ TEST_CASE("silu multiply gates the up projection elementwise")
     }
 }
 
-TEST_CASE("silu multiply requires rank-two tensors")
+TEST_CASE("silu multiply validates shapes and dtypes")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto& context = test_context();
+    auto valid = make_tensor(context, dtype::f32, { 2, 2 });
+    auto bad_rank = make_tensor(context, dtype::f32, { 4 });
+    auto bad_dtype = make_tensor(context, dtype::bf16, { 2, 2 });
+    auto bad_shape = make_tensor(context, dtype::f32, { 1, 4 });
 
-    SUBCASE("gate")
-    {
-        auto gate = make_tensor(*context, dtype::f32, { 4 });
-        auto up = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 2 });
-
-        auto activated = silu_mul(*context, gate, up, output);
-        REQUIRE_FALSE(activated.has_value());
-        CHECK(activated.error() == tensor_op_errc::invalid_rank);
-    }
-
-    SUBCASE("up")
-    {
-        auto gate = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto up = make_tensor(*context, dtype::f32, { 4 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 2 });
-
-        auto activated = silu_mul(*context, gate, up, output);
-        REQUIRE_FALSE(activated.has_value());
-        CHECK(activated.error() == tensor_op_errc::invalid_rank);
-    }
-
-    SUBCASE("output")
-    {
-        auto gate = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto up = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto output = make_tensor(*context, dtype::f32, { 4 });
-
-        auto activated = silu_mul(*context, gate, up, output);
-        REQUIRE_FALSE(activated.has_value());
-        CHECK(activated.error() == tensor_op_errc::invalid_rank);
-    }
-}
-
-TEST_CASE("silu multiply requires f32 tensors")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    SUBCASE("gate")
-    {
-        auto gate = make_tensor(*context, dtype::bf16, { 2, 2 });
-        auto up = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 2 });
-
-        auto activated = silu_mul(*context, gate, up, output);
-        REQUIRE_FALSE(activated.has_value());
-        CHECK(activated.error() == tensor_op_errc::unsupported_dtype);
-    }
-
-    SUBCASE("up")
-    {
-        auto gate = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto up = make_tensor(*context, dtype::bf16, { 2, 2 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 2 });
-
-        auto activated = silu_mul(*context, gate, up, output);
-        REQUIRE_FALSE(activated.has_value());
-        CHECK(activated.error() == tensor_op_errc::unsupported_dtype);
-    }
-
-    SUBCASE("output")
-    {
-        auto gate = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto up = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto output = make_tensor(*context, dtype::bf16, { 2, 2 });
-
-        auto activated = silu_mul(*context, gate, up, output);
-        REQUIRE_FALSE(activated.has_value());
-        CHECK(activated.error() == tensor_op_errc::unsupported_dtype);
-    }
-}
-
-TEST_CASE("silu multiply requires matching input shapes")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto gate = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto up = make_tensor(*context, dtype::f32, { 3, 2 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 3 });
-
-    auto activated = silu_mul(*context, gate, up, output);
-    REQUIRE_FALSE(activated.has_value());
-    CHECK(activated.error() == tensor_op_errc::input_shape_mismatch);
-}
-
-TEST_CASE("silu multiply requires output to match the inputs")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto gate = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto up = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto output = make_tensor(*context, dtype::f32, { 3, 2 });
-
-    auto activated = silu_mul(*context, gate, up, output);
-    REQUIRE_FALSE(activated.has_value());
-    CHECK(activated.error() == tensor_op_errc::output_shape_mismatch);
+    CHECK(silu_mul(context, bad_rank, valid, valid).error() == tensor_op_errc::invalid_rank);
+    CHECK(silu_mul(context, bad_dtype, valid, valid).error() == tensor_op_errc::unsupported_dtype);
+    CHECK(silu_mul(context, valid, bad_shape, valid).error() == tensor_op_errc::input_shape_mismatch);
+    CHECK(silu_mul(context, valid, valid, bad_shape).error() == tensor_op_errc::output_shape_mismatch);
 }
 
 TEST_CASE("add sums corresponding tensor elements")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto& context = test_context();
 
-    auto lhs = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto rhs = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 3 });
+    auto lhs = make_tensor(context, dtype::f32, { 2, 3 });
+    auto rhs = make_tensor(context, dtype::f32, { 2, 3 });
+    auto output = make_tensor(context, dtype::f32, { 2, 3 });
     write_floats(lhs, { 1.0F, -2.0F, 0.5F, 4.0F, -1.25F, 10.0F });
     write_floats(rhs, { 2.0F, 3.0F, -0.5F, -4.0F, 1.0F, -2.0F });
 
-    auto added = add(*context, lhs, rhs, output);
+    auto added = add(context, lhs, rhs, output);
     REQUIRE(added.has_value());
 
     const auto values = read_floats(output);
@@ -867,116 +462,23 @@ TEST_CASE("add sums corresponding tensor elements")
     }
 }
 
-TEST_CASE("add requires rank-two tensors")
+TEST_CASE("add validates shapes and dtypes")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto& context = test_context();
+    auto valid = make_tensor(context, dtype::f32, { 2, 2 });
+    auto bad_rank = make_tensor(context, dtype::f32, { 4 });
+    auto bad_dtype = make_tensor(context, dtype::bf16, { 2, 2 });
+    auto bad_shape = make_tensor(context, dtype::f32, { 1, 4 });
 
-    SUBCASE("lhs")
-    {
-        auto lhs = make_tensor(*context, dtype::f32, { 4 });
-        auto rhs = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 2 });
-
-        auto added = add(*context, lhs, rhs, output);
-        REQUIRE_FALSE(added.has_value());
-        CHECK(added.error() == tensor_op_errc::invalid_rank);
-    }
-
-    SUBCASE("rhs")
-    {
-        auto lhs = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto rhs = make_tensor(*context, dtype::f32, { 4 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 2 });
-
-        auto added = add(*context, lhs, rhs, output);
-        REQUIRE_FALSE(added.has_value());
-        CHECK(added.error() == tensor_op_errc::invalid_rank);
-    }
-
-    SUBCASE("output")
-    {
-        auto lhs = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto rhs = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto output = make_tensor(*context, dtype::f32, { 4 });
-
-        auto added = add(*context, lhs, rhs, output);
-        REQUIRE_FALSE(added.has_value());
-        CHECK(added.error() == tensor_op_errc::invalid_rank);
-    }
-}
-
-TEST_CASE("add requires f32 tensors")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    SUBCASE("lhs")
-    {
-        auto lhs = make_tensor(*context, dtype::bf16, { 2, 2 });
-        auto rhs = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 2 });
-
-        auto added = add(*context, lhs, rhs, output);
-        REQUIRE_FALSE(added.has_value());
-        CHECK(added.error() == tensor_op_errc::unsupported_dtype);
-    }
-
-    SUBCASE("rhs")
-    {
-        auto lhs = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto rhs = make_tensor(*context, dtype::bf16, { 2, 2 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 2 });
-
-        auto added = add(*context, lhs, rhs, output);
-        REQUIRE_FALSE(added.has_value());
-        CHECK(added.error() == tensor_op_errc::unsupported_dtype);
-    }
-
-    SUBCASE("output")
-    {
-        auto lhs = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto rhs = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto output = make_tensor(*context, dtype::bf16, { 2, 2 });
-
-        auto added = add(*context, lhs, rhs, output);
-        REQUIRE_FALSE(added.has_value());
-        CHECK(added.error() == tensor_op_errc::unsupported_dtype);
-    }
-}
-
-TEST_CASE("add requires matching input shapes")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto lhs = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto rhs = make_tensor(*context, dtype::f32, { 3, 2 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 3 });
-
-    auto added = add(*context, lhs, rhs, output);
-    REQUIRE_FALSE(added.has_value());
-    CHECK(added.error() == tensor_op_errc::input_shape_mismatch);
-}
-
-TEST_CASE("add requires output to match the inputs")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto lhs = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto rhs = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto output = make_tensor(*context, dtype::f32, { 3, 2 });
-
-    auto added = add(*context, lhs, rhs, output);
-    REQUIRE_FALSE(added.has_value());
-    CHECK(added.error() == tensor_op_errc::output_shape_mismatch);
+    CHECK(add(context, bad_rank, valid, valid).error() == tensor_op_errc::invalid_rank);
+    CHECK(add(context, bad_dtype, valid, valid).error() == tensor_op_errc::unsupported_dtype);
+    CHECK(add(context, valid, bad_shape, valid).error() == tensor_op_errc::input_shape_mismatch);
+    CHECK(add(context, valid, valid, bad_shape).error() == tensor_op_errc::output_shape_mismatch);
 }
 
 TEST_CASE("rope rotates split-half feature pairs for every head")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
 
     auto input = make_tensor(*context, dtype::f32, { 2, 8 });
     auto positions = make_tensor(*context, dtype::u32, { 2 });
@@ -1019,189 +521,82 @@ TEST_CASE("rope rotates split-half feature pairs for every head")
     }
 }
 
-TEST_CASE("rope requires rank-two activations and rank-one positions")
+TEST_CASE("rope validates inputs, shapes, and theta")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto& context = test_context();
 
-    SUBCASE("input")
+    SUBCASE("ranks and dtypes")
     {
-        auto input = make_tensor(*context, dtype::f32, { 8 });
-        auto positions = make_tensor(*context, dtype::u32, { 2 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 4 });
+        auto input = make_tensor(context, dtype::f32, { 2, 4 });
+        auto positions = make_tensor(context, dtype::u32, { 2 });
+        auto output = make_tensor(context, dtype::f32, { 2, 4 });
 
-        auto rotated = rope(*context, input, positions, 1, 10'000.0F, output);
-        REQUIRE_FALSE(rotated.has_value());
-        CHECK(rotated.error() == tensor_op_errc::invalid_rank);
+        CHECK(rope(context, make_tensor(context, dtype::f32, { 8 }), positions, 1, 10'000.0F, output).error()
+              == tensor_op_errc::invalid_rank);
+        CHECK(rope(context, input, make_tensor(context, dtype::u32, { 1, 2 }), 1, 10'000.0F, output).error()
+              == tensor_op_errc::invalid_rank);
+        auto bad_rank_out = make_tensor(context, dtype::f32, { 8 });
+        CHECK(rope(context, input, positions, 1, 10'000.0F, bad_rank_out).error()
+              == tensor_op_errc::invalid_rank);
+
+        CHECK(rope(context, make_tensor(context, dtype::bf16, { 2, 4 }), positions, 1, 10'000.0F, output).error()
+              == tensor_op_errc::unsupported_dtype);
+        CHECK(rope(context, input, make_tensor(context, dtype::i32, { 2 }), 1, 10'000.0F, output).error()
+              == tensor_op_errc::unsupported_dtype);
+        auto bad_dtype_out = make_tensor(context, dtype::bf16, { 2, 4 });
+        CHECK(rope(context, input, positions, 1, 10'000.0F, bad_dtype_out).error()
+              == tensor_op_errc::unsupported_dtype);
     }
 
-    SUBCASE("positions")
+    SUBCASE("shapes and head count")
     {
-        auto input = make_tensor(*context, dtype::f32, { 2, 4 });
-        auto positions = make_tensor(*context, dtype::u32, { 1, 2 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 4 });
+        auto input = make_tensor(context, dtype::f32, { 2, 8 });
+        auto positions = make_tensor(context, dtype::u32, { 2 });
+        auto output = make_tensor(context, dtype::f32, { 2, 8 });
 
-        auto rotated = rope(*context, input, positions, 1, 10'000.0F, output);
-        REQUIRE_FALSE(rotated.has_value());
-        CHECK(rotated.error() == tensor_op_errc::invalid_rank);
+        CHECK(rope(context, input, make_tensor(context, dtype::u32, { 1 }), 1, 10'000.0F, output).error()
+              == tensor_op_errc::position_count_mismatch);
+        CHECK(rope(context, input, positions, 0, 10'000.0F, output).error()
+              == tensor_op_errc::invalid_head_count);
+        CHECK(rope(context, input, positions, 3, 10'000.0F, output).error()
+              == tensor_op_errc::invalid_head_dimension);
+        auto six_dim_tensor = make_tensor(context, dtype::f32, { 2, 6 });
+        CHECK(rope(context, six_dim_tensor, positions, 2, 10'000.0F, six_dim_tensor).error()
+              == tensor_op_errc::invalid_head_dimension);
+        auto bad_shape_out = make_tensor(context, dtype::f32, { 1, 16 });
+        CHECK(rope(context, input, positions, 2, 10'000.0F, bad_shape_out).error()
+              == tensor_op_errc::output_shape_mismatch);
     }
 
-    SUBCASE("output")
+    SUBCASE("theta validation")
     {
-        auto input = make_tensor(*context, dtype::f32, { 2, 4 });
-        auto positions = make_tensor(*context, dtype::u32, { 2 });
-        auto output = make_tensor(*context, dtype::f32, { 8 });
+        auto input = make_tensor(context, dtype::f32, { 2, 8 });
+        auto positions = make_tensor(context, dtype::u32, { 2 });
+        auto output = make_tensor(context, dtype::f32, { 2, 8 });
 
-        auto rotated = rope(*context, input, positions, 1, 10'000.0F, output);
-        REQUIRE_FALSE(rotated.has_value());
-        CHECK(rotated.error() == tensor_op_errc::invalid_rank);
+        for (const auto theta : { 0.0F, -1.0F, std::numeric_limits<float>::infinity(),
+                                  std::numeric_limits<float>::quiet_NaN() }) {
+            CHECK(rope(context, input, positions, 2, theta, output).error()
+                  == tensor_op_errc::invalid_rope_theta);
+        }
     }
 }
 
-TEST_CASE("rope requires f32 activations and u32 positions")
+TEST_CASE("kv cache store writes rows into selected physical slots")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto& context = test_context();
+    auto cache = make_kv_cache(context);
 
-    SUBCASE("input")
-    {
-        auto input = make_tensor(*context, dtype::bf16, { 2, 4 });
-        auto positions = make_tensor(*context, dtype::u32, { 2 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 4 });
-
-        auto rotated = rope(*context, input, positions, 1, 10'000.0F, output);
-        REQUIRE_FALSE(rotated.has_value());
-        CHECK(rotated.error() == tensor_op_errc::unsupported_dtype);
-    }
-
-    SUBCASE("positions")
-    {
-        auto input = make_tensor(*context, dtype::f32, { 2, 4 });
-        auto positions = make_tensor(*context, dtype::i32, { 2 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 4 });
-
-        auto rotated = rope(*context, input, positions, 1, 10'000.0F, output);
-        REQUIRE_FALSE(rotated.has_value());
-        CHECK(rotated.error() == tensor_op_errc::unsupported_dtype);
-    }
-
-    SUBCASE("output")
-    {
-        auto input = make_tensor(*context, dtype::f32, { 2, 4 });
-        auto positions = make_tensor(*context, dtype::u32, { 2 });
-        auto output = make_tensor(*context, dtype::bf16, { 2, 4 });
-
-        auto rotated = rope(*context, input, positions, 1, 10'000.0F, output);
-        REQUIRE_FALSE(rotated.has_value());
-        CHECK(rotated.error() == tensor_op_errc::unsupported_dtype);
-    }
-}
-
-TEST_CASE("rope requires one position per activation row")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto input = make_tensor(*context, dtype::f32, { 2, 4 });
-    auto positions = make_tensor(*context, dtype::u32, { 1 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 4 });
-
-    auto rotated = rope(*context, input, positions, 1, 10'000.0F, output);
-    REQUIRE_FALSE(rotated.has_value());
-    CHECK(rotated.error() == tensor_op_errc::position_count_mismatch);
-}
-
-TEST_CASE("rope requires a positive head count with even head dimensions")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    SUBCASE("zero head count")
-    {
-        auto input = make_tensor(*context, dtype::f32, { 2, 8 });
-        auto positions = make_tensor(*context, dtype::u32, { 2 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 8 });
-
-        auto rotated = rope(*context, input, positions, 0, 10'000.0F, output);
-        REQUIRE_FALSE(rotated.has_value());
-        CHECK(rotated.error() == tensor_op_errc::invalid_head_count);
-    }
-
-    SUBCASE("features not divisible by heads")
-    {
-        auto input = make_tensor(*context, dtype::f32, { 2, 8 });
-        auto positions = make_tensor(*context, dtype::u32, { 2 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 8 });
-
-        auto rotated = rope(*context, input, positions, 3, 10'000.0F, output);
-        REQUIRE_FALSE(rotated.has_value());
-        CHECK(rotated.error() == tensor_op_errc::invalid_head_dimension);
-    }
-
-    SUBCASE("odd head dimension")
-    {
-        auto input = make_tensor(*context, dtype::f32, { 2, 6 });
-        auto positions = make_tensor(*context, dtype::u32, { 2 });
-        auto output = make_tensor(*context, dtype::f32, { 2, 6 });
-
-        auto rotated = rope(*context, input, positions, 2, 10'000.0F, output);
-        REQUIRE_FALSE(rotated.has_value());
-        CHECK(rotated.error() == tensor_op_errc::invalid_head_dimension);
-    }
-}
-
-TEST_CASE("rope requires output to match the input")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto input = make_tensor(*context, dtype::f32, { 2, 8 });
-    auto positions = make_tensor(*context, dtype::u32, { 2 });
-    auto output = make_tensor(*context, dtype::f32, { 1, 16 });
-
-    auto rotated = rope(*context, input, positions, 2, 10'000.0F, output);
-    REQUIRE_FALSE(rotated.has_value());
-    CHECK(rotated.error() == tensor_op_errc::output_shape_mismatch);
-}
-
-TEST_CASE("rope requires a positive finite theta")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    auto input = make_tensor(*context, dtype::f32, { 2, 8 });
-    auto positions = make_tensor(*context, dtype::u32, { 2 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 8 });
-    const std::vector<float> invalid_values {
-        0.0F,
-        -1.0F,
-        std::numeric_limits<float>::infinity(),
-        std::numeric_limits<float>::quiet_NaN(),
-    };
-
-    for (const auto theta : invalid_values) {
-        auto rotated = rope(*context, input, positions, 2, theta, output);
-        REQUIRE_FALSE(rotated.has_value());
-        CHECK(rotated.error() == tensor_op_errc::invalid_rope_theta);
-    }
-}
-
-TEST_CASE("kv cache store writes rows into selected physical slots" * doctest::skip())
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-    auto cache = make_kv_cache(*context);
-
-    auto keys = make_tensor(*context, dtype::f32, { 2, 2 });
-    auto values = make_tensor(*context, dtype::f32, { 2, 2 });
-    auto slots = make_tensor(*context, dtype::u32, { 2 });
+    auto keys = make_tensor(context, dtype::f32, { 2, 2 });
+    auto values = make_tensor(context, dtype::f32, { 2, 2 });
+    auto slots = make_tensor(context, dtype::u32, { 2 });
     write_floats(keys, { 1.0F, 2.0F, 3.0F, 4.0F });
     write_floats(values, { 5.0F, 6.0F, 7.0F, 8.0F });
     write_u32(slots, { 1, 3 });
     write_floats(cache.keys(), std::vector<float>(16, -1.0F));
     write_floats(cache.values(), std::vector<float>(16, -1.0F));
 
-    auto stored = store_kv(*context, keys, values, slots, 1, cache);
+    auto stored = store_kv(context, keys, values, slots, 1, cache);
     REQUIRE(stored.has_value());
 
     CHECK(read_floats(cache.keys())
@@ -1212,146 +607,57 @@ TEST_CASE("kv cache store writes rows into selected physical slots" * doctest::s
                                   -1.0F, 5.0F, 6.0F, -1.0F, -1.0F, 7.0F, 8.0F });
 }
 
-TEST_CASE("kv cache store requires rank-two inputs and rank-one slots")
+TEST_CASE("kv cache store validates inputs, shapes, and slots")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto& context = test_context();
+    auto cache = make_kv_cache(context);
+    auto keys = make_tensor(context, dtype::f32, { 2, 2 });
+    auto values = make_tensor(context, dtype::f32, { 2, 2 });
+    auto slots = make_tensor(context, dtype::u32, { 2 });
 
-    SUBCASE("keys")
+    SUBCASE("ranks and dtypes")
     {
-        auto cache = make_kv_cache(*context);
-        auto keys = make_tensor(*context, dtype::f32, { 4 });
-        auto values = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto slots = make_tensor(*context, dtype::u32, { 2 });
-        CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
+        CHECK(store_kv(context, make_tensor(context, dtype::f32, { 4 }), values, slots, 0, cache).error()
               == tensor_op_errc::invalid_rank);
-    }
-
-    SUBCASE("values")
-    {
-        auto cache = make_kv_cache(*context);
-        auto keys = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto values = make_tensor(*context, dtype::f32, { 4 });
-        auto slots = make_tensor(*context, dtype::u32, { 2 });
-        CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
+        CHECK(store_kv(context, keys, make_tensor(context, dtype::f32, { 4 }), slots, 0, cache).error()
               == tensor_op_errc::invalid_rank);
-    }
-
-    SUBCASE("slots")
-    {
-        auto cache = make_kv_cache(*context);
-        auto keys = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto values = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto slots = make_tensor(*context, dtype::u32, { 1, 2 });
-        CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
+        CHECK(store_kv(context, keys, values, make_tensor(context, dtype::u32, { 1, 2 }), 0, cache).error()
               == tensor_op_errc::invalid_rank);
-    }
-}
 
-TEST_CASE("kv cache store requires f32 inputs and u32 slots")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-
-    SUBCASE("keys")
-    {
-        auto cache = make_kv_cache(*context);
-        auto keys = make_tensor(*context, dtype::bf16, { 2, 2 });
-        auto values = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto slots = make_tensor(*context, dtype::u32, { 2 });
-        CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
+        CHECK(store_kv(context, make_tensor(context, dtype::bf16, { 2, 2 }), values, slots, 0, cache).error()
+              == tensor_op_errc::unsupported_dtype);
+        CHECK(store_kv(context, keys, make_tensor(context, dtype::bf16, { 2, 2 }), slots, 0, cache).error()
+              == tensor_op_errc::unsupported_dtype);
+        CHECK(store_kv(context, keys, values, make_tensor(context, dtype::i32, { 2 }), 0, cache).error()
               == tensor_op_errc::unsupported_dtype);
     }
 
-    SUBCASE("values")
+    SUBCASE("shapes, layers, and slot bounds")
     {
-        auto cache = make_kv_cache(*context);
-        auto keys = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto values = make_tensor(*context, dtype::bf16, { 2, 2 });
-        auto slots = make_tensor(*context, dtype::u32, { 2 });
-        CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
-              == tensor_op_errc::unsupported_dtype);
-    }
-
-    SUBCASE("slots")
-    {
-        auto cache = make_kv_cache(*context);
-        auto keys = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto values = make_tensor(*context, dtype::f32, { 2, 2 });
-        auto slots = make_tensor(*context, dtype::i32, { 2 });
-        CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
-              == tensor_op_errc::unsupported_dtype);
-    }
-}
-
-TEST_CASE("kv cache store requires matching key and value shapes")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-    auto cache = make_kv_cache(*context);
-    auto keys = make_tensor(*context, dtype::f32, { 2, 2 });
-    auto values = make_tensor(*context, dtype::f32, { 1, 2 });
-    auto slots = make_tensor(*context, dtype::u32, { 2 });
-
-    CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
-          == tensor_op_errc::input_shape_mismatch);
-}
-
-TEST_CASE("kv cache store requires one slot per input row")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-    auto cache = make_kv_cache(*context);
-    auto keys = make_tensor(*context, dtype::f32, { 2, 2 });
-    auto values = make_tensor(*context, dtype::f32, { 2, 2 });
-    auto slots = make_tensor(*context, dtype::u32, { 1 });
-
-    CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
-          == tensor_op_errc::cache_slot_count_mismatch);
-}
-
-TEST_CASE("kv cache store requires cache-sized rows")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-    auto cache = make_kv_cache(*context);
-    auto keys = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto values = make_tensor(*context, dtype::f32, { 2, 3 });
-    auto slots = make_tensor(*context, dtype::u32, { 2 });
-
-    CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
-          == tensor_op_errc::cache_feature_count_mismatch);
-}
-
-TEST_CASE("kv cache store rejects invalid layers and slots")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-    auto keys = make_tensor(*context, dtype::f32, { 2, 2 });
-    auto values = make_tensor(*context, dtype::f32, { 2, 2 });
-
-    SUBCASE("layer")
-    {
-        auto cache = make_kv_cache(*context);
-        auto slots = make_tensor(*context, dtype::u32, { 2 });
-        CHECK(store_kv(*context, keys, values, slots, 2, cache).error()
+        // mismatched key/value shapes
+        CHECK(store_kv(context, keys, make_tensor(context, dtype::f32, { 1, 2 }), slots, 0, cache).error()
+              == tensor_op_errc::input_shape_mismatch);
+        // slot count mismatch
+        CHECK(store_kv(context, keys, values, make_tensor(context, dtype::u32, { 1 }), 0, cache).error()
+              == tensor_op_errc::cache_slot_count_mismatch);
+        // feature dimension mismatch
+        CHECK(store_kv(context, make_tensor(context, dtype::f32, { 2, 3 }),
+                       make_tensor(context, dtype::f32, { 2, 3 }), slots, 0, cache).error()
+              == tensor_op_errc::cache_feature_count_mismatch);
+        // layer out of range
+        CHECK(store_kv(context, keys, values, slots, 2, cache).error()
               == tensor_op_errc::cache_layer_out_of_range);
-    }
-
-    SUBCASE("slot")
-    {
-        auto cache = make_kv_cache(*context);
-        auto slots = make_tensor(*context, dtype::u32, { 2 });
-        write_u32(slots, { 0, 4 });
-        CHECK(store_kv(*context, keys, values, slots, 0, cache).error()
+        // slot out of range
+        auto invalid_slots = make_tensor(context, dtype::u32, { 2 });
+        write_u32(invalid_slots, { 0, 4 });
+        CHECK(store_kv(context, keys, values, invalid_slots, 0, cache).error()
               == tensor_op_errc::cache_slot_out_of_range);
     }
 }
 
 TEST_CASE("paged attention follows block tables and shares kv heads")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
     auto cache = make_kv_cache(*context);
 
     write_floats(cache.keys(),
@@ -1395,8 +701,7 @@ TEST_CASE("paged attention follows block tables and shares kv heads")
 
 TEST_CASE("paged FlashAttention tiles causal query rows over paged keys and values")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
     auto cache_result = metal_kv_cache::make(*context,
                                              {
                                                  .layer_count = 1,
@@ -1483,8 +788,7 @@ TEST_CASE("paged FlashAttention tiles causal query rows over paged keys and valu
 
 TEST_CASE("paged FlashAttention merges key tiles across a cached prefix")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
     auto cache_result = metal_kv_cache::make(*context,
                                              {
                                                  .layer_count = 1,
@@ -1532,8 +836,7 @@ TEST_CASE("paged FlashAttention merges key tiles across a cached prefix")
 
 TEST_CASE("paged attention combines multiple context chunks")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
     auto cache_result = metal_kv_cache::make(*context,
                                              {
                                                  .layer_count = 1,
@@ -1576,216 +879,107 @@ TEST_CASE("paged attention combines multiple context chunks")
     CHECK(result[1] == doctest::Approx(128.0F).epsilon(1e-5));
 }
 
-TEST_CASE("paged attention requires tensor ranks and dtypes")
+TEST_CASE("paged attention validates inputs and metadata")
 {
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto& context = test_context();
+    auto cache = make_kv_cache(context);
+    auto queries = make_tensor(context, dtype::f32, { 1, 2 });
+    auto positions = make_tensor(context, dtype::u32, { 1 });
+    auto table = make_tensor(context, dtype::u32, { 1 });
+    auto offsets = make_tensor(context, dtype::u32, { 1 });
+    auto lengths = make_tensor(context, dtype::u32, { 1 });
+    auto output = make_tensor(context, dtype::f32, { 1, 2 });
 
-    SUBCASE("rank")
+    SUBCASE("ranks and dtypes")
     {
-        auto cache = make_kv_cache(*context);
-        auto queries = make_tensor(*context, dtype::f32, { 2 });
-        auto positions = make_tensor(*context, dtype::u32, { 1 });
-        auto table = make_tensor(*context, dtype::u32, { 1 });
-        auto offsets = make_tensor(*context, dtype::u32, { 1 });
-        auto lengths = make_tensor(*context, dtype::u32, { 1 });
-        auto output = make_tensor(*context, dtype::f32, { 1, 2 });
-        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
-                              output)
+        CHECK(paged_attention(context, make_tensor(context, dtype::f32, { 2 }), positions, table, offsets,
+                              lengths, 0, 1, cache, output)
                   .error()
               == tensor_op_errc::invalid_rank);
-    }
-
-    SUBCASE("dtype")
-    {
-        auto cache = make_kv_cache(*context);
-        auto queries = make_tensor(*context, dtype::f32, { 1, 2 });
-        auto positions = make_tensor(*context, dtype::u32, { 1 });
-        auto table = make_tensor(*context, dtype::i32, { 1 });
-        auto offsets = make_tensor(*context, dtype::u32, { 1 });
-        auto lengths = make_tensor(*context, dtype::u32, { 1 });
-        auto output = make_tensor(*context, dtype::f32, { 1, 2 });
-        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
-                              output)
+        CHECK(paged_attention(context, queries, positions, make_tensor(context, dtype::i32, { 1 }), offsets,
+                              lengths, 0, 1, cache, output)
                   .error()
               == tensor_op_errc::unsupported_dtype);
     }
-}
 
-TEST_CASE("paged attention requires one metadata entry per query row")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-    auto cache = make_kv_cache(*context);
-    auto queries = make_tensor(*context, dtype::f32, { 2, 2 });
-    auto table = make_tensor(*context, dtype::u32, { 1 });
-    auto output = make_tensor(*context, dtype::f32, { 2, 2 });
-
-    SUBCASE("positions")
+    SUBCASE("metadata counts")
     {
-        auto positions = make_tensor(*context, dtype::u32, { 1 });
-        auto offsets = make_tensor(*context, dtype::u32, { 2 });
-        auto lengths = make_tensor(*context, dtype::u32, { 2 });
-        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
-                              output)
+        auto q2 = make_tensor(context, dtype::f32, { 2, 2 });
+        auto out2 = make_tensor(context, dtype::f32, { 2, 2 });
+        CHECK(paged_attention(context, q2, positions, table, make_tensor(context, dtype::u32, { 2 }),
+                              make_tensor(context, dtype::u32, { 2 }), 0, 1, cache, out2)
                   .error()
               == tensor_op_errc::position_count_mismatch);
-    }
-
-    SUBCASE("block tables")
-    {
-        auto positions = make_tensor(*context, dtype::u32, { 2 });
-        auto offsets = make_tensor(*context, dtype::u32, { 1 });
-        auto lengths = make_tensor(*context, dtype::u32, { 2 });
-        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
-                              output)
+        CHECK(paged_attention(context, q2, make_tensor(context, dtype::u32, { 2 }), table, offsets,
+                              make_tensor(context, dtype::u32, { 2 }), 0, 1, cache, out2)
                   .error()
               == tensor_op_errc::block_table_metadata_count_mismatch);
     }
-}
 
-TEST_CASE("paged attention validates query heads against the cache")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-    auto positions = make_tensor(*context, dtype::u32, { 1 });
-    auto table = make_tensor(*context, dtype::u32, { 1 });
-    auto offsets = make_tensor(*context, dtype::u32, { 1 });
-    auto lengths = make_tensor(*context, dtype::u32, { 1 });
-
-    SUBCASE("zero query heads")
+    SUBCASE("heads and dimensions")
     {
-        auto cache = make_kv_cache(*context);
-        auto queries = make_tensor(*context, dtype::f32, { 1, 2 });
-        auto output = make_tensor(*context, dtype::f32, { 1, 2 });
-        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 0, cache,
-                              output)
+        CHECK(paged_attention(context, queries, positions, table, offsets, lengths, 0, 0, cache, output)
                   .error()
               == tensor_op_errc::invalid_head_count);
-    }
-
-    SUBCASE("query features")
-    {
-        auto cache = make_kv_cache(*context);
-        auto queries = make_tensor(*context, dtype::f32, { 1, 5 });
-        auto output = make_tensor(*context, dtype::f32, { 1, 5 });
-        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 2, cache,
-                              output)
+        auto dim5 = make_tensor(context, dtype::f32, { 1, 5 });
+        CHECK(paged_attention(context, dim5, positions, table, offsets, lengths, 0, 2, cache, dim5)
                   .error()
               == tensor_op_errc::invalid_head_dimension);
-    }
-
-    SUBCASE("head dimension")
-    {
-        auto cache = make_kv_cache(*context);
-        auto queries = make_tensor(*context, dtype::f32, { 1, 3 });
-        auto output = make_tensor(*context, dtype::f32, { 1, 3 });
-        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
-                              output)
+        auto dim3 = make_tensor(context, dtype::f32, { 1, 3 });
+        CHECK(paged_attention(context, dim3, positions, table, offsets, lengths, 0, 1, cache, dim3)
                   .error()
               == tensor_op_errc::cache_head_dimension_mismatch);
-    }
 
-    SUBCASE("grouped query mapping")
-    {
-        auto cache_result = metal_kv_cache::make(*context,
-                                                 {
-                                                     .layer_count = 1,
-                                                     .block_count = 1,
-                                                     .block_size = 1,
-                                                     .kv_head_count = 2,
-                                                     .head_dimension = 2,
-                                                 });
-        REQUIRE(cache_result.has_value());
-        auto cache = std::move(*cache_result);
-        auto queries = make_tensor(*context, dtype::f32, { 1, 6 });
-        auto output = make_tensor(*context, dtype::f32, { 1, 6 });
-        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 3, cache,
-                              output)
+        auto gqa_cache = metal_kv_cache::make(context, { .layer_count = 1,
+                                                          .block_count = 1,
+                                                          .block_size = 1,
+                                                          .kv_head_count = 2,
+                                                          .head_dimension = 2 });
+        REQUIRE(gqa_cache.has_value());
+        auto dim6 = make_tensor(context, dtype::f32, { 1, 6 });
+        CHECK(paged_attention(context, dim6, positions, table, offsets, lengths, 0, 3, *gqa_cache, dim6)
                   .error()
               == tensor_op_errc::invalid_kv_head_mapping);
     }
-}
 
-TEST_CASE("paged attention validates output and layer")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-    auto queries = make_tensor(*context, dtype::f32, { 1, 2 });
-    auto positions = make_tensor(*context, dtype::u32, { 1 });
-    auto table = make_tensor(*context, dtype::u32, { 1 });
-    auto offsets = make_tensor(*context, dtype::u32, { 1 });
-    auto lengths = make_tensor(*context, dtype::u32, { 1 });
-
-    SUBCASE("output")
+    SUBCASE("output and layer")
     {
-        auto cache = make_kv_cache(*context);
-        auto output = make_tensor(*context, dtype::f32, { 2, 1 });
-        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
-                              output)
+        auto bad_out = make_tensor(context, dtype::f32, { 2, 1 });
+        CHECK(paged_attention(context, queries, positions, table, offsets, lengths, 0, 1, cache, bad_out)
                   .error()
               == tensor_op_errc::output_shape_mismatch);
-    }
-
-    SUBCASE("layer")
-    {
-        auto cache = make_kv_cache(*context);
-        auto output = make_tensor(*context, dtype::f32, { 1, 2 });
-        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 2, 1, cache,
-                              output)
+        CHECK(paged_attention(context, queries, positions, table, offsets, lengths, 2, 1, cache, output)
                   .error()
               == tensor_op_errc::cache_layer_out_of_range);
     }
-}
 
-TEST_CASE("paged attention validates block table ranges and ids")
-{
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
-    auto queries = make_tensor(*context, dtype::f32, { 1, 2 });
-    auto positions = make_tensor(*context, dtype::u32, { 1 });
-    auto offsets = make_tensor(*context, dtype::u32, { 1 });
-    auto lengths = make_tensor(*context, dtype::u32, { 1 });
-    auto output = make_tensor(*context, dtype::f32, { 1, 2 });
-
-    SUBCASE("missing required block")
+    SUBCASE("block table bounds and ids")
     {
-        auto cache = make_kv_cache(*context);
-        auto table = make_tensor(*context, dtype::u32, { 1 });
+        // missing required block
         write_u32(positions, { 2 });
         write_u32(offsets, { 0 });
         write_u32(lengths, { 1 });
         write_u32(table, { 0 });
-        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
-                              output)
+        CHECK(paged_attention(context, queries, positions, table, offsets, lengths, 0, 1, cache, output)
                   .error()
               == tensor_op_errc::block_table_range_out_of_bounds);
-    }
 
-    SUBCASE("range outside flattened table")
-    {
-        auto cache = make_kv_cache(*context);
-        auto table = make_tensor(*context, dtype::u32, { 2 });
+        // range outside flattened table
         write_u32(positions, { 0 });
         write_u32(offsets, { 1 });
         write_u32(lengths, { 2 });
-        write_u32(table, { 0, 1 });
-        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
-                              output)
+        auto t2 = make_tensor(context, dtype::u32, { 2 });
+        write_u32(t2, { 0, 1 });
+        CHECK(paged_attention(context, queries, positions, t2, offsets, lengths, 0, 1, cache, output)
                   .error()
               == tensor_op_errc::block_table_range_out_of_bounds);
-    }
 
-    SUBCASE("physical block")
-    {
-        auto cache = make_kv_cache(*context);
-        auto table = make_tensor(*context, dtype::u32, { 1 });
+        // physical block out of range
         write_u32(positions, { 0 });
         write_u32(offsets, { 0 });
         write_u32(lengths, { 1 });
         write_u32(table, { 2 });
-        CHECK(paged_attention(*context, queries, positions, table, offsets, lengths, 0, 1, cache,
-                              output)
+        CHECK(paged_attention(context, queries, positions, table, offsets, lengths, 0, 1, cache, output)
                   .error()
               == tensor_op_errc::cache_block_out_of_range);
     }

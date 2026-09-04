@@ -87,65 +87,28 @@ TEST_CASE("Qwen3 config rejects malformed and incomplete JSON")
     CHECK(parse_qwen3_config(config).error() == qwen_config_errc::missing_field);
 }
 
-TEST_CASE("Qwen3 config supports only the implemented Qwen3 architecture")
+TEST_CASE("Qwen3 config validates supported architecture and geometry")
 {
-    SUBCASE("model type")
-    {
-        auto config = valid_config();
-        replace_once(config, "\"qwen3\"", "\"llama\"");
-        CHECK(parse_qwen3_config(config).error() == qwen_config_errc::unsupported_model_type);
-    }
+    const std::vector<std::pair<std::pair<std::string_view, std::string_view>, qwen_config_errc>>
+        cases {
+            { { "\"qwen3\"", "\"llama\"" }, qwen_config_errc::unsupported_model_type },
+            { { "\"silu\"", "\"gelu\"" }, qwen_config_errc::unsupported_configuration },
+            { { "\"bfloat16\"", "\"float16\"" }, qwen_config_errc::unsupported_configuration },
+            { { "\"attention_bias\": false", "\"attention_bias\": true" },
+              qwen_config_errc::unsupported_configuration },
+            { { "\"use_sliding_window\": false", "\"use_sliding_window\": true" },
+              qwen_config_errc::unsupported_configuration },
+            { { "\"num_attention_heads\": 4", "\"num_attention_heads\": 3" },
+              qwen_config_errc::invalid_geometry },
+            { { "\"head_dim\": 4", "\"head_dim\": 3" }, qwen_config_errc::invalid_geometry },
+            { { "\"eos_token_id\": 11", "\"eos_token_id\": 32" },
+              qwen_config_errc::invalid_geometry },
+        };
 
-    SUBCASE("activation")
-    {
+    for (const auto& [replacement, expected_errc] : cases) {
         auto config = valid_config();
-        replace_once(config, "\"silu\"", "\"gelu\"");
-        CHECK(parse_qwen3_config(config).error() == qwen_config_errc::unsupported_configuration);
-    }
-
-    SUBCASE("dtype")
-    {
-        auto config = valid_config();
-        replace_once(config, "\"bfloat16\"", "\"float16\"");
-        CHECK(parse_qwen3_config(config).error() == qwen_config_errc::unsupported_configuration);
-    }
-
-    SUBCASE("attention bias")
-    {
-        auto config = valid_config();
-        replace_once(config, "\"attention_bias\": false", "\"attention_bias\": true");
-        CHECK(parse_qwen3_config(config).error() == qwen_config_errc::unsupported_configuration);
-    }
-
-    SUBCASE("sliding window")
-    {
-        auto config = valid_config();
-        replace_once(config, "\"use_sliding_window\": false", "\"use_sliding_window\": true");
-        CHECK(parse_qwen3_config(config).error() == qwen_config_errc::unsupported_configuration);
-    }
-}
-
-TEST_CASE("Qwen3 config validates attention geometry and token ids")
-{
-    SUBCASE("grouped-query mapping")
-    {
-        auto config = valid_config();
-        replace_once(config, "\"num_attention_heads\": 4", "\"num_attention_heads\": 3");
-        CHECK(parse_qwen3_config(config).error() == qwen_config_errc::invalid_geometry);
-    }
-
-    SUBCASE("RoPE dimension")
-    {
-        auto config = valid_config();
-        replace_once(config, "\"head_dim\": 4", "\"head_dim\": 3");
-        CHECK(parse_qwen3_config(config).error() == qwen_config_errc::invalid_geometry);
-    }
-
-    SUBCASE("EOS token")
-    {
-        auto config = valid_config();
-        replace_once(config, "\"eos_token_id\": 11", "\"eos_token_id\": 32");
-        CHECK(parse_qwen3_config(config).error() == qwen_config_errc::invalid_geometry);
+        replace_once(config, replacement.first, replacement.second);
+        CHECK(parse_qwen3_config(config).error() == expected_errc);
     }
 }
 

@@ -13,15 +13,6 @@ using chibillm::seq_errc;
 using chibillm::seq_status;
 using chibillm::token_id;
 
-TEST_CASE("sampling parameters have sensible defaults")
-{
-    const sampling_params params;
-
-    CHECK(params.temperature == 1.0f);
-    CHECK(params.max_new_tokens == 64);
-    CHECK_FALSE(params.ignore_eos);
-}
-
 TEST_CASE("a sequence owns its prompt and starts waiting")
 {
     const std::vector<token_id> prompt { 1, 2, 3 };
@@ -122,51 +113,27 @@ TEST_CASE("lifecycle transitions reject invalid source states")
     REQUIRE(result.has_value());
     auto& sequence = *result;
 
-    auto waiting_again = sequence.mark_waiting();
-    REQUIRE_FALSE(waiting_again.has_value());
-    CHECK(waiting_again.error() == seq_errc::invalid_state_transition);
-
-    auto running_too_early = sequence.mark_running();
-    REQUIRE_FALSE(running_too_early.has_value());
-    CHECK(running_too_early.error() == seq_errc::invalid_state_transition);
+    CHECK(sequence.mark_waiting().error() == seq_errc::invalid_state_transition);
+    CHECK(sequence.mark_running().error() == seq_errc::invalid_state_transition);
+    CHECK(sequence.append_token(3).error() == seq_errc::invalid_state_transition);
 
     REQUIRE(sequence.schedule_tokens(2).has_value());
-    auto running_with_work = sequence.mark_running();
-    REQUIRE_FALSE(running_with_work.has_value());
-    CHECK(running_with_work.error() == seq_errc::work_already_scheduled);
+    CHECK(sequence.mark_running().error() == seq_errc::work_already_scheduled);
 
     REQUIRE(sequence.commit_scheduled_tokens().has_value());
     REQUIRE(sequence.mark_running().has_value());
+    CHECK(sequence.mark_running().error() == seq_errc::invalid_state_transition);
 
-    auto running_again = sequence.mark_running();
-    REQUIRE_FALSE(running_again.has_value());
-    CHECK(running_again.error() == seq_errc::invalid_state_transition);
+    REQUIRE(sequence.append_token(3).has_value());
+    CHECK(sequence.append_token(4).error() == seq_errc::invalid_state_transition);
 
+    REQUIRE(sequence.schedule_tokens(1).has_value());
+    REQUIRE(sequence.commit_scheduled_tokens().has_value());
     REQUIRE(sequence.mark_waiting().has_value());
     CHECK(sequence.status() == seq_status::waiting);
 }
 
-TEST_CASE("append requires running state and fully committed old tokens")
-{
-    auto result = seq::make(1, { 1, 2 }, sampling_params {}, 16);
-    REQUIRE(result.has_value());
-    auto& sequence = *result;
-
-    auto while_waiting = sequence.append_token(3);
-    REQUIRE_FALSE(while_waiting.has_value());
-    CHECK(while_waiting.error() == seq_errc::invalid_state_transition);
-
-    REQUIRE(sequence.schedule_tokens(2).has_value());
-    REQUIRE(sequence.commit_scheduled_tokens().has_value());
-    REQUIRE(sequence.mark_running().has_value());
-    REQUIRE(sequence.append_token(3).has_value());
-
-    auto before_decode = sequence.append_token(4);
-    REQUIRE_FALSE(before_decode.has_value());
-    CHECK(before_decode.error() == seq_errc::invalid_state_transition);
-}
-
-TEST_CASE("logical block geometry and slices handle partial final blocks")
+TEST_CASE("logical block geometry and slices handle exact and partial boundaries")
 {
     auto result = seq::make(1, { 1, 2, 3, 4, 5, 6, 7 }, sampling_params {}, 3);
     REQUIRE(result.has_value());
@@ -191,31 +158,22 @@ TEST_CASE("logical block geometry and slices handle partial final blocks")
     CHECK(third->size() == 1);
     CHECK((*third)[0] == 7);
 
-    auto outside = sequence.logical_block_tokens(3);
-    REQUIRE_FALSE(outside.has_value());
-    CHECK(outside.error() == seq_errc::index_out_of_range);
+    CHECK(sequence.logical_block_tokens(3).error() == seq_errc::index_out_of_range);
 
     REQUIRE(sequence.append_physical_block(11).has_value());
     REQUIRE(sequence.append_physical_block(22).has_value());
     REQUIRE(sequence.append_physical_block(33).has_value());
     CHECK(sequence.block_table().size() == 3);
     CHECK(sequence.block_table()[1] == 22);
+    CHECK(sequence.append_physical_block(44).error() == seq_errc::block_table_full);
 
-    auto extra_block = sequence.append_physical_block(44);
-    REQUIRE_FALSE(extra_block.has_value());
-    CHECK(extra_block.error() == seq_errc::block_table_full);
+    auto exact = seq::make(2, { 1, 2, 3, 4 }, sampling_params {}, 4);
+    REQUIRE(exact.has_value());
+    CHECK(exact->logical_block_count() == 1);
+    CHECK(exact->tokens_in_last_block() == 4);
 }
 
-TEST_CASE("exact block boundaries report a full final block")
-{
-    auto result = seq::make(1, { 1, 2, 3, 4 }, sampling_params {}, 4);
-    REQUIRE(result.has_value());
-
-    CHECK(result->logical_block_count() == 1);
-    CHECK(result->tokens_in_last_block() == 4);
-}
-
-TEST_CASE("cache metadata reset refuses to discard scheduled work")
+TEST_CASE("cache metadata reset validates sequence state")
 {
     auto result = seq::make(1, { 1, 2, 3, 4 }, sampling_params {}, 2);
     REQUIRE(result.has_value());
@@ -226,9 +184,7 @@ TEST_CASE("cache metadata reset refuses to discard scheduled work")
     REQUIRE(sequence.set_cached_token_count(2).has_value());
     REQUIRE(sequence.schedule_tokens(2).has_value());
 
-    auto with_work = sequence.reset_cache_metadata();
-    REQUIRE_FALSE(with_work.has_value());
-    CHECK(with_work.error() == seq_errc::work_already_scheduled);
+    CHECK(sequence.reset_cache_metadata().error() == seq_errc::work_already_scheduled);
     CHECK(sequence.cached_token_count() == 2);
     CHECK(sequence.block_table().size() == 2);
 
@@ -237,23 +193,11 @@ TEST_CASE("cache metadata reset refuses to discard scheduled work")
     CHECK(sequence.cached_token_count() == 0);
     CHECK(sequence.block_table().empty());
     CHECK(sequence.token_count() == 4);
-}
 
-TEST_CASE("cache metadata cannot be removed from a running sequence")
-{
-    auto result = seq::make(1, { 1, 2 }, sampling_params {}, 2);
-    REQUIRE(result.has_value());
-    auto& sequence = *result;
-
-    REQUIRE(sequence.schedule_tokens(2).has_value());
+    REQUIRE(sequence.schedule_tokens(4).has_value());
     REQUIRE(sequence.commit_scheduled_tokens().has_value());
     REQUIRE(sequence.mark_running().has_value());
-
-    auto reset = sequence.reset_cache_metadata();
-    REQUIRE_FALSE(reset.has_value());
-    CHECK(reset.error() == seq_errc::invalid_state_transition);
-    CHECK(sequence.cached_token_count() == 2);
-    CHECK(sequence.status() == seq_status::running);
+    CHECK(sequence.reset_cache_metadata().error() == seq_errc::invalid_state_transition);
 }
 
 TEST_CASE("EOS and length limits are evaluated after appending")

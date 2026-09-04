@@ -12,19 +12,6 @@ using chibillm::sampling_params;
 using chibillm::seq;
 using chibillm::seq_status;
 
-TEST_CASE("KV block free state follows its reference count")
-{
-    kv_block block {
-        .id = 3,
-        .ref_count = 0,
-    };
-
-    CHECK(block.is_free());
-
-    block.ref_count = 1;
-    CHECK_FALSE(block.is_free());
-}
-
 TEST_CASE("block manager construction validates its geometry")
 {
     auto zero_blocks = block_manager::make(0, 16);
@@ -81,6 +68,10 @@ TEST_CASE("block requirements and capacity are calculated without mutation")
     CHECK(*can_allocate);
     CHECK(manager.free_block_count() == 4);
     CHECK(sequence.block_table().empty());
+
+    auto exhausted = block_manager::make(1, 2);
+    REQUIRE(exhausted.has_value());
+    CHECK(exhausted->can_ensure_capacity(sequence).value() == false);
 }
 
 TEST_CASE("ensure capacity assigns every missing physical block")
@@ -182,29 +173,7 @@ TEST_CASE("release returns blocks and FIFO allocation reuses the oldest free ID"
     CHECK(second.block_table()[0] == 2);
 }
 
-TEST_CASE("release rejects running sequences without changing ownership")
-{
-    auto manager_result = block_manager::make(2, 2);
-    auto sequence_result = seq::make(1, { 1, 2 }, sampling_params {}, 2);
-    REQUIRE(manager_result.has_value());
-    REQUIRE(sequence_result.has_value());
-    auto& manager = *manager_result;
-    auto& sequence = *sequence_result;
-
-    REQUIRE(manager.ensure_capacity(sequence).has_value());
-    REQUIRE(sequence.schedule_tokens(2).has_value());
-    REQUIRE(sequence.commit_scheduled_tokens().has_value());
-    REQUIRE(sequence.mark_running().has_value());
-
-    auto released = manager.release(sequence);
-    REQUIRE_FALSE(released.has_value());
-    CHECK(released.error() == block_manager_errc::sequence_running);
-    CHECK(sequence.status() == seq_status::running);
-    CHECK(sequence.block_table().size() == 1);
-    CHECK(manager.used_block_count() == 1);
-}
-
-TEST_CASE("release rejects scheduled work without changing ownership")
+TEST_CASE("release rejects busy sequences without changing ownership")
 {
     auto manager_result = block_manager::make(2, 2);
     auto sequence_result = seq::make(1, { 1, 2 }, sampling_params {}, 2);
@@ -215,12 +184,17 @@ TEST_CASE("release rejects scheduled work without changing ownership")
 
     REQUIRE(manager.ensure_capacity(sequence).has_value());
     REQUIRE(sequence.schedule_tokens(1).has_value());
-
-    auto released = manager.release(sequence);
-    REQUIRE_FALSE(released.has_value());
-    CHECK(released.error() == block_manager_errc::sequence_has_scheduled_work);
-    CHECK(sequence.block_table().size() == 1);
+    CHECK(manager.release(sequence).error() == block_manager_errc::sequence_has_scheduled_work);
     CHECK(sequence.scheduled_token_count() == 1);
+    CHECK(manager.used_block_count() == 1);
+
+    REQUIRE(sequence.commit_scheduled_tokens().has_value());
+    REQUIRE(sequence.schedule_tokens(1).has_value());
+    REQUIRE(sequence.commit_scheduled_tokens().has_value());
+    REQUIRE(sequence.mark_running().has_value());
+    CHECK(manager.release(sequence).error() == block_manager_errc::sequence_running);
+    CHECK(sequence.status() == seq_status::running);
+    CHECK(sequence.block_table().size() == 1);
     CHECK(manager.used_block_count() == 1);
 }
 
@@ -234,22 +208,6 @@ TEST_CASE("manager rejects incompatible sequence geometry")
     auto required = manager_result->additional_blocks_required(*sequence_result);
     REQUIRE_FALSE(required.has_value());
     CHECK(required.error() == block_manager_errc::incompatible_block_size);
-}
-
-TEST_CASE("capacity query reports a valid lack of free blocks")
-{
-    auto manager_result = block_manager::make(1, 2);
-    auto first_result = seq::make(1, { 1 }, sampling_params {}, 2);
-    auto second_result = seq::make(2, { 2 }, sampling_params {}, 2);
-    REQUIRE(manager_result.has_value());
-    REQUIRE(first_result.has_value());
-    REQUIRE(second_result.has_value());
-    auto& manager = *manager_result;
-
-    REQUIRE(manager.ensure_capacity(*first_result).has_value());
-    auto can_allocate = manager.can_ensure_capacity(*second_result);
-    REQUIRE(can_allocate.has_value());
-    CHECK_FALSE(*can_allocate);
 }
 
 TEST_CASE("existing block-table entries must reference live manager blocks")

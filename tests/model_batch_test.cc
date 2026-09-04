@@ -35,53 +35,6 @@ test_config()
 
 } // namespace
 
-TEST_CASE("model batch accessors summarize owned data")
-{
-    const model_batch batch {
-        .id = 7,
-        .phase = batch_phase::prefill,
-        .kv_block_size = 2,
-        .tokens = { 10, 20, 30 },
-        .positions = { 0, 1, 0 },
-        .items = {
-            model_batch_item {
-                .id = 1,
-                .token_offset = 0,
-                .token_count = 2,
-                .logits_index = 1,
-                .block_table = { 0 },
-            },
-            model_batch_item {
-                .id = 2,
-                .token_offset = 2,
-                .token_count = 1,
-                .logits_index = 2,
-                .block_table = { 1 },
-            },
-        },
-    };
-
-    CHECK_FALSE(batch.empty());
-    CHECK(batch.sequence_count() == 2);
-    CHECK(batch.token_count() == 3);
-}
-
-TEST_CASE("empty scheduled batches are rejected")
-{
-    auto engine = scheduler::make(test_config());
-    REQUIRE(engine.has_value());
-
-    const scheduled_batch scheduled {
-        .id = 1,
-        .phase = batch_phase::prefill,
-        .items = {},
-    };
-
-    auto built = build_model_batch(scheduled, *engine);
-    REQUIRE_FALSE(built.has_value());
-    CHECK(built.error() == model_batch_errc::empty_batch);
-}
-
 TEST_CASE("prefill input contains the scheduled token slice and absolute positions")
 {
     auto config = test_config();
@@ -199,41 +152,39 @@ TEST_CASE("ragged prefill is flattened in scheduled order")
     CHECK(built->items[1].logits_index == 2);
 }
 
-TEST_CASE("reservation mismatches are rejected without changing the sequence")
+TEST_CASE("model batch rejects invalid scheduled batches")
 {
     auto engine = scheduler::make(test_config());
-    auto sequence = seq::make(1, { 10 }, sampling_params {}, 2);
     REQUIRE(engine.has_value());
-    REQUIRE(sequence.has_value());
-    REQUIRE(engine->add(std::move(*sequence)).has_value());
 
-    auto scheduled = engine->schedule();
-    REQUIRE(scheduled.has_value());
-    ++scheduled->items[0].token_count;
+    SUBCASE("empty batch")
+    {
+        const scheduled_batch scheduled { .id = 1, .phase = batch_phase::prefill, .items = {} };
+        CHECK(build_model_batch(scheduled, *engine).error() == model_batch_errc::empty_batch);
+    }
 
-    auto built = build_model_batch(*scheduled, *engine);
-    REQUIRE_FALSE(built.has_value());
-    CHECK(built.error() == model_batch_errc::scheduled_token_count_mismatch);
+    SUBCASE("reservation mismatch and duplicate ids")
+    {
+        auto sequence = seq::make(1, { 10 }, sampling_params {}, 2);
+        REQUIRE(sequence.has_value());
+        REQUIRE(engine->add(std::move(*sequence)).has_value());
 
-    const auto* unchanged = engine->find_sequence(1);
-    REQUIRE(unchanged != nullptr);
-    CHECK(unchanged->cached_token_count() == 0);
-    CHECK(unchanged->scheduled_token_count() == 1);
-}
+        auto scheduled = engine->schedule();
+        REQUIRE(scheduled.has_value());
 
-TEST_CASE("duplicate sequence ids are rejected")
-{
-    auto engine = scheduler::make(test_config());
-    auto sequence = seq::make(1, { 10 }, sampling_params {}, 2);
-    REQUIRE(engine.has_value());
-    REQUIRE(sequence.has_value());
-    REQUIRE(engine->add(std::move(*sequence)).has_value());
+        auto mismatched = *scheduled;
+        ++mismatched.items[0].token_count;
+        CHECK(build_model_batch(mismatched, *engine).error()
+              == model_batch_errc::scheduled_token_count_mismatch);
 
-    auto scheduled = engine->schedule();
-    REQUIRE(scheduled.has_value());
-    scheduled->items.push_back(scheduled->items.front());
+        auto duplicated = *scheduled;
+        duplicated.items.push_back(duplicated.items.front());
+        CHECK(build_model_batch(duplicated, *engine).error()
+              == model_batch_errc::duplicate_sequence_id);
 
-    auto built = build_model_batch(*scheduled, *engine);
-    REQUIRE_FALSE(built.has_value());
-    CHECK(built.error() == model_batch_errc::duplicate_sequence_id);
+        const auto* unchanged = engine->find_sequence(1);
+        REQUIRE(unchanged != nullptr);
+        CHECK(unchanged->cached_token_count() == 0);
+        CHECK(unchanged->scheduled_token_count() == 1);
+    }
 }

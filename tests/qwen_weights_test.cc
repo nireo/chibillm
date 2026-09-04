@@ -327,6 +327,19 @@ check_floats(const metal_tensor& tensor, const std::vector<float>& expected)
     }
 }
 
+const metal_context&
+test_context()
+{
+    static const auto context = [] {
+        auto result = metal_context::make(load_shader_source());
+        if (!result) {
+            throw std::runtime_error("failed to create metal context: " + result.error().message);
+        }
+        return std::move(*result);
+    }();
+    return context;
+}
+
 } // namespace
 
 TEST_CASE("Qwen weight validation accepts the expected tensor set")
@@ -341,49 +354,28 @@ TEST_CASE("Qwen weight validation accepts the expected tensor set")
 TEST_CASE("Qwen weight validation reports incompatible manifests")
 {
     const auto config = test_config();
-
-    SUBCASE("missing tensor")
-    {
-        auto tensors = expected_tensors(config);
-        tensors.erase(tensors.begin() + 4);
-        auto file = write_weights(std::move(tensors), "chibillm_qwen_weights_missing.safetensors");
+    auto check_err = [&](std::vector<tensor_spec> tensors, const char* name, qwen_weights_errc err) {
+        auto file = write_weights(std::move(tensors), name);
         auto weights = safetensors_file::open(file.path());
         REQUIRE(weights.has_value());
-        CHECK(validate_qwen_weights(*weights, config).error() == qwen_weights_errc::missing_tensor);
-    }
+        CHECK(validate_qwen_weights(*weights, config).error() == err);
+    };
 
-    SUBCASE("wrong dtype")
-    {
-        auto tensors = expected_tensors(config);
-        tensors[4].dtype = "F32";
-        auto file = write_weights(std::move(tensors), "chibillm_qwen_weights_dtype.safetensors");
-        auto weights = safetensors_file::open(file.path());
-        REQUIRE(weights.has_value());
-        CHECK(validate_qwen_weights(*weights, config).error()
-              == qwen_weights_errc::unsupported_dtype);
-    }
+    auto missing = expected_tensors(config);
+    missing.erase(missing.begin() + 4);
+    check_err(std::move(missing), "qwen_missing.safetensors", qwen_weights_errc::missing_tensor);
 
-    SUBCASE("wrong shape")
-    {
-        auto tensors = expected_tensors(config);
-        tensors[4].shape = { config.head_dimension + 1 };
-        auto file = write_weights(std::move(tensors), "chibillm_qwen_weights_shape.safetensors");
-        auto weights = safetensors_file::open(file.path());
-        REQUIRE(weights.has_value());
-        CHECK(validate_qwen_weights(*weights, config).error()
-              == qwen_weights_errc::tensor_shape_mismatch);
-    }
+    auto wrong_dtype = expected_tensors(config);
+    wrong_dtype[4].dtype = "F32";
+    check_err(std::move(wrong_dtype), "qwen_dtype.safetensors", qwen_weights_errc::unsupported_dtype);
 
-    SUBCASE("unexpected tensor")
-    {
-        auto tensors = expected_tensors(config);
-        tensors.push_back({ "unused.weight", "BF16", { 1 } });
-        auto file = write_weights(std::move(tensors), "chibillm_qwen_weights_extra.safetensors");
-        auto weights = safetensors_file::open(file.path());
-        REQUIRE(weights.has_value());
-        CHECK(validate_qwen_weights(*weights, config).error()
-              == qwen_weights_errc::unexpected_tensor_count);
-    }
+    auto wrong_shape = expected_tensors(config);
+    wrong_shape[4].shape = { config.head_dimension + 1 };
+    check_err(std::move(wrong_shape), "qwen_shape.safetensors", qwen_weights_errc::tensor_shape_mismatch);
+
+    auto extra = expected_tensors(config);
+    extra.push_back({ "unused.weight", "BF16", { 1 } });
+    check_err(std::move(extra), "qwen_extra.safetensors", qwen_weights_errc::unexpected_tensor_count);
 }
 
 TEST_CASE("Qwen3.5 weight validation accepts its hybrid tensor layouts")
@@ -399,45 +391,28 @@ TEST_CASE("Qwen3.5 weight validation accepts its hybrid tensor layouts")
 TEST_CASE("Qwen3.5 weight validation distinguishes architecture and storage types")
 {
     const auto config = qwen3_5_test_config();
-
-    SUBCASE("missing linear-attention tensor")
-    {
-        auto tensors = expected_qwen3_5_tensors(config);
-        const auto found = std::ranges::find_if(
-            tensors, [](const auto& tensor) { return tensor.name.ends_with("linear_attn.A_log"); });
-        REQUIRE(found != tensors.end());
-        tensors.erase(found);
-        auto file =
-            write_weights(std::move(tensors), "chibillm_qwen3_5_weights_missing.safetensors");
+    auto check_err = [&](std::vector<tensor_spec> tensors, const char* name, qwen_weights_errc err) {
+        auto file = write_weights(std::move(tensors), name);
         auto weights = safetensors_file::open(file.path());
         REQUIRE(weights.has_value());
-        CHECK(validate_qwen3_5_weights(*weights, config).error()
-              == qwen_weights_errc::missing_tensor);
-    }
+        CHECK(validate_qwen3_5_weights(*weights, config).error() == err);
+    };
 
-    SUBCASE("wrong F32 state dtype")
-    {
-        auto tensors = expected_qwen3_5_tensors(config);
-        const auto found = std::ranges::find_if(
-            tensors, [](const auto& tensor) { return tensor.name.ends_with("linear_attn.A_log"); });
-        REQUIRE(found != tensors.end());
-        found->dtype = "BF16";
-        auto file = write_weights(std::move(tensors), "chibillm_qwen3_5_weights_dtype.safetensors");
-        auto weights = safetensors_file::open(file.path());
-        REQUIRE(weights.has_value());
-        CHECK(validate_qwen3_5_weights(*weights, config).error()
-              == qwen_weights_errc::unsupported_dtype);
-    }
+    auto missing = expected_qwen3_5_tensors(config);
+    const auto found_log = std::ranges::find_if(
+        missing, [](const auto& t) { return t.name.ends_with("linear_attn.A_log"); });
+    REQUIRE(found_log != missing.end());
+    missing.erase(found_log);
+    check_err(std::move(missing), "qwen3_5_missing.safetensors", qwen_weights_errc::missing_tensor);
 
-    SUBCASE("Qwen3 manifest is not accepted as Qwen3.5")
-    {
-        auto file =
-            write_weights(expected_tensors(test_config()), "chibillm_qwen3_as_qwen3_5.safetensors");
-        auto weights = safetensors_file::open(file.path());
-        REQUIRE(weights.has_value());
-        CHECK(validate_qwen3_5_weights(*weights, config).error()
-              == qwen_weights_errc::missing_tensor);
-    }
+    auto wrong_dtype = expected_qwen3_5_tensors(config);
+    const auto found_dt = std::ranges::find_if(
+        wrong_dtype, [](const auto& t) { return t.name.ends_with("linear_attn.A_log"); });
+    REQUIRE(found_dt != wrong_dtype.end());
+    found_dt->dtype = "BF16";
+    check_err(std::move(wrong_dtype), "qwen3_5_dtype.safetensors", qwen_weights_errc::unsupported_dtype);
+
+    check_err(expected_tensors(test_config()), "qwen3_as_3_5.safetensors", qwen_weights_errc::missing_tensor);
 }
 
 TEST_CASE("Qwen3.5 weights load linear and full-attention layers separately")
@@ -447,8 +422,7 @@ TEST_CASE("Qwen3.5 weights load linear and full-attention layers separately")
                               "chibillm_qwen3_5_weights_load.safetensors");
     auto safetensors = safetensors_file::open(file.path());
     REQUIRE(safetensors.has_value());
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
 
     auto weights = load_qwen3_5_weights(*context, *safetensors, config);
     REQUIRE(weights.has_value());
@@ -489,8 +463,7 @@ TEST_CASE("Qwen weights are loaded into resident Metal tensors")
     auto file = write_weights(expected_tensors(config), "chibillm_qwen_weights_load.safetensors");
     auto safetensors = safetensors_file::open(file.path());
     REQUIRE(safetensors.has_value());
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
 
     auto weights = load_qwen_weights(*context, *safetensors, config);
     REQUIRE(weights.has_value());
@@ -519,8 +492,7 @@ TEST_CASE("Qwen token embedding produces hidden-state rows")
     auto file = write_weights(expected_tensors(config), "chibillm_qwen_embedding.safetensors");
     auto safetensors = safetensors_file::open(file.path());
     REQUIRE(safetensors.has_value());
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
     auto weights = load_qwen_weights(*context, *safetensors, config);
     REQUIRE(weights.has_value());
 
@@ -553,8 +525,7 @@ TEST_CASE("Qwen output selects requested rows and samples their largest logits")
     auto file = write_weights(expected_tensors(config), "chibillm_qwen_output.safetensors");
     auto safetensors = safetensors_file::open(file.path());
     REQUIRE(safetensors.has_value());
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
     auto weights = load_qwen_weights(*context, *safetensors, config);
     REQUIRE(weights.has_value());
 
@@ -651,8 +622,7 @@ TEST_CASE("Qwen layer input produces normalized query key and value projections"
     auto file = write_weights(expected_tensors(config), "chibillm_qwen_qkv.safetensors");
     auto safetensors = safetensors_file::open(file.path());
     REQUIRE(safetensors.has_value());
-    auto context = metal_context::make(load_shader_source());
-    REQUIRE(context.has_value());
+    const auto* context = &test_context();
     auto weights = load_qwen_weights(*context, *safetensors, config);
     REQUIRE(weights.has_value());
 
