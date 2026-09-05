@@ -8,11 +8,11 @@
 
 using chibillm::batch_phase;
 using chibillm::build_model_batch;
+using chibillm::generation_params;
 using chibillm::model_batch;
 using chibillm::model_batch_errc;
 using chibillm::model_batch_item;
 using chibillm::position_id;
-using chibillm::sampling_params;
 using chibillm::scheduled_batch;
 using chibillm::scheduler;
 using chibillm::scheduler_config;
@@ -40,7 +40,7 @@ TEST_CASE("model batch builds chunked prefill and subsequent decode batches")
     auto config = test_config();
     config.max_batch_tokens = 2;
     auto engine = scheduler::make(config);
-    auto sequence = seq::make(1, { 10, 20, 30 }, sampling_params {}, 2);
+    auto sequence = seq::make(1, { 10, 20, 30 }, generation_params {});
     REQUIRE(engine.has_value());
     REQUIRE(sequence.has_value());
     REQUIRE(engine->add(std::move(*sequence)).has_value());
@@ -60,17 +60,17 @@ TEST_CASE("model batch builds chunked prefill and subsequent decode batches")
     CHECK(first_batch->items[0].id == 1);
     CHECK(first_batch->items[0].token_offset == 0);
     CHECK(first_batch->items[0].token_count == 2);
-    CHECK(first_batch->items[0].logits_index == 1);
+    CHECK_FALSE(first_batch->items[0].logits_index.has_value());
     CHECK(first_batch->items[0].block_table.size() == 2);
 
     const auto* unchanged = engine->find_sequence(1);
     REQUIRE(unchanged != nullptr);
-    CHECK(unchanged->cached_token_count() == 0);
+    CHECK(unchanged->processed_token_count() == 0);
     CHECK(unchanged->scheduled_token_count() == 2);
 
     // Chunk 2: remaining prefill slice [30] starting at cached prefix position 2
-    const std::array<token_id, 1> ignored_sample { 77 };
-    REQUIRE(engine->complete(*first, ignored_sample).has_value());
+    const std::array<token_id, 0> ignored_sample {};
+    REQUIRE(engine->complete(first->id, ignored_sample).has_value());
 
     auto second = engine->schedule();
     REQUIRE(second.has_value());
@@ -85,7 +85,7 @@ TEST_CASE("model batch builds chunked prefill and subsequent decode batches")
 
     // Decode: subsequent step feeds the previous sample (30) at position 3
     const std::array<token_id, 1> decode_sample { 40 };
-    REQUIRE(engine->complete(*second, decode_sample).has_value());
+    REQUIRE(engine->complete(second->id, decode_sample).has_value());
 
     auto decode = engine->schedule();
     REQUIRE(decode.has_value());
@@ -105,8 +105,8 @@ TEST_CASE("ragged prefill is flattened in scheduled order")
     config.max_sequences = 2;
     config.max_batch_tokens = 3;
     auto engine = scheduler::make(config);
-    auto first = seq::make(1, { 10, 11 }, sampling_params {}, 2);
-    auto second = seq::make(2, { 20, 21 }, sampling_params {}, 2);
+    auto first = seq::make(1, { 10, 11 }, generation_params {});
+    auto second = seq::make(2, { 20, 21 }, generation_params {});
     REQUIRE(engine.has_value());
     REQUIRE(first.has_value());
     REQUIRE(second.has_value());
@@ -128,7 +128,13 @@ TEST_CASE("ragged prefill is flattened in scheduled order")
     CHECK(built->items[1].id == 2);
     CHECK(built->items[1].token_offset == 2);
     CHECK(built->items[1].token_count == 1);
-    CHECK(built->items[1].logits_index == 2);
+    CHECK_FALSE(built->items[1].logits_index.has_value());
+    auto updates = engine->complete(scheduled->id, std::array<token_id, 1> { 42 });
+    REQUIRE(updates.has_value());
+    REQUIRE(updates->size() == 1);
+    CHECK(updates->front().id == 1);
+    CHECK(engine->find_sequence(2)->completion_token_count() == 0);
+    CHECK(engine->find_sequence(2)->processed_token_count() == 1);
 }
 
 TEST_CASE("model batch rejects invalid scheduled batches")
@@ -144,7 +150,7 @@ TEST_CASE("model batch rejects invalid scheduled batches")
 
     SUBCASE("reservation mismatch and duplicate ids")
     {
-        auto sequence = seq::make(1, { 10 }, sampling_params {}, 2);
+        auto sequence = seq::make(1, { 10 }, generation_params {});
         REQUIRE(sequence.has_value());
         REQUIRE(engine->add(std::move(*sequence)).has_value());
 
@@ -163,7 +169,7 @@ TEST_CASE("model batch rejects invalid scheduled batches")
 
         const auto* unchanged = engine->find_sequence(1);
         REQUIRE(unchanged != nullptr);
-        CHECK(unchanged->cached_token_count() == 0);
+        CHECK(unchanged->processed_token_count() == 0);
         CHECK(unchanged->scheduled_token_count() == 1);
     }
 }

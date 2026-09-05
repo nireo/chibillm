@@ -22,12 +22,6 @@ enum class inference_engine_errc : std::uint8_t {
     sequence_remove_failed,
 };
 
-struct sequence_update {
-    seq_id id;
-    token_id token;
-    finish_reason reason;
-};
-
 // coordinates scheduling, model execution, and sequence completion.
 class inference_engine {
 public:

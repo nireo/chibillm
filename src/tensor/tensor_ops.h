@@ -12,6 +12,13 @@
 namespace chibillm {
 
 enum class tensor_op_errc : std::uint8_t {
+    tensor_creation_failed,
+    allocation_failed,
+    empty_tokens,
+    empty_logits_indices,
+    invalid_hidden_states,
+    logits_index_out_of_range,
+    token_id_overflow,
     invalid_rank,
     unsupported_dtype,
     input_shape_mismatch,
@@ -34,6 +41,11 @@ enum class tensor_op_errc : std::uint8_t {
     invalid_kv_head_mapping,
     backend_failure,
 };
+
+[[nodiscard]] result<metal_tensor, tensor_op_errc>
+allocate_tensor(const metal_context& context, dtype type, std::vector<std::size_t> dimensions);
+[[nodiscard]] result<metal_tensor, tensor_op_errc>
+upload_u32(const metal_context& context, std::span<const std::uint32_t> values);
 
 // projects input and adds a same-shaped f32 residual into output.
 [[nodiscard]] result<void, tensor_op_errc> linear_add(const metal_context& context,

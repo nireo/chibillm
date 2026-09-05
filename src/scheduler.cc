@@ -1,4 +1,5 @@
 #include "scheduler.h"
+#include "model_batch.h"
 #include "seq.h"
 
 #include <algorithm>
@@ -25,7 +26,7 @@ scheduled_batch::token_count() const noexcept
 }
 
 result<scheduler, scheduler_errc>
-scheduler::make(scheduler_config config)
+scheduler::make(scheduler_config config, std::unique_ptr<model_state> state)
 {
     if (config.max_sequences == 0) {
         return fail(scheduler_errc::invalid_max_sequences);
@@ -35,26 +36,22 @@ scheduler::make(scheduler_config config)
         return fail(scheduler_errc::invalid_max_batch_tokens);
     }
 
-    if (config.kv_block_count == 0) {
-        return fail(scheduler_errc::invalid_kv_block_count);
+    if (!state) {
+        if (!config.kv_block_count)
+            return fail(scheduler_errc::invalid_kv_block_count);
+        if (!config.kv_block_size)
+            return fail(scheduler_errc::invalid_kv_block_size);
+        auto manager = block_manager::make(config.kv_block_count, config.kv_block_size);
+        if (!manager)
+            return fail(scheduler_errc::block_manager_failure);
+        state = std::make_unique<block_manager>(std::move(*manager));
     }
-
-    if (config.kv_block_size == 0) {
-        return fail(scheduler_errc::invalid_kv_block_size);
-    }
-
-    auto manager = block_manager::make(config.kv_block_count, config.kv_block_size);
-    if (!manager) {
-        // map block-manager failures at the scheduler boundary.
-        return fail(scheduler_errc::block_manager_failure);
-    }
-
-    return scheduler { config, std::move(*manager) };
+    return scheduler { config, std::move(state) };
 }
 
-scheduler::scheduler(scheduler_config config, block_manager manager)
+scheduler::scheduler(scheduler_config config, std::unique_ptr<model_state> state)
     : config_(config)
-    , block_manager_(std::move(manager))
+    , state_(std::move(state))
 {
     assert_invariants();
 }
@@ -103,16 +100,10 @@ scheduler::find_sequence(seq_id id) const noexcept
 }
 
 seq*
-scheduler::find_sequence(seq_id id) noexcept
+scheduler::mutable_sequence(seq_id id) noexcept
 {
     const auto found = sequences_.find(id);
     return found == sequences_.end() ? nullptr : &found->second;
-}
-
-const block_manager&
-scheduler::cache() const noexcept
-{
-    return block_manager_;
 }
 
 result<void, scheduler_errc>
@@ -126,9 +117,7 @@ scheduler::add(seq sequence)
 
     const bool is_ok = sequence.status() == seq_status::waiting
         && sequence.scheduled_token_count() == 0
-        && sequence.cached_token_count() == 0
-        && sequence.block_table().empty()
-        && sequence.block_size() == config_.kv_block_size;
+        && sequence.processed_token_count() == 0;
 
     if (!is_ok) {
         return fail(scheduler_errc::invalid_sequence_state);
@@ -157,108 +146,43 @@ scheduler::schedule()
         .items = {},
     };
 
-    batch.items.reserve(std::min(waiting_.size(), config_.max_sequences));
-    size_t used_tokens = 0;
     bool blocked_by_cache = false;
-
-    for (const auto id : waiting_) {
-        if (batch.items.size() >= config_.max_sequences) {
-            break;
-        }
-
-        if (used_tokens >= config_.max_batch_tokens) {
-            break;
-        }
-
-        auto* sequence = find_sequence(id);
-        if (sequence == nullptr) {
-            rollback_reservations(batch);
-            return fail(scheduler_errc::unknown_sequence);
-        }
-
-        const auto available = sequence->schedulable_token_count();
-        if (available == 0) {
-            rollback_reservations(batch);
-            return fail(scheduler_errc::invalid_sequence_state);
-        }
-
-        const auto remaining_tokens = config_.max_batch_tokens - used_tokens;
-        const auto tokens_to_schedule = std::min(available, remaining_tokens);
-
-        // capacity covers the full sequence, not only this prefill chunk.
-        auto capacity = block_manager_.ensure_capacity(*sequence);
-        if (!capacity) {
-            if (capacity.error() == block_manager_errc::insufficient_free_blocks) {
-                blocked_by_cache = true;
-                continue;
-            }
-
-            rollback_reservations(batch);
-            return fail(scheduler_errc::block_manager_failure);
-        }
-
-        auto reserved = sequence->schedule_tokens(tokens_to_schedule);
-        if (!reserved) {
-            rollback_reservations(batch);
-            return fail(scheduler_errc::sequence_failure);
-        }
-
-        batch.items.push_back(scheduled_item {
-            .id = id,
-            .token_count = tokens_to_schedule,
-        });
-
-        used_tokens += tokens_to_schedule;
-    }
-
-    // fall back to decode only when no prefill work fits.
-    if (batch.empty()) {
-        batch.phase = batch_phase::decode;
-        batch.items.reserve(std::min(running_.size(), config_.max_sequences));
-        used_tokens = 0;
-
-        for (const auto id : running_) {
+    const auto select = [&](const std::deque<seq_id>& queue,
+                            batch_phase phase) -> result<void, scheduler_errc> {
+        batch.phase = phase;
+        batch.items.reserve(std::min(queue.size(), config_.max_sequences));
+        std::size_t used_tokens = 0;
+        for (const auto id : queue) {
             if (batch.items.size() >= config_.max_sequences
-                || used_tokens >= config_.max_batch_tokens) {
+                || used_tokens >= config_.max_batch_tokens)
                 break;
-            }
-
-            auto* sequence = find_sequence(id);
-            if (sequence == nullptr) {
-                rollback_reservations(batch);
-                return fail(scheduler_errc::unknown_sequence);
-            }
-
-            // running sequences must preserve a one-token cache gap.
-            if (sequence->status() != seq_status::running
-                || sequence->schedulable_token_count() != 1) {
-                rollback_reservations(batch);
+            auto* sequence = mutable_sequence(id);
+            assert(sequence != nullptr);
+            const auto available = sequence->schedulable_token_count();
+            if (!available || (phase == batch_phase::decode && available != 1))
                 return fail(scheduler_errc::invalid_sequence_state);
-            }
-
-            auto capacity = block_manager_.ensure_capacity(*sequence);
+            auto capacity = state_->reserve(id, sequence->token_count());
             if (!capacity) {
-                if (capacity.error() == block_manager_errc::insufficient_free_blocks) {
+                if (capacity.error() == state_errc::capacity_exhausted) {
                     blocked_by_cache = true;
                     continue;
                 }
-
-                rollback_reservations(batch);
                 return fail(scheduler_errc::block_manager_failure);
             }
-
-            auto reserved = sequence->schedule_tokens(1);
-            if (!reserved) {
-                rollback_reservations(batch);
+            const auto count = std::min(available, config_.max_batch_tokens - used_tokens);
+            if (!sequence->schedule_tokens(count))
                 return fail(scheduler_errc::sequence_failure);
-            }
-
-            batch.items.push_back(scheduled_item {
-                .id = id,
-                .token_count = 1,
-            });
-            ++used_tokens;
+            batch.items.push_back({ id, count, count == available });
+            used_tokens += count;
         }
+        return {};
+    };
+    auto selected = select(waiting_, batch_phase::prefill);
+    if (selected && batch.empty())
+        selected = select(running_, batch_phase::decode);
+    if (!selected) {
+        rollback_reservations(batch);
+        return fail(selected.error());
     }
 
     if (batch.empty()) {
@@ -276,56 +200,48 @@ scheduler::schedule()
 }
 
 result<void, scheduler_errc>
-scheduler::complete(const scheduled_batch& batch, std::span<const token_id> sampled_tokens)
+scheduler::begin_execution(const model_batch& batch)
+{
+    if (!active_batch_)
+        return fail(scheduler_errc::no_batch_in_flight);
+    if (active_batch_->id != batch.id)
+        return fail(scheduler_errc::batch_id_mismatch);
+    if (state_transaction_open_)
+        return fail(scheduler_errc::batch_in_flight);
+    state_transaction_open_ = true;
+    if (!state_->begin_batch(batch))
+        return fail(scheduler_errc::block_manager_failure);
+    return {};
+}
+
+result<std::vector<sequence_update>, scheduler_errc>
+scheduler::complete(batch_id id, std::span<const token_id> sampled_tokens)
 {
     if (!active_batch_.has_value()) {
         return fail(scheduler_errc::no_batch_in_flight);
     }
 
     const auto& active = *active_batch_;
-    if (batch.id != active.id) {
+    if (id != active.id) {
         return fail(scheduler_errc::batch_id_mismatch);
     }
 
-    if (sampled_tokens.size() != active.items.size()) {
+    const auto sample_count = std::count_if(active.items.begin(), active.items.end(),
+                                            [](const auto& item) { return item.sample; });
+    if (sampled_tokens.size() != static_cast<std::size_t>(sample_count)) {
         return fail(scheduler_errc::result_count_mismatch);
     }
+    std::vector<sequence_update> updates;
+    updates.reserve(sampled_tokens.size());
+    std::size_t sample_index = 0;
 
-    // validate the caller's copy against the authoritative batch.
-    if (batch.phase != active.phase || batch.items.size() != active.items.size()) {
-        return fail(scheduler_errc::invalid_sequence_state);
+    if (state_transaction_open_) {
+        state_->commit_batch();
+        state_transaction_open_ = false;
     }
-
-    for (std::size_t index = 0; index < active.items.size(); ++index) {
-        const auto& expected_item = active.items[index];
-        const auto& supplied_item = batch.items[index];
-        if (supplied_item.id != expected_item.id
-            || supplied_item.token_count != expected_item.token_count) {
-            return fail(scheduler_errc::invalid_sequence_state);
-        }
-
-        const auto* sequence = find_sequence(expected_item.id);
-        if (sequence == nullptr) {
-            return fail(scheduler_errc::unknown_sequence);
-        }
-
-        const auto expected_status =
-            active.phase == batch_phase::prefill ? seq_status::waiting : seq_status::running;
-
-        const auto& expected_queue = active.phase == batch_phase::prefill ? waiting_ : running_;
-
-        if (sequence->status() != expected_status
-            || sequence->scheduled_token_count() != expected_item.token_count
-            || std::find(expected_queue.begin(), expected_queue.end(), expected_item.id)
-                == expected_queue.end()) {
-            return fail(scheduler_errc::invalid_sequence_state);
-        }
-    }
-
-    // validate every item before mutating any sequence.
     for (std::size_t index = 0; index < active.items.size(); ++index) {
         const auto item = active.items[index];
-        auto* sequence = find_sequence(item.id);
+        auto* sequence = mutable_sequence(item.id);
         assert(sequence != nullptr);
 
         auto committed = sequence->commit_scheduled_tokens();
@@ -334,8 +250,7 @@ scheduler::complete(const scheduled_batch& batch, std::span<const token_id> samp
             return fail(scheduler_errc::sequence_failure);
         }
 
-        if (active.phase == batch_phase::prefill && sequence->uncached_token_count() != 0) {
-            // intermediate prefill samples are not usable completions.
+        if (!item.sample) {
             continue;
         }
 
@@ -348,7 +263,7 @@ scheduler::complete(const scheduled_batch& batch, std::span<const token_id> samp
         }
 
         // appending the sample restores the one-token cache gap.
-        auto appended = sequence->append_token(sampled_tokens[index]);
+        auto appended = sequence->append_token(sampled_tokens[sample_index++]);
         if (!appended) {
             assert(false && "prevalidated sampled-token append failed");
             return fail(scheduler_errc::sequence_failure);
@@ -368,11 +283,7 @@ scheduler::complete(const scheduled_batch& batch, std::span<const token_id> samp
                 return fail(scheduler_errc::invalid_sequence_state);
             }
 
-            auto released = block_manager_.release(*sequence);
-            if (!released) {
-                assert(false && "prevalidated KV-cache release failed");
-                return fail(scheduler_errc::block_manager_failure);
-            }
+            state_->release(item.id);
         } else if (active.phase == batch_phase::prefill) {
             if (!remove_from_queue(waiting_, item.id)) {
                 assert(false && "prefilled sequence was absent from waiting queue");
@@ -380,55 +291,31 @@ scheduler::complete(const scheduled_batch& batch, std::span<const token_id> samp
             }
             running_.push_back(item.id);
         }
+        updates.push_back({ item.id, sequence->last_token(), sequence->reason() });
     }
 
     active_batch_.reset();
     assert_invariants();
 
-    return {};
+    return updates;
 }
 
 result<void, scheduler_errc>
-scheduler::abort(const scheduled_batch& batch)
+scheduler::abort(batch_id id)
 {
     if (!active_batch_.has_value()) {
         return fail(scheduler_errc::no_batch_in_flight);
     }
 
     const auto& active = *active_batch_;
-    if (batch.id != active.id) {
+    if (id != active.id) {
         return fail(scheduler_errc::batch_id_mismatch);
     }
 
-    if (batch.phase != active.phase || batch.items.size() != active.items.size()) {
-        return fail(scheduler_errc::invalid_sequence_state);
+    if (state_transaction_open_) {
+        state_->abort_batch();
+        state_transaction_open_ = false;
     }
-
-    for (std::size_t index = 0; index < active.items.size(); ++index) {
-        const auto& expected_item = active.items[index];
-        const auto& supplied_item = batch.items[index];
-        if (supplied_item.id != expected_item.id
-            || supplied_item.token_count != expected_item.token_count) {
-            return fail(scheduler_errc::invalid_sequence_state);
-        }
-
-        const auto* sequence = find_sequence(expected_item.id);
-        if (sequence == nullptr) {
-            return fail(scheduler_errc::unknown_sequence);
-        }
-
-        const auto expected_status =
-            active.phase == batch_phase::prefill ? seq_status::waiting : seq_status::running;
-        const auto& expected_queue = active.phase == batch_phase::prefill ? waiting_ : running_;
-
-        if (sequence->status() != expected_status
-            || sequence->scheduled_token_count() != expected_item.token_count
-            || std::find(expected_queue.begin(), expected_queue.end(), expected_item.id)
-                == expected_queue.end()) {
-            return fail(scheduler_errc::invalid_sequence_state);
-        }
-    }
-
     rollback_reservations(active);
     active_batch_.reset();
     assert_invariants();
@@ -443,7 +330,7 @@ scheduler::cancel(seq_id id)
         return fail(scheduler_errc::batch_in_flight);
     }
 
-    auto* sequence = find_sequence(id);
+    auto* sequence = mutable_sequence(id);
     if (sequence == nullptr) {
         return fail(scheduler_errc::unknown_sequence);
     }
@@ -459,10 +346,7 @@ scheduler::cancel(seq_id id)
     if (!finished) {
         return fail(scheduler_errc::sequence_failure);
     }
-    auto released = block_manager_.release(*sequence);
-    if (!released) {
-        return fail(scheduler_errc::block_manager_failure);
-    }
+    state_->release(id);
 
     assert_invariants();
     return {};
@@ -504,7 +388,7 @@ void
 scheduler::rollback_reservations(const scheduled_batch& batch) noexcept
 {
     for (const auto& item : batch.items) {
-        auto* sequence = find_sequence(item.id);
+        auto* sequence = mutable_sequence(item.id);
 
         assert(sequence != nullptr);
         if (sequence == nullptr) {
@@ -522,8 +406,7 @@ scheduler::assert_invariants() const noexcept
 #ifndef NDEBUG
     assert(config_.max_sequences > 0);
     assert(config_.max_batch_tokens > 0);
-    assert(config_.kv_block_count > 0);
-    assert(config_.kv_block_size > 0);
+    assert(state_ != nullptr);
 #endif
 }
 

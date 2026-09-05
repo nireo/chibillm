@@ -5,46 +5,30 @@
 #include <utility>
 
 namespace chibillm {
-seq::seq(seq_id id,
-         std::vector<token_id> prompt_tokens,
-         sampling_params params,
-         std::size_t kv_block_size)
+seq::seq(seq_id id, std::vector<token_id> prompt_tokens, generation_params params)
     : id_(id)
     , tokens_(std::move(prompt_tokens))
     , prompt_token_count_(tokens_.size())
-    , block_size_(kv_block_size)
     , params_(params)
 {
     assert_invariants();
 }
 
 result<seq, seq_errc>
-seq::make(seq_id id,
-          std::vector<token_id> prompt_tokens,
-          sampling_params params,
-          std::size_t kv_block_size)
+seq::make(seq_id id, std::vector<token_id> prompt_tokens, generation_params params)
 {
     if (prompt_tokens.empty()) {
         return fail(seq_errc::empty_prompt);
-    }
-
-    if (!std::isfinite(params.temperature) || params.temperature <= 0.0f) {
-        return fail(seq_errc::invalid_temperature);
     }
 
     if (params.max_new_tokens == 0) {
         return fail(seq_errc::invalid_max_new_tokens);
     }
 
-    if (kv_block_size == 0) {
-        return fail(seq_errc::invalid_block_size);
-    }
-
     return seq {
         id,
         std::move(prompt_tokens),
         params,
-        kv_block_size,
     };
 }
 
@@ -138,7 +122,7 @@ seq::append_token(token_id token)
         return fail(seq_errc::work_already_scheduled);
     }
 
-    if (cached_token_count_ != token_count()) {
+    if (processed_token_count_ != token_count()) {
         return fail(seq_errc::invalid_state_transition);
     }
 
@@ -162,31 +146,11 @@ seq::mark_running()
         return fail(seq_errc::work_already_scheduled);
     }
 
-    if (token_count() != cached_token_count_) {
+    if (token_count() != processed_token_count_) {
         return fail(seq_errc::invalid_state_transition);
     }
 
     status_ = seq_status::running;
-    assert_invariants();
-    return {};
-}
-
-result<void, seq_errc>
-seq::mark_waiting()
-{
-    if (status_ == seq_status::finished) {
-        return fail(seq_errc::already_finished);
-    }
-
-    if (status_ != seq_status::running) {
-        return fail(seq_errc::invalid_state_transition);
-    }
-
-    if (scheduled_token_count_ > 0) {
-        return fail(seq_errc::work_already_scheduled);
-    }
-
-    status_ = seq_status::waiting;
     assert_invariants();
     return {};
 }
@@ -214,9 +178,9 @@ seq::finish(finish_reason reason)
 }
 
 std::size_t
-seq::cached_token_count() const noexcept
+seq::processed_token_count() const noexcept
 {
-    return cached_token_count_;
+    return processed_token_count_;
 }
 
 std::size_t
@@ -226,15 +190,15 @@ seq::scheduled_token_count() const noexcept
 }
 
 std::size_t
-seq::uncached_token_count() const noexcept
+seq::unprocessed_token_count() const noexcept
 {
-    return token_count() - cached_token_count_;
+    return token_count() - processed_token_count_;
 }
 
 std::size_t
 seq::schedulable_token_count() const noexcept
 {
-    return token_count() - cached_token_count_ - scheduled_token_count_;
+    return token_count() - processed_token_count_ - scheduled_token_count_;
 }
 
 result<void, seq_errc>
@@ -272,7 +236,7 @@ seq::commit_scheduled_tokens()
         return fail(seq_errc::no_work_scheduled);
     }
 
-    cached_token_count_ += scheduled_token_count_;
+    processed_token_count_ += scheduled_token_count_;
     scheduled_token_count_ = 0;
 
     assert_invariants();
@@ -286,109 +250,7 @@ seq::cancel_scheduled_tokens() noexcept
     assert_invariants();
 }
 
-result<void, seq_errc>
-seq::set_cached_token_count(std::size_t count)
-{
-    if (status_ == seq_status::finished) {
-        return fail(seq_errc::already_finished);
-    }
-
-    if (status_ != seq_status::waiting) {
-        return fail(seq_errc::invalid_state_transition);
-    }
-
-    if (count > token_count()) {
-        return fail(seq_errc::cached_token_count_out_of_range);
-    }
-
-    if (scheduled_token_count_ > 0) {
-        return fail(seq_errc::work_already_scheduled);
-    }
-
-    cached_token_count_ = count;
-    assert_invariants();
-    return {};
-}
-
-std::size_t
-seq::block_size() const noexcept
-{
-    return block_size_;
-}
-
-std::size_t
-seq::logical_block_count() const noexcept
-{
-    return 1 + (token_count() - 1) / block_size_;
-}
-
-std::size_t
-seq::tokens_in_last_block() const noexcept
-{
-    const auto re = token_count() % block_size_;
-    return (re == 0) ? block_size_ : re;
-}
-
-result<std::span<const token_id>, seq_errc>
-seq::logical_block_tokens(std::size_t logical_block) const noexcept
-{
-    if (logical_block >= logical_block_count()) {
-        return fail(seq_errc::index_out_of_range);
-    }
-
-    const auto start = logical_block * block_size_;
-    auto end = start + block_size_;
-    if (end > token_count()) {
-        end = token_count();
-    }
-
-    return std::span(tokens_).subspan(start, end - start);
-}
-
-std::span<const block_id>
-seq::block_table() const noexcept
-{
-    return {
-        block_table_.data(),
-        block_table_.size(),
-    };
-}
-
-result<void, seq_errc>
-seq::append_physical_block(block_id physical_block)
-{
-    if (status_ == seq_status::finished) {
-        return fail(seq_errc::already_finished);
-    }
-
-    if (block_table_.size() >= logical_block_count()) {
-        return fail(seq_errc::block_table_full);
-    }
-
-    block_table_.push_back(physical_block);
-    assert_invariants();
-    return {};
-}
-
-result<void, seq_errc>
-seq::reset_cache_metadata()
-{
-    if (status_ == seq_status::running) {
-        return fail(seq_errc::invalid_state_transition);
-    }
-
-    if (scheduled_token_count_ != 0) {
-        return fail(seq_errc::work_already_scheduled);
-    }
-
-    cached_token_count_ = 0;
-    block_table_.clear();
-
-    assert_invariants();
-    return {};
-}
-
-const sampling_params&
+const generation_params&
 seq::params() const noexcept
 {
     return params_;
@@ -420,11 +282,8 @@ seq::assert_invariants() const noexcept
     assert(prompt_token_count_ > 0);
     assert(prompt_token_count_ <= tokens_.size());
 
-    assert(block_size_ > 0);
-    assert(cached_token_count_ <= tokens_.size());
-    assert(cached_token_count_ + scheduled_token_count_ <= tokens_.size());
-
-    assert(block_table_.size() <= logical_block_count());
+    assert(processed_token_count_ <= tokens_.size());
+    assert(processed_token_count_ + scheduled_token_count_ <= tokens_.size());
 
     if (status_ == seq_status::finished) {
         assert(finish_reason_ != finish_reason::none);

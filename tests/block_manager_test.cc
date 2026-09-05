@@ -1,211 +1,50 @@
-#include <doctest/doctest.h>
-
-#include <limits>
-
 #include "block_manager.h"
+#include <doctest/doctest.h>
+#include <limits>
+using namespace chibillm;
 
-using chibillm::block_id;
-using chibillm::block_manager;
-using chibillm::block_manager_errc;
-using chibillm::kv_block;
-using chibillm::sampling_params;
-using chibillm::seq;
-using chibillm::seq_status;
-
-TEST_CASE("block manager construction validates its geometry")
+TEST_CASE("paged state validates geometry")
 {
-    auto zero_blocks = block_manager::make(0, 16);
-    REQUIRE_FALSE(zero_blocks.has_value());
-    CHECK(zero_blocks.error() == block_manager_errc::invalid_block_count);
-
-    auto zero_size = block_manager::make(4, 0);
-    REQUIRE_FALSE(zero_size.has_value());
-    CHECK(zero_size.error() == block_manager_errc::invalid_block_size);
-
-    if constexpr (std::numeric_limits<std::size_t>::max() > std::numeric_limits<block_id>::max()) {
-        const auto unrepresentable =
-            static_cast<std::size_t>(std::numeric_limits<block_id>::max()) + 2;
-        auto too_many = block_manager::make(unrepresentable, 16);
-        REQUIRE_FALSE(too_many.has_value());
-        CHECK(too_many.error() == block_manager_errc::too_many_blocks);
-    }
+    CHECK(block_manager::make(0, 16).error() == block_manager_errc::invalid_block_count);
+    CHECK(block_manager::make(4, 0).error() == block_manager_errc::invalid_block_size);
+    CHECK(
+        block_manager::make(static_cast<std::size_t>(std::numeric_limits<block_id>::max()) + 2, 16)
+            .error()
+        == block_manager_errc::too_many_blocks);
 }
 
-TEST_CASE("new block manager starts with every block free")
+TEST_CASE("paged reservations grow at block boundaries and release without sharing ownership")
 {
-    auto result = block_manager::make(4, 16);
-    REQUIRE(result.has_value());
-    const auto& manager = *result;
-
-    CHECK(manager.block_count() == 4);
-    CHECK(manager.block_size() == 16);
-    CHECK(manager.free_block_count() == 4);
-    CHECK(manager.used_block_count() == 0);
-    REQUIRE(manager.blocks().size() == 4);
-
-    for (std::size_t index = 0; index < manager.blocks().size(); ++index) {
-        CHECK(manager.blocks()[index].id == static_cast<block_id>(index));
-        CHECK(manager.blocks()[index].ref_count == 0);
-        CHECK(manager.blocks()[index].is_free());
-    }
+    auto state = block_manager::make(4, 2);
+    REQUIRE(state.has_value());
+    REQUIRE(state->reserve(1, 3).has_value());
+    CHECK(state->resources(1).blocks.size() == 2);
+    CHECK(state->free_block_count() == 2);
+    REQUIRE(state->reserve(1, 4).has_value());
+    CHECK(state->free_block_count() == 2);
+    REQUIRE(state->reserve(1, 5).has_value());
+    CHECK(state->resources(1).blocks.size() == 3);
+    REQUIRE(state->reserve(2, 2).has_value());
+    CHECK(state->resources(2).blocks[0] == 3);
+    state->release(1);
+    CHECK(state->resources(1).blocks.empty());
+    CHECK(state->free_block_count() == 3);
+    state->release(1);
+    CHECK(state->free_block_count() == 3);
+    REQUIRE(state->reserve(3, 1).has_value());
+    CHECK(state->resources(3).blocks[0] == 0);
+    CHECK(state->resources(2).blocks[0] == 3);
 }
 
-TEST_CASE("block manager calculates capacity requirements and assigns physical blocks")
+TEST_CASE("failed reservations leave existing allocations intact")
 {
-    auto manager_result = block_manager::make(4, 2);
-    auto sequence_result = seq::make(1, { 1, 2, 3 }, sampling_params {}, 2);
-    REQUIRE(manager_result.has_value());
-    REQUIRE(sequence_result.has_value());
-    auto& manager = *manager_result;
-    auto& sequence = *sequence_result;
-
-    auto required = manager.additional_blocks_required(sequence);
-    auto can_allocate = manager.can_ensure_capacity(sequence);
-    REQUIRE(required.has_value());
-    REQUIRE(can_allocate.has_value());
-    CHECK(*required == 2);
-    CHECK(*can_allocate);
-    CHECK(manager.free_block_count() == 4);
-    CHECK(sequence.block_table().empty());
-
-    auto exhausted = block_manager::make(1, 2);
-    REQUIRE(exhausted.has_value());
-    CHECK(exhausted->can_ensure_capacity(sequence).value() == false);
-
-    REQUIRE(manager.ensure_capacity(sequence).has_value());
-    REQUIRE(sequence.block_table().size() == 2);
-    CHECK(sequence.block_table()[0] == 0);
-    CHECK(sequence.block_table()[1] == 1);
-    CHECK(manager.free_block_count() == 2);
-    CHECK(manager.used_block_count() == 2);
-    CHECK(manager.blocks()[0].ref_count == 1);
-    CHECK(manager.blocks()[1].ref_count == 1);
-
-    // calling again when every logical block is already mapped is a no-op.
-    REQUIRE(manager.ensure_capacity(sequence).has_value());
-    CHECK(sequence.block_table().size() == 2);
-    CHECK(manager.free_block_count() == 2);
-}
-
-TEST_CASE("insufficient capacity does not partially allocate")
-{
-    auto manager_result = block_manager::make(1, 2);
-    auto sequence_result = seq::make(1, { 1, 2, 3 }, sampling_params {}, 2);
-    REQUIRE(manager_result.has_value());
-    REQUIRE(sequence_result.has_value());
-    auto& manager = *manager_result;
-    auto& sequence = *sequence_result;
-
-    auto allocated = manager.ensure_capacity(sequence);
-
-    REQUIRE_FALSE(allocated.has_value());
-    CHECK(allocated.error() == block_manager_errc::insufficient_free_blocks);
-    CHECK(sequence.block_table().empty());
-    CHECK(manager.free_block_count() == 1);
-    CHECK(manager.used_block_count() == 0);
-    CHECK(manager.blocks()[0].is_free());
-}
-
-TEST_CASE("decode growth allocates only when crossing a block boundary")
-{
-    auto manager_result = block_manager::make(3, 2);
-    auto sequence_result = seq::make(1, { 1, 2, 3 }, sampling_params {}, 2);
-    REQUIRE(manager_result.has_value());
-    REQUIRE(sequence_result.has_value());
-    auto& manager = *manager_result;
-    auto& sequence = *sequence_result;
-
-    REQUIRE(manager.ensure_capacity(sequence).has_value());
-    REQUIRE(sequence.schedule_tokens(3).has_value());
-    REQUIRE(sequence.commit_scheduled_tokens().has_value());
-    REQUIRE(sequence.mark_running().has_value());
-
-    // token 4 fills the existing second logical block.
-    REQUIRE(sequence.append_token(4).has_value());
-    REQUIRE(manager.ensure_capacity(sequence).has_value());
-    CHECK(sequence.block_table().size() == 2);
-    CHECK(manager.free_block_count() == 1);
-
-    // process token 4, then append token 5. position 4 begins logical block 2.
-    REQUIRE(sequence.schedule_tokens(1).has_value());
-    REQUIRE(sequence.commit_scheduled_tokens().has_value());
-    REQUIRE(sequence.append_token(5).has_value());
-    REQUIRE(manager.ensure_capacity(sequence).has_value());
-    REQUIRE(sequence.block_table().size() == 3);
-    CHECK(sequence.block_table()[2] == 2);
-    CHECK(manager.free_block_count() == 0);
-}
-
-TEST_CASE("release returns blocks and FIFO allocation reuses the oldest free ID")
-{
-    auto manager_result = block_manager::make(3, 2);
-    auto first_result = seq::make(1, { 1, 2, 3 }, sampling_params {}, 2);
-    REQUIRE(manager_result.has_value());
-    REQUIRE(first_result.has_value());
-    auto& manager = *manager_result;
-    auto& first = *first_result;
-
-    REQUIRE(manager.ensure_capacity(first).has_value());
-    REQUIRE(manager.release(first).has_value());
-    CHECK(first.block_table().empty());
-    CHECK(first.cached_token_count() == 0);
-    CHECK(manager.free_block_count() == 3);
-    CHECK(manager.used_block_count() == 0);
-
-    // block 2 was never used and remained at the front while 0 and 1 were
-    // released to the back.
-    auto second_result = seq::make(2, { 9 }, sampling_params {}, 2);
-    REQUIRE(second_result.has_value());
-    auto& second = *second_result;
-    REQUIRE(manager.ensure_capacity(second).has_value());
-    REQUIRE(second.block_table().size() == 1);
-    CHECK(second.block_table()[0] == 2);
-}
-
-TEST_CASE("release rejects busy sequences without changing ownership")
-{
-    auto manager_result = block_manager::make(2, 2);
-    auto sequence_result = seq::make(1, { 1, 2 }, sampling_params {}, 2);
-    REQUIRE(manager_result.has_value());
-    REQUIRE(sequence_result.has_value());
-    auto& manager = *manager_result;
-    auto& sequence = *sequence_result;
-
-    REQUIRE(manager.ensure_capacity(sequence).has_value());
-    REQUIRE(sequence.schedule_tokens(1).has_value());
-    CHECK(manager.release(sequence).error() == block_manager_errc::sequence_has_scheduled_work);
-    CHECK(sequence.scheduled_token_count() == 1);
-    CHECK(manager.used_block_count() == 1);
-
-    REQUIRE(sequence.commit_scheduled_tokens().has_value());
-    REQUIRE(sequence.schedule_tokens(1).has_value());
-    REQUIRE(sequence.commit_scheduled_tokens().has_value());
-    REQUIRE(sequence.mark_running().has_value());
-    CHECK(manager.release(sequence).error() == block_manager_errc::sequence_running);
-    CHECK(sequence.status() == seq_status::running);
-    CHECK(sequence.block_table().size() == 1);
-    CHECK(manager.used_block_count() == 1);
-}
-
-TEST_CASE("block requirements validation rejects incompatible geometry and invalid block IDs")
-{
-    auto manager = block_manager::make(2, 2);
-    REQUIRE(manager.has_value());
-
-    auto wrong_geometry = seq::make(1, { 1, 2 }, sampling_params {}, 4);
-    REQUIRE(wrong_geometry.has_value());
-    CHECK(manager->additional_blocks_required(*wrong_geometry).error()
-          == block_manager_errc::incompatible_block_size);
-
-    auto free_reference = seq::make(1, { 1 }, sampling_params {}, 2);
-    REQUIRE(free_reference.has_value());
-    REQUIRE(free_reference->append_physical_block(0).has_value());
-    CHECK(manager->additional_blocks_required(*free_reference).error()
-          == block_manager_errc::block_not_in_use);
-
-    auto invalid_reference = seq::make(2, { 1 }, sampling_params {}, 2);
-    REQUIRE(invalid_reference.has_value());
-    REQUIRE(invalid_reference->append_physical_block(99).has_value());
-    CHECK(manager->additional_blocks_required(*invalid_reference).error()
-          == block_manager_errc::invalid_block_id);
+    auto state = block_manager::make(2, 2);
+    REQUIRE(state.has_value());
+    REQUIRE(state->reserve(1, 2).has_value());
+    CHECK(state->reserve(2, 3).error() == state_errc::capacity_exhausted);
+    CHECK(state->resources(2).blocks.empty());
+    CHECK(state->reserve(1, 5).error() == state_errc::capacity_exhausted);
+    CHECK(state->resources(1).blocks.size() == 1);
+    CHECK(state->free_block_count() == 1);
+    CHECK(state->reserve(2, 0).error() == state_errc::invalid_reservation);
 }

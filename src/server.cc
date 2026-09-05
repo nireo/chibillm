@@ -1,20 +1,15 @@
 #include "server.h"
+#include "serving_runtime.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <condition_variable>
-#include <deque>
 #include <limits>
 #include <mutex>
 #include <optional>
-#include <span>
 #include <string_view>
-#include <thread>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -34,406 +29,8 @@ struct request_error {
 };
 
 struct completion_request {
-    std::vector<chat_message> messages;
-    std::size_t max_completion_tokens;
+    generation_request generation;
     bool stream;
-};
-
-enum class request_status : std::uint8_t {
-    submitted,
-    ready,
-    finished,
-};
-
-struct request_state {
-    request_state(seq_id id, std::int64_t created) noexcept
-        : id(id)
-        , created(created)
-    {}
-
-    seq_id id;
-    std::int64_t created;
-    mutable std::mutex mutex;
-    std::condition_variable changed;
-    std::string output;
-    std::string pending_bytes;
-    std::size_t prompt_tokens {};
-    std::size_t completion_tokens {};
-    finish_reason reason { finish_reason::none };
-    std::optional<request_error> error;
-    request_status status { request_status::submitted };
-    std::atomic_bool cancelled {};
-};
-
-struct prepared_request {
-    std::shared_ptr<request_state> state;
-    std::vector<token_id> prompt;
-    std::size_t max_completion_tokens;
-};
-
-[[nodiscard]] std::optional<std::size_t>
-complete_utf8_prefix(std::string_view text)
-{
-    std::size_t offset = 0;
-    while (offset < text.size()) {
-        const auto first = static_cast<unsigned char>(text[offset]);
-        const std::size_t length = first < 0x80 ? 1
-            : (first & 0xE0) == 0xC0            ? 2
-            : (first & 0xF0) == 0xE0            ? 3
-            : (first & 0xF8) == 0xF0            ? 4
-                                                : 0;
-        if (length == 0) {
-            return std::nullopt;
-        }
-        if (length > text.size() - offset) {
-            break;
-        }
-        for (std::size_t index = 1; index < length; ++index) {
-            if ((static_cast<unsigned char>(text[offset + index]) & 0xC0) != 0x80) {
-                return std::nullopt;
-            }
-        }
-        offset += length;
-    }
-    return offset;
-}
-
-class serving_runtime {
-public:
-    static result<std::unique_ptr<serving_runtime>, server_errc>
-    make(model_runner& runner, const server_config& config)
-    {
-        auto engine = inference_engine::make(
-            {
-                .max_sequences = config.max_sequences,
-                .max_batch_tokens = config.max_batch_tokens,
-                .kv_block_count = config.kv_block_count,
-                .kv_block_size = config.kv_block_size,
-                .eos_token = runner.info().eos_token,
-            },
-            runner);
-        if (!engine) {
-            return fail(server_errc::engine_creation_failed);
-        }
-        return std::unique_ptr<serving_runtime>(
-            new serving_runtime(runner, config, std::move(*engine)));
-    }
-
-    ~serving_runtime()
-    {
-        {
-            std::lock_guard lock(mutex_);
-            stopping_ = true;
-        }
-        changed_.notify_one();
-        worker_.request_stop();
-        if (worker_.joinable()) {
-            worker_.join();
-        }
-    }
-
-    result<std::shared_ptr<request_state>, request_error>
-    submit(completion_request request)
-    {
-        auto state =
-            std::make_shared<request_state>(next_id_.fetch_add(1, std::memory_order_relaxed),
-                                            std::chrono::duration_cast<std::chrono::seconds>(
-                                                std::chrono::system_clock::now().time_since_epoch())
-                                                .count());
-        {
-            std::lock_guard lock(mutex_);
-            if (outstanding_ >= config_.max_pending_requests) {
-                return fail(request_error {
-                    .status = 429,
-                    .message = "The server request queue is full.",
-                    .type = "rate_limit_error",
-                    .code = "queue_full",
-                });
-            }
-            ++outstanding_;
-            submissions_.push_back({ std::move(request), state });
-        }
-        changed_.notify_one();
-
-        std::unique_lock lock(state->mutex);
-        state->changed.wait(lock, [&] { return state->status != request_status::submitted; });
-        if (state->error) {
-            return fail(*state->error);
-        }
-        return state;
-    }
-
-    void
-    cancel(const std::shared_ptr<request_state>& state) noexcept
-    {
-        state->cancelled.store(true, std::memory_order_relaxed);
-        changed_.notify_one();
-    }
-
-private:
-    struct submission {
-        completion_request request;
-        std::shared_ptr<request_state> state;
-    };
-
-    serving_runtime(model_runner& runner, server_config config, inference_engine engine)
-        : runner_(runner)
-        , config_(std::move(config))
-        , engine_(std::move(engine))
-        , worker_([this](std::stop_token stop) { run(stop); })
-    {}
-
-    void
-    finish_error(const std::shared_ptr<request_state>& state, request_error error)
-    {
-        {
-            std::lock_guard lock(state->mutex);
-            state->error = std::move(error);
-            state->status = request_status::finished;
-        }
-        state->changed.notify_all();
-        complete_one();
-    }
-
-    void
-    complete_one()
-    {
-        std::lock_guard lock(mutex_);
-        --outstanding_;
-    }
-
-    void
-    drain_submissions()
-    {
-        std::deque<submission> submissions;
-        {
-            std::lock_guard lock(mutex_);
-            submissions.swap(submissions_);
-        }
-
-        for (auto& submission : submissions) {
-            auto prompt = runner_.encode_chat(submission.request.messages);
-            if (!prompt) {
-                finish_error(submission.state,
-                             { .status = 400,
-                               .message = "The messages could not be encoded.",
-                               .param = "messages" });
-                continue;
-            }
-            if (prompt->size() >= runner_.info().max_context_tokens
-                || submission.request.max_completion_tokens
-                    > runner_.info().max_context_tokens - prompt->size()) {
-                finish_error(
-                    submission.state,
-                    { .status = 400,
-                      .message =
-                          "The requested prompt and completion exceed the model context window.",
-                      .param = "max_completion_tokens",
-                      .code = "context_length_exceeded" });
-                continue;
-            }
-
-            {
-                std::lock_guard lock(submission.state->mutex);
-                submission.state->prompt_tokens = prompt->size();
-                submission.state->status = request_status::ready;
-            }
-            submission.state->changed.notify_all();
-            pending_.push_back(
-                { submission.state, std::move(*prompt), submission.request.max_completion_tokens });
-        }
-    }
-
-    void
-    cancel_requests()
-    {
-        for (auto pending = pending_.begin(); pending != pending_.end();) {
-            if (!pending->state->cancelled.load(std::memory_order_relaxed)) {
-                ++pending;
-                continue;
-            }
-            finish_cancelled(pending->state);
-            pending = pending_.erase(pending);
-        }
-
-        for (auto active = active_.begin(); active != active_.end();) {
-            if (!active->second->cancelled.load(std::memory_order_relaxed)) {
-                ++active;
-                continue;
-            }
-            const auto id = active->first;
-            if (!engine_.cancel(id) || !engine_.remove(id)) {
-                finish_error(active->second,
-                             { .status = 500,
-                               .message = "The request could not be cancelled.",
-                               .type = "server_error" });
-            } else {
-                finish_cancelled(active->second);
-            }
-            active = active_.erase(active);
-        }
-    }
-
-    void
-    finish_cancelled(const std::shared_ptr<request_state>& state)
-    {
-        {
-            std::lock_guard lock(state->mutex);
-            state->reason = finish_reason::cancelled;
-            state->status = request_status::finished;
-        }
-        state->changed.notify_all();
-        complete_one();
-    }
-
-    void
-    admit_requests()
-    {
-        while (active_.size() < config_.max_sequences && !pending_.empty()) {
-            auto request = std::move(pending_.front());
-            pending_.pop_front();
-            auto sequence = seq::make(request.state->id, std::move(request.prompt),
-                                      {
-                                          .temperature = 1.0F,
-                                          .max_new_tokens = request.max_completion_tokens,
-                                          .ignore_eos = false,
-                                      },
-                                      config_.kv_block_size);
-            if (!sequence || !engine_.add(std::move(*sequence))) {
-                finish_error(request.state,
-                             { .status = 500,
-                               .message = "The request could not be admitted.",
-                               .type = "server_error" });
-                continue;
-            }
-            active_.emplace(request.state->id, std::move(request.state));
-        }
-    }
-
-    bool
-    append_update(const sequence_update& update)
-    {
-        const auto found = active_.find(update.id);
-        if (found == active_.end()) {
-            return false;
-        }
-        const auto& state = found->second;
-        const std::span token(&update.token, 1);
-        auto bytes = runner_.decode(token);
-        if (!bytes) {
-            [[maybe_unused]] const auto cancelled = engine_.cancel(update.id);
-            finish_error(state,
-                         { .status = 500,
-                           .message = "The generated token could not be decoded.",
-                           .type = "server_error" });
-            return true;
-        }
-
-        bool finished = update.reason != finish_reason::none;
-        bool invalid_text = false;
-        {
-            std::lock_guard lock(state->mutex);
-            state->pending_bytes += *bytes;
-            ++state->completion_tokens;
-            const auto prefix = complete_utf8_prefix(state->pending_bytes);
-            if (!prefix) {
-                invalid_text = true;
-            } else if (*prefix != 0) {
-                state->output.append(state->pending_bytes, 0, *prefix);
-                state->pending_bytes.erase(0, *prefix);
-            }
-            if (finished && !state->pending_bytes.empty()) {
-                invalid_text = true;
-            }
-            if (!invalid_text && finished) {
-                state->reason = update.reason;
-                state->status = request_status::finished;
-            }
-        }
-
-        if (invalid_text) {
-            [[maybe_unused]] const auto cancelled = engine_.cancel(update.id);
-            finish_error(state,
-                         { .status = 500,
-                           .message = "The model produced invalid UTF-8.",
-                           .type = "server_error" });
-        } else {
-            state->changed.notify_all();
-            if (finished) {
-                complete_one();
-            }
-        }
-        return finished || invalid_text;
-    }
-
-    void
-    execute_step()
-    {
-        auto updates = engine_.step();
-        if (!updates) {
-            fail_all("Model execution failed.");
-            return;
-        }
-        for (const auto& update : *updates) {
-            if (!append_update(update)) {
-                continue;
-            }
-            [[maybe_unused]] const auto removed = engine_.remove(update.id);
-            active_.erase(update.id);
-        }
-    }
-
-    void
-    fail_all(std::string message)
-    {
-        for (auto& request : pending_) {
-            finish_error(request.state,
-                         { .status = 500, .message = message, .type = "server_error" });
-        }
-        pending_.clear();
-        for (auto& [id, state] : active_) {
-            [[maybe_unused]] const auto cancelled = engine_.cancel(id);
-            [[maybe_unused]] const auto removed = engine_.remove(id);
-            finish_error(state, { .status = 500, .message = message, .type = "server_error" });
-        }
-        active_.clear();
-    }
-
-    void
-    run(std::stop_token stop)
-    {
-        while (!stop.stop_requested()) {
-            drain_submissions();
-            cancel_requests();
-            admit_requests();
-            if (!active_.empty()) {
-                execute_step();
-                continue;
-            }
-
-            std::unique_lock lock(mutex_);
-            changed_.wait(lock, [&] { return stopping_ || !submissions_.empty(); });
-            if (stopping_) {
-                break;
-            }
-        }
-        drain_submissions();
-        fail_all("The server is shutting down.");
-    }
-
-    model_runner& runner_;
-    server_config config_;
-    inference_engine engine_;
-    std::deque<prepared_request> pending_;
-    std::unordered_map<seq_id, std::shared_ptr<request_state>> active_;
-
-    std::mutex mutex_;
-    std::condition_variable changed_;
-    std::deque<submission> submissions_;
-    std::size_t outstanding_ {};
-    bool stopping_ {};
-    std::atomic<seq_id> next_id_ { 1 };
-    std::jthread worker_;
 };
 
 [[nodiscard]] request_error
@@ -467,11 +64,10 @@ parse_completion_request(std::string_view body,
     }
 
     completion_request request {
-        .messages = {},
-        .max_completion_tokens = default_max_tokens,
+        .generation = { .messages = {}, .max_completion_tokens = default_max_tokens },
         .stream = false,
     };
-    request.messages.reserve(input["messages"].size());
+    request.generation.messages.reserve(input["messages"].size());
     for (const auto& value : input["messages"]) {
         if (!value.is_object()
             || !value.contains("role")
@@ -481,7 +77,7 @@ parse_completion_request(std::string_view body,
             return fail(
                 invalid("Each message must have string role and content fields.", "messages"));
         }
-        request.messages.push_back(
+        request.generation.messages.push_back(
             { value["role"].get<std::string>(), value["content"].get<std::string>() });
     }
 
@@ -509,7 +105,7 @@ parse_completion_request(std::string_view body,
             return fail(invalid("The maximum completion token count must be a positive integer.",
                                 max_field));
         }
-        request.max_completion_tokens = static_cast<std::size_t>(amount);
+        request.generation.max_completion_tokens = static_cast<std::size_t>(amount);
     }
     if (input.contains("stream") && !input["stream"].is_null()) {
         if (!input["stream"].is_boolean()) {
@@ -553,6 +149,33 @@ write_error(httplib::Response& response, const request_error& error)
 {
     response.status = error.status;
     response.set_content(error_json(error).dump(), "application/json");
+}
+
+request_error
+http_error(const generation_error& error)
+{
+    const auto status = error.kind == generation_errc::queue_full ? 429
+        : error.kind == generation_errc::invalid_input            ? 400
+                                                                  : 500;
+    return { .status = status,
+             .message = error.message,
+             .type = status == 500 ? "server_error"
+                 : status == 429   ? "rate_limit_error"
+                                   : "invalid_request_error",
+             .param = error.param,
+             .code = error.code };
+}
+
+json
+error_json(const generation_error& error)
+{
+    return error_json(http_error(error));
+}
+
+void
+write_error(httplib::Response& response, const generation_error& error)
+{
+    write_error(response, http_error(error));
 }
 
 std::string
@@ -653,9 +276,14 @@ openai_server::make(model_runner& runner, server_config config)
         || config.default_max_completion_tokens == 0) {
         return fail(server_errc::invalid_config);
     }
-    auto runtime = serving_runtime::make(runner, config);
+    auto runtime = serving_runtime::make(runner,
+                                         { .max_sequences = config.max_sequences,
+                                           .max_pending_requests = config.max_pending_requests,
+                                           .max_batch_tokens = config.max_batch_tokens,
+                                           .kv_block_count = config.kv_block_count,
+                                           .kv_block_size = config.kv_block_size });
     if (!runtime) {
-        return fail(runtime.error());
+        return fail(server_errc::engine_creation_failed);
     }
     auto impl = std::make_unique<implementation>(runner, std::move(config), std::move(*runtime));
 
@@ -703,7 +331,7 @@ openai_server::make(model_runner& runner, server_config config)
                 return;
             }
             const bool stream = parsed->stream;
-            auto submitted = runtime_ptr->submit(std::move(*parsed));
+            auto submitted = runtime_ptr->submit(std::move(parsed->generation));
             if (!submitted) {
                 write_error(response, submitted.error());
                 return;
@@ -734,7 +362,7 @@ openai_server::make(model_runner& runner, server_config config)
                 "text/event-stream",
                 [state, cursor, &runner](std::size_t, httplib::DataSink& sink) {
                     std::string delta;
-                    std::optional<request_error> error;
+                    std::optional<generation_error> error;
                     finish_reason reason = finish_reason::none;
                     bool finished = false;
                     {

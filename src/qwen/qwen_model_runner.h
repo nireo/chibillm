@@ -41,6 +41,10 @@ public:
     qwen_model_runner(qwen_model_runner&&) noexcept = default;
     qwen_model_runner& operator=(qwen_model_runner&&) noexcept = default;
 
+    std::unique_ptr<text_decoder> make_decoder() const override;
+    result<std::unique_ptr<model_state>, model_runner_errc>
+    make_state(scheduler_config config) const override;
+
     [[nodiscard]] const qwen3_config& config() const noexcept;
     [[nodiscard]] const model_info& info() const noexcept override;
 
@@ -51,20 +55,20 @@ public:
     decode(std::span<const token_id> tokens) const override;
 
     [[nodiscard]] result<std::vector<token_id>, model_runner_errc>
-    execute(const model_batch& batch) override;
+    execute(const model_batch& batch, model_state& state) override;
 
 private:
     qwen_model_runner(metal_context context,
                       qwen3_config config,
                       qwen_weights weights,
-                      metal_kv_cache cache,
+                      kv_cache_config cache_config,
                       qwen_tokenizer tokenizer,
                       model_info info);
 
     metal_context context_;
     qwen3_config config_;
     qwen_weights weights_;
-    metal_kv_cache cache_;
+    kv_cache_config cache_config_;
     qwen_tokenizer tokenizer_;
     model_info info_;
 };

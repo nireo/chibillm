@@ -1,74 +1,56 @@
 #pragma once
-
-#include <cstddef>
-#include <cstdint>
+#include "model_state.h"
 #include <deque>
-#include <span>
+#include <unordered_map>
 #include <vector>
 
-#include "result.h"
-#include "seq.h"
-
 namespace chibillm {
-
-struct kv_block {
-    block_id id;
-    std::size_t ref_count { 0 };
-
-    [[nodiscard]] bool is_free() const noexcept;
-};
-
-enum class block_manager_errc : std::uint8_t {
+enum class block_manager_errc {
     invalid_block_count,
     invalid_block_size,
-    too_many_blocks,
-
-    incompatible_block_size,
-    inconsistent_block_table,
-
-    insufficient_free_blocks,
-    invalid_block_id,
-    block_not_in_use,
-
-    sequence_finished,
-    sequence_running,
-    sequence_has_scheduled_work,
-    sequence_update_failed,
+    too_many_blocks
 };
 
-struct block_manager {
-    [[nodiscard]] static result<block_manager, block_manager_errc> make(std::size_t block_count,
-                                                                        std::size_t block_size);
+class block_manager final : public model_state {
+public:
+    static result<block_manager, block_manager_errc> make(std::size_t block_count,
+                                                          std::size_t block_size);
+    block_manager(block_manager&&) noexcept = default;
+    block_manager& operator=(block_manager&&) noexcept = default;
 
-    block_manager(const block_manager&) = delete;
-    block_manager& operator=(const block_manager&) = delete;
+    std::size_t
+    block_count() const noexcept
+    {
+        return block_count_;
+    }
 
-    block_manager(block_manager&&) = default;
-    block_manager& operator=(block_manager&&) = default;
+    std::size_t
+    block_size() const noexcept override
+    {
+        return block_size_;
+    }
 
-    [[nodiscard]] std::size_t block_count() const noexcept;
-    [[nodiscard]] std::size_t block_size() const noexcept;
-    [[nodiscard]] std::size_t free_block_count() const noexcept;
-    [[nodiscard]] std::size_t used_block_count() const noexcept;
-    [[nodiscard]] std::span<const kv_block> blocks() const noexcept;
+    std::size_t
+    free_block_count() const noexcept
+    {
+        return free_.size();
+    }
 
-    [[nodiscard]] result<std::size_t, block_manager_errc>
-    additional_blocks_required(const seq& sequence) const noexcept;
+    std::size_t
+    used_block_count() const noexcept
+    {
+        return block_count_ - free_.size();
+    }
 
-    [[nodiscard]] result<bool, block_manager_errc>
-    can_ensure_capacity(const seq& sequence) const noexcept;
-
-    [[nodiscard]] result<void, block_manager_errc> ensure_capacity(seq& sequence);
-    [[nodiscard]] result<void, block_manager_errc> release(seq& sequence);
+    sequence_resources resources(seq_id id) const noexcept override;
+    result<void, state_errc> reserve(seq_id id, std::size_t token_count) override;
+    void release(seq_id id) noexcept override;
 
 private:
-    block_manager(std::size_t block_count, std::size_t block_size);
-
-    void assert_invariants() const noexcept;
-
+    block_manager(std::size_t count, std::size_t size);
+    std::size_t block_count_;
     std::size_t block_size_;
-    std::vector<kv_block> blocks_;
-    std::deque<block_id> free_block_ids_;
+    std::deque<block_id> free_;
+    std::unordered_map<seq_id, std::vector<block_id>> tables_;
 };
-
 } // namespace chibillm

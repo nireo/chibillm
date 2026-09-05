@@ -49,7 +49,7 @@ public:
     }
 
     result<std::vector<token_id>, model_runner_errc>
-    execute(const model_batch& batch) override
+    execute(const model_batch& batch, chibillm::model_state&) override
     {
         {
             std::unique_lock lock(mutex_);

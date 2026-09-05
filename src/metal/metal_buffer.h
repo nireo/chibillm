@@ -23,6 +23,7 @@ public:
 
 private:
     friend class metal_context;
+    friend class metal_kernels;
 
     struct implementation;
 

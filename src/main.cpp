@@ -14,7 +14,7 @@
 #include <vector>
 
 #include "inference_engine.h"
-#include "qwen/qwen_model_runner.h"
+#include "model_factory.h"
 #include "server.h"
 
 namespace {
@@ -53,7 +53,9 @@ percentile(std::vector<double> samples, double fraction)
 }
 
 result<generation_result, chat_errc>
-generate(chibillm::qwen_model_runner& runner, std::span<const chibillm::chat_message> history)
+generate(chibillm::model_runner& runner,
+         chibillm::inference_engine& engine,
+         std::span<const chibillm::chat_message> history)
 {
     auto prompt = runner.encode_chat(history);
     if (!prompt) {
@@ -63,30 +65,15 @@ generate(chibillm::qwen_model_runner& runner, std::span<const chibillm::chat_mes
         return chibillm::fail(chat_errc::context_full);
     }
 
-    auto engine = chibillm::inference_engine::make(
-        {
-            .max_sequences = 1,
-            .max_batch_tokens = 128,
-            .kv_block_count = kv_block_count,
-            .kv_block_size = kv_block_size,
-            .eos_token = runner.info().eos_token,
-        },
-        runner);
-    if (!engine) {
-        return chibillm::fail(chat_errc::generation_failed);
-    }
-
     const auto prompt_tokens = prompt->size();
     const auto token_budget =
         std::min(max_new_tokens, runner.info().max_context_tokens - prompt->size());
     auto sequence = chibillm::seq::make(1, std::move(*prompt),
                                         {
-                                            .temperature = 1.0F,
                                             .max_new_tokens = token_budget,
                                             .ignore_eos = false,
-                                        },
-                                        kv_block_size);
-    if (!sequence || !engine->add(std::move(*sequence))) {
+                                        });
+    if (!sequence || !engine.add(std::move(*sequence))) {
         return chibillm::fail(chat_errc::generation_failed);
     }
 
@@ -95,9 +82,9 @@ generate(chibillm::qwen_model_runner& runner, std::span<const chibillm::chat_mes
     auto first_token = started;
     bool produced_token = false;
     std::vector<double> decode_latencies;
-    while (!engine->is_finished()) {
+    while (!engine.is_finished()) {
         const auto step_started = clock::now();
-        if (!engine->step()) {
+        if (!engine.step()) {
             return chibillm::fail(chat_errc::generation_failed);
         }
         const auto step_finished = clock::now();
@@ -105,7 +92,7 @@ generate(chibillm::qwen_model_runner& runner, std::span<const chibillm::chat_mes
             decode_latencies.push_back(
                 std::chrono::duration<double>(step_finished - step_started).count());
         }
-        const auto* current = engine->find_sequence(1);
+        const auto* current = engine.find_sequence(1);
         if (!produced_token && current != nullptr && current->completion_token_count() != 0) {
             first_token = step_finished;
             produced_token = true;
@@ -113,7 +100,7 @@ generate(chibillm::qwen_model_runner& runner, std::span<const chibillm::chat_mes
     }
     const auto finished_at = clock::now();
 
-    const auto* finished = engine->find_sequence(1);
+    const auto* finished = engine.find_sequence(1);
     if (finished == nullptr || !produced_token) {
         return chibillm::fail(chat_errc::generation_failed);
     }
@@ -192,10 +179,15 @@ main(int argc, char** argv)
     if (model_id.empty()) {
         model_id = "chibillm-qwen";
     }
-    auto runner = qwen_model_runner::make(model_directory, shader_source, kv_block_count,
-                                          kv_block_size, std::move(model_id));
+    auto runner = load_model(model_directory, shader_source, kv_block_count, kv_block_size,
+                             std::move(model_id));
     if (!runner) {
-        std::cerr << "failed to load Qwen from " << model_directory << '\n';
+        std::cerr
+            << (runner.error() == model_load_errc::unsupported_architecture
+                    ? "unsupported model architecture in "
+                    : "failed to load model from ")
+            << model_directory
+            << '\n';
         return 1;
     }
     const auto load_time =
@@ -207,7 +199,7 @@ main(int argc, char** argv)
         << load_time
         << " s\n";
     if (serve_mode) {
-        auto server = openai_server::make(*runner,
+        auto server = openai_server::make(**runner,
                                           {
                                               .host = "127.0.0.1",
                                               .port = 8000,
@@ -230,6 +222,20 @@ main(int argc, char** argv)
         return 0;
     }
 
+    auto engine = chibillm::inference_engine::make(
+        {
+            .max_sequences = 1,
+            .max_batch_tokens = 128,
+            .kv_block_count = kv_block_count,
+            .kv_block_size = kv_block_size,
+            .eos_token = (*runner)->info().eos_token,
+        },
+        **runner);
+    if (!engine) {
+        std::cerr << "failed to create inference state\n";
+        return 1;
+    }
+
     std::vector<chat_message> history;
     std::cout << "chibillm chat — /reset clears history, /quit exits\n";
 
@@ -249,7 +255,11 @@ main(int argc, char** argv)
         }
 
         history.push_back({ "user", input });
-        auto response = generate(*runner, history);
+        auto response = generate(**runner, *engine, history);
+        if (engine->find_sequence(1) && (!engine->cancel(1) || !engine->remove(1))) {
+            std::cerr << "failed to release inference state\n";
+            return 1;
+        }
         if (!response) {
             history.pop_back();
             std::cerr << (response.error() == chat_errc::context_full

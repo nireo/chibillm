@@ -52,6 +52,8 @@ chibillm_core = static_library(
     'src/scheduler.cc',
     'src/model_batch.cc',
     'src/model_runner.cc',
+    'src/text_decoder.cc',
+    'src/serving_runtime.cc',
     'src/inference_engine.cc',
   ],
   include_directories: src_include,
@@ -62,11 +64,18 @@ chibillm_metal = static_library(
   'chibillm_metal',
   [
     'src/metal/metal_context.mm',
+    'src/metal/metal_kernels.mm',
+    'src/tensor/output.cc',
+    'src/tensor/embedding.cc',
+    'src/tensor/layers.cc',
+    'src/tensor/attention.cc',
     'src/metal/metal_kv_cache.cc',
+    'src/model_format/weight_reader.cc',
     'src/tensor/tensor_ops.cc',
   ],
   include_directories: src_include,
   dependencies: metal_framework_dep,
+  link_with: chibillm_model_format,
   install: false,
 )
 
@@ -74,10 +83,9 @@ chibillm_qwen = static_library(
   'chibillm_qwen',
   [
     'src/qwen/qwen_configs.cc',
-    'src/qwen/qwen_embedding.cc',
+    'src/qwen/qwen_chat.cc',
     'src/qwen/qwen_layer.cc',
     'src/qwen/qwen_model_runner.cc',
-    'src/qwen/qwen_output.cc',
     'src/qwen/qwen_tokenizer.cc',
     'src/qwen/qwen_weights.cc',
   ],
@@ -88,6 +96,14 @@ chibillm_qwen = static_library(
     chibillm_model_format,
     chibillm_metal,
   ],
+  install: false,
+)
+
+chibillm_models = static_library(
+  'chibillm_models', 'src/model_factory.cc',
+  include_directories: src_include,
+  dependencies: nlohmann_json_dep,
+  link_with: chibillm_qwen,
   install: false,
 )
 
@@ -119,234 +135,40 @@ executable(
     metal_framework_dep,
   ],
   link_with: [
-    chibillm_qwen,
+    chibillm_models,
     chibillm_server,
   ],
   install: true,
 )
 
-chibillm_tests = executable(
-  'chibillm_tests',
-  [
-    'tests/seq_test.cc',
-    'tests/block_manager_test.cc',
-  ],
-  include_directories: src_include,
-  dependencies: doctest_dep,
-  link_with: chibillm_core,
-)
+test_args = [
+  '-DCHIBILLM_SHADER_PATH="' + meson.project_source_root() / 'shaders/tensor_ops.metal' + '"',
+  '-DQWEN3_CONFIG_FIXTURE_PATH="' + meson.project_source_root() / 'tests/fixtures/qwen3_0_6b_config.json' + '"',
+  '-DQWEN3_5_CONFIG_FIXTURE_PATH="' + meson.project_source_root() / 'tests/fixtures/qwen3_5_0_8b_config.json' + '"',
+  '-DQWEN3_5_MODEL_PATH="' + meson.project_source_root() / 'qwen3_5_model' + '"',
+]
 
-test('chibillm unit tests', chibillm_tests)
-
-chibillm_scheduler_tests = executable(
-  'chibillm_scheduler_tests',
-  'tests/scheduler_test.cc',
-  include_directories: src_include,
-  dependencies: doctest_dep,
-  link_with: chibillm_core,
-)
-
-test('chibillm scheduler tests', chibillm_scheduler_tests)
-
-chibillm_model_batch_tests = executable(
-  'chibillm_model_batch_tests',
-  'tests/model_batch_test.cc',
-  include_directories: src_include,
-  dependencies: doctest_dep,
-  link_with: chibillm_core,
-)
-
-test('chibillm model batch tests', chibillm_model_batch_tests)
-
-chibillm_inference_engine_tests = executable(
-  'chibillm_inference_engine_tests',
-  'tests/inference_engine_test.cc',
-  include_directories: src_include,
-  dependencies: doctest_dep,
-  link_with: chibillm_core,
-)
-
-test('chibillm inference engine tests', chibillm_inference_engine_tests)
-
-chibillm_server_tests = executable(
-  'chibillm_server_tests',
-  'tests/server_test.cc',
-  include_directories: src_include,
-  dependencies: [
-    cpp_httplib_dep,
-    doctest_dep,
-    nlohmann_json_dep,
-  ],
-  link_with: [
-    chibillm_core,
-    chibillm_server,
-  ],
-)
-
-test('chibillm server tests', chibillm_server_tests)
-
-qwen3_config_fixture_path = join_paths(
-  meson.project_source_root(),
-  'tests',
-  'fixtures',
-  'qwen3_0_6b_config.json',
-)
-
-qwen3_5_config_fixture_path = join_paths(
-  meson.project_source_root(),
-  'tests',
-  'fixtures',
-  'qwen3_5_0_8b_config.json',
-)
-
-chibillm_qwen_config_tests = executable(
-  'chibillm_qwen_config_tests',
-  'tests/qwen_config_test.cc',
-  include_directories: src_include,
-  cpp_args: [
-    '-DQWEN3_CONFIG_FIXTURE_PATH="' + qwen3_config_fixture_path + '"',
-    '-DQWEN3_5_CONFIG_FIXTURE_PATH="' + qwen3_5_config_fixture_path + '"',
-  ],
-  dependencies: [
-    doctest_dep,
-    nlohmann_json_dep,
-  ],
-  link_with: chibillm_qwen,
-)
-
-test('chibillm qwen config tests', chibillm_qwen_config_tests)
-
-chibillm_qwen_tokenizer_tests = executable(
-  'chibillm_qwen_tokenizer_tests',
-  'tests/qwen_tokenizer_test.cc',
-  include_directories: src_include,
-  dependencies: [
-    doctest_dep,
-    metal_framework_dep,
-    nlohmann_json_dep,
-  ],
-  link_with: chibillm_qwen,
-)
-
-test('chibillm qwen tokenizer tests', chibillm_qwen_tokenizer_tests)
-
-tests_include = include_directories('tests')
-
-chibillm_safetensors_tests = executable(
-  'chibillm_safetensors_tests',
-  'tests/safetensors_test.cc',
-  include_directories: [
-    src_include,
-    tests_include,
-  ],
-  dependencies: [
-    doctest_dep,
-    nlohmann_json_dep,
-  ],
-  link_with: chibillm_model_format,
-)
-
-test('chibillm safetensors tests', chibillm_safetensors_tests)
-
-metal_shader_path = join_paths(
-  meson.project_source_root(),
-  'shaders',
-  'tensor_ops.metal',
-)
-
-chibillm_qwen_weights_tests = executable(
-  'chibillm_qwen_weights_tests',
-  'tests/qwen_weights_test.cc',
-  include_directories: [
-    src_include,
-    tests_include,
-  ],
-  cpp_args: [
-    '-DCHIBILLM_SHADER_PATH="' + metal_shader_path + '"',
-    '-DQWEN3_5_MODEL_PATH="' + join_paths(
-      meson.project_source_root(),
-      'qwen3_5_model',
-    ) + '"',
-  ],
-  dependencies: [
-    doctest_dep,
-    metal_framework_dep,
-    nlohmann_json_dep,
-  ],
-  link_with: [
-    chibillm_model_format,
-    chibillm_metal,
-    chibillm_qwen,
-  ],
-)
-
-test('chibillm qwen weights tests', chibillm_qwen_weights_tests)
-
-chibillm_kv_cache_tests = executable(
-  'chibillm_kv_cache_tests',
-  'tests/metal_kv_cache_test.cc',
-  include_directories: [
-    src_include,
-    tests_include,
-  ],
-  cpp_args: [
-    '-DCHIBILLM_SHADER_PATH="' + metal_shader_path + '"',
-  ],
-  dependencies: [
-    doctest_dep,
-    metal_framework_dep,
-  ],
-  link_args: ['-Wl,-no_warn_duplicate_libraries'],
-  link_with: [
-    chibillm_core,
-    chibillm_metal,
-  ],
-)
-
-test('chibillm kv cache tests', chibillm_kv_cache_tests)
-
-chibillm_tensor_tests = executable(
-  'chibillm_tensor_tests',
-  'tests/tensor_test.cc',
-  include_directories: [
-    src_include,
-    tests_include,
-  ],
-  cpp_args: [
-    '-DCHIBILLM_SHADER_PATH="' + metal_shader_path + '"',
-  ],
-  dependencies: [
-    doctest_dep,
-    metal_framework_dep,
-  ],
-  link_args: ['-Wl,-no_warn_duplicate_libraries'],
-  link_with: [
-    chibillm_core,
-    chibillm_metal,
-  ],
-)
-
-test('chibillm tensor tests', chibillm_tensor_tests)
-
-chibillm_tensor_ops_tests = executable(
-  'chibillm_tensor_ops_tests',
-  'tests/tensor_ops_test.cc',
-  include_directories: [
-    src_include,
-    tests_include,
-  ],
-  cpp_args: [
-    '-DCHIBILLM_SHADER_PATH="' + metal_shader_path + '"',
-  ],
-  dependencies: [
-    doctest_dep,
-    metal_framework_dep,
-  ],
-  link_args: ['-Wl,-no_warn_duplicate_libraries'],
-  link_with: [
-    chibillm_core,
-    chibillm_metal,
-  ],
-)
-
-test('chibillm tensor ops tests', chibillm_tensor_ops_tests)
+foreach spec : [
+  {'name': 'unit', 'sources': ['tests/seq_test.cc', 'tests/block_manager_test.cc'], 'library': chibillm_core},
+  {'name': 'scheduler', 'sources': ['tests/scheduler_test.cc'], 'library': chibillm_core},
+  {'name': 'model batch', 'sources': ['tests/model_batch_test.cc'], 'library': chibillm_core},
+  {'name': 'inference engine', 'sources': ['tests/inference_engine_test.cc', 'tests/fake_model_runner.cc'], 'library': chibillm_core},
+  {'name': 'server', 'sources': ['tests/server_test.cc'], 'library': chibillm_server, 'deps': [cpp_httplib_dep, nlohmann_json_dep]},
+  {'name': 'qwen config', 'sources': ['tests/qwen_config_test.cc'], 'library': chibillm_qwen, 'deps': [nlohmann_json_dep]},
+  {'name': 'qwen tokenizer', 'sources': ['tests/qwen_tokenizer_test.cc'], 'library': chibillm_qwen, 'deps': [nlohmann_json_dep]},
+  {'name': 'safetensors', 'sources': ['tests/safetensors_test.cc'], 'library': chibillm_model_format, 'deps': [nlohmann_json_dep]},
+  {'name': 'qwen weights', 'sources': ['tests/qwen_weights_test.cc'], 'library': chibillm_qwen, 'deps': [nlohmann_json_dep]},
+  {'name': 'kv cache', 'sources': ['tests/metal_kv_cache_test.cc'], 'library': chibillm_metal},
+  {'name': 'tensor', 'sources': ['tests/tensor_test.cc'], 'library': chibillm_metal},
+  {'name': 'tensor ops', 'sources': ['tests/tensor_ops_test.cc'], 'library': chibillm_metal},
+]
+  name = spec['name'] == 'unit' ? 'chibillm_tests' : 'chibillm_' + spec['name'].replace(' ', '_') + '_tests'
+  target = executable(
+    name, spec['sources'],
+    include_directories: [src_include, include_directories('tests')],
+    dependencies: [doctest_dep] + spec.get('deps', []),
+    cpp_args: test_args,
+    link_with: spec['library'],
+  )
+  test('chibillm ' + spec['name'] + ' tests', target)
+endforeach

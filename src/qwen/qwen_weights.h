@@ -1,3 +1,4 @@
+#include "model_format/weight_reader.h"
 #pragma once
 
 #include <cstdint>
@@ -11,18 +12,6 @@
 #include "result.h"
 
 namespace chibillm {
-
-enum class qwen_weights_errc : std::uint8_t {
-    missing_tensor,
-    unsupported_dtype,
-    tensor_shape_mismatch,
-    unexpected_tensor_count,
-    tensor_count_overflow,
-    invalid_configuration,
-    tensor_creation_failed,
-    metal_allocation_failed,
-    tensor_read_failed,
-};
 
 struct qwen_layer_weights {
     metal_tensor input_norm;
@@ -82,16 +71,17 @@ struct qwen3_5_weights {
     std::vector<qwen3_5_layer_weights> layers;
 };
 
-[[nodiscard]] result<void, qwen_weights_errc> validate_qwen_weights(const safetensors_file& weights,
-                                                                    const qwen3_config& config);
+[[nodiscard]] result<void, weight_errc> validate_qwen_weights(const safetensors_file& weights,
+                                                              const qwen3_config& config);
 
-[[nodiscard]] result<qwen_weights, qwen_weights_errc> load_qwen_weights(
-    const metal_context& context, const safetensors_file& file, const qwen3_config& config);
+[[nodiscard]] result<qwen_weights, weight_errc> load_qwen_weights(const metal_context& context,
+                                                                  const safetensors_file& file,
+                                                                  const qwen3_config& config);
 
-[[nodiscard]] result<void, qwen_weights_errc>
-validate_qwen3_5_weights(const safetensors_file& weights, const qwen3_5_config& config);
+[[nodiscard]] result<void, weight_errc> validate_qwen3_5_weights(const safetensors_file& weights,
+                                                                 const qwen3_5_config& config);
 
-[[nodiscard]] result<qwen3_5_weights, qwen_weights_errc> load_qwen3_5_weights(
+[[nodiscard]] result<qwen3_5_weights, weight_errc> load_qwen3_5_weights(
     const metal_context& context, const safetensors_file& file, const qwen3_5_config& config);
 
 } // namespace chibillm

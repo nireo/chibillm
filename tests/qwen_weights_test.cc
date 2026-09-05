@@ -18,20 +18,21 @@
 #include "inference_engine.h"
 #include "metal/metal_context.h"
 #include "metal/metal_kv_cache.h"
+#include "metal_test_support.h"
 #include "model_format/safetensors.h"
 #include "qwen/qwen_configs.h"
-#include "qwen/qwen_embedding.h"
 #include "qwen/qwen_layer.h"
 #include "qwen/qwen_model_runner.h"
-#include "qwen/qwen_output.h"
 #include "qwen/qwen_weights.h"
-#include "metal_test_support.h"
 #include "safetensors_test_support.h"
 #include "tensor/bf16.h"
+#include "tensor/embedding.h"
+#include "tensor/output.h"
 
+using chibillm::attention_metadata;
 using chibillm::bf16;
-using chibillm::embed_qwen_tokens;
-using chibillm::encode_qwen_greedy;
+using chibillm::embed_tokens;
+using chibillm::encode_greedy;
 using chibillm::load_qwen3_5_config;
 using chibillm::load_qwen3_5_weights;
 using chibillm::load_qwen_weights;
@@ -43,14 +44,13 @@ using chibillm::qwen3_5_full_attention_weights;
 using chibillm::qwen3_5_layer_type;
 using chibillm::qwen3_5_linear_attention_weights;
 using chibillm::qwen3_config;
-using chibillm::qwen_attention_metadata;
 using chibillm::qwen_model_runner;
-using chibillm::qwen_weights_errc;
-using chibillm::read_qwen_greedy;
+using chibillm::read_greedy;
 using chibillm::run_qwen_layers;
 using chibillm::safetensors_file;
 using chibillm::validate_qwen3_5_weights;
 using chibillm::validate_qwen_weights;
+using chibillm::weight_errc;
 using safetensors_test::temporary_file;
 using namespace metal_test;
 
@@ -302,7 +302,7 @@ TEST_CASE("Qwen weight validation accepts the expected tensor set")
 TEST_CASE("Qwen weight validation reports incompatible manifests")
 {
     const auto config = test_config();
-    auto check_err = [&](std::vector<tensor_spec> tensors, const char* name, qwen_weights_errc err) {
+    auto check_err = [&](std::vector<tensor_spec> tensors, const char* name, weight_errc err) {
         auto file = write_weights(std::move(tensors), name);
         auto weights = safetensors_file::open(file.path());
         REQUIRE(weights.has_value());
@@ -311,19 +311,19 @@ TEST_CASE("Qwen weight validation reports incompatible manifests")
 
     auto missing = expected_tensors(config);
     missing.erase(missing.begin() + 4);
-    check_err(std::move(missing), "qwen_missing.safetensors", qwen_weights_errc::missing_tensor);
+    check_err(std::move(missing), "qwen_missing.safetensors", weight_errc::missing_tensor);
 
     auto wrong_dtype = expected_tensors(config);
     wrong_dtype[4].dtype = "F32";
-    check_err(std::move(wrong_dtype), "qwen_dtype.safetensors", qwen_weights_errc::unsupported_dtype);
+    check_err(std::move(wrong_dtype), "qwen_dtype.safetensors", weight_errc::unsupported_dtype);
 
     auto wrong_shape = expected_tensors(config);
     wrong_shape[4].shape = { config.head_dimension + 1 };
-    check_err(std::move(wrong_shape), "qwen_shape.safetensors", qwen_weights_errc::tensor_shape_mismatch);
+    check_err(std::move(wrong_shape), "qwen_shape.safetensors", weight_errc::tensor_shape_mismatch);
 
     auto extra = expected_tensors(config);
     extra.push_back({ "unused.weight", "BF16", { 1 } });
-    check_err(std::move(extra), "qwen_extra.safetensors", qwen_weights_errc::unexpected_tensor_count);
+    check_err(std::move(extra), "qwen_extra.safetensors", weight_errc::unexpected_tensor_count);
 }
 
 TEST_CASE("Qwen3.5 weight validation accepts its hybrid tensor layouts")
@@ -339,7 +339,7 @@ TEST_CASE("Qwen3.5 weight validation accepts its hybrid tensor layouts")
 TEST_CASE("Qwen3.5 weight validation distinguishes architecture and storage types")
 {
     const auto config = qwen3_5_test_config();
-    auto check_err = [&](std::vector<tensor_spec> tensors, const char* name, qwen_weights_errc err) {
+    auto check_err = [&](std::vector<tensor_spec> tensors, const char* name, weight_errc err) {
         auto file = write_weights(std::move(tensors), name);
         auto weights = safetensors_file::open(file.path());
         REQUIRE(weights.has_value());
@@ -351,16 +351,17 @@ TEST_CASE("Qwen3.5 weight validation distinguishes architecture and storage type
         missing, [](const auto& t) { return t.name.ends_with("linear_attn.A_log"); });
     REQUIRE(found_log != missing.end());
     missing.erase(found_log);
-    check_err(std::move(missing), "qwen3_5_missing.safetensors", qwen_weights_errc::missing_tensor);
+    check_err(std::move(missing), "qwen3_5_missing.safetensors", weight_errc::missing_tensor);
 
     auto wrong_dtype = expected_qwen3_5_tensors(config);
     const auto found_dt = std::ranges::find_if(
         wrong_dtype, [](const auto& t) { return t.name.ends_with("linear_attn.A_log"); });
     REQUIRE(found_dt != wrong_dtype.end());
     found_dt->dtype = "BF16";
-    check_err(std::move(wrong_dtype), "qwen3_5_dtype.safetensors", qwen_weights_errc::unsupported_dtype);
+    check_err(std::move(wrong_dtype), "qwen3_5_dtype.safetensors", weight_errc::unsupported_dtype);
 
-    check_err(expected_tensors(test_config()), "qwen3_as_3_5.safetensors", qwen_weights_errc::missing_tensor);
+    check_err(expected_tensors(test_config()), "qwen3_as_3_5.safetensors",
+              weight_errc::missing_tensor);
 }
 
 TEST_CASE("Qwen3.5 weights load linear and full-attention layers separately")
@@ -455,7 +456,7 @@ TEST_CASE("Qwen token embedding produces hidden-state rows")
                 embedding_bits.size() * sizeof(std::uint16_t));
 
     const std::vector<chibillm::token_id> tokens { 2, 0 };
-    auto hidden_states = embed_qwen_tokens(*context, *weights, tokens);
+    auto hidden_states = embed_tokens(*context, weights->token_embedding, tokens);
     REQUIRE(hidden_states.has_value());
     CHECK(std::ranges::equal(hidden_states->descriptor().shape().dimensions(),
                              std::vector<std::size_t> { 2, config.hidden_size }));
@@ -490,18 +491,20 @@ TEST_CASE("Qwen output selects requested rows and samples their largest logits")
     write_bf16(weights->output, output);
 
     const std::vector<chibillm::token_id> input_tokens { 0, 1, 2 };
-    auto hidden_states = embed_qwen_tokens(*context, *weights, input_tokens);
+    auto hidden_states = embed_tokens(*context, weights->token_embedding, input_tokens);
     REQUIRE(hidden_states.has_value());
 
     const std::vector<std::size_t> logits_indices { 2, 0 };
-    auto sampled = encode_qwen_greedy(*context, config, *weights, *hidden_states, logits_indices);
+    auto sampled = encode_greedy(*context, weights->final_norm, weights->output, config.rms_epsilon,
+                                 *hidden_states, logits_indices);
     REQUIRE(sampled.has_value());
-    CHECK(read_qwen_greedy(*sampled) == std::vector<chibillm::token_id> { 5, 3 });
+    CHECK(read_greedy(*sampled) == std::vector<chibillm::token_id> { 5, 3 });
 
     const std::vector<std::size_t> invalid_indices { input_tokens.size() };
-    auto invalid = encode_qwen_greedy(*context, config, *weights, *hidden_states, invalid_indices);
+    auto invalid = encode_greedy(*context, weights->final_norm, weights->output, config.rms_epsilon,
+                                 *hidden_states, invalid_indices);
     REQUIRE_FALSE(invalid.has_value());
-    CHECK(invalid.error() == chibillm::qwen_output_errc::logits_index_out_of_range);
+    CHECK(invalid.error() == chibillm::tensor_op_errc::logits_index_out_of_range);
 }
 
 TEST_CASE("Qwen model runner executes a flattened multi-sequence batch")
@@ -526,10 +529,8 @@ TEST_CASE("Qwen model runner executes a flattened multi-sequence batch")
             .eos_token = config.eos_token_id,
         },
         *runner);
-    auto first = chibillm::seq::make(
-        10, { 1, 2, 3 }, { .temperature = 1.0F, .max_new_tokens = 2, .ignore_eos = false }, 2);
-    auto second = chibillm::seq::make(
-        20, { 4 }, { .temperature = 1.0F, .max_new_tokens = 2, .ignore_eos = false }, 2);
+    auto first = chibillm::seq::make(10, { 1, 2, 3 }, { .max_new_tokens = 2, .ignore_eos = false });
+    auto second = chibillm::seq::make(20, { 4 }, { .max_new_tokens = 2, .ignore_eos = false });
     REQUIRE(engine.has_value());
     REQUIRE(first.has_value());
     REQUIRE(second.has_value());
@@ -559,7 +560,9 @@ TEST_CASE("Qwen model runner executes a flattened multi-sequence batch")
                      .logits_index = 0,
                      .block_table = { 3 } } },
     };
-    auto rejected = runner->execute(invalid);
+    auto state = runner->make_state({ .kv_block_count = 3, .kv_block_size = 2 });
+    REQUIRE(state.has_value());
+    auto rejected = runner->execute(invalid, **state);
     REQUIRE_FALSE(rejected.has_value());
     CHECK(rejected.error() == chibillm::model_runner_errc::inconsistent_batch);
 }
@@ -612,13 +615,13 @@ TEST_CASE("Qwen layers execute forward pass with residual connections")
     auto cache = std::move(*cache_result);
 
     const std::vector<chibillm::token_id> tokens { 1 };
-    auto hidden_states = embed_qwen_tokens(*context, *weights, tokens);
+    auto hidden_states = embed_tokens(*context, weights->token_embedding, tokens);
     REQUIRE(hidden_states.has_value());
 
     const std::array<std::uint32_t, 1> zero { 0 };
     const std::array<std::uint32_t, 1> one { 1 };
     auto layer_output = run_qwen_layers(*context, config, *weights, std::move(*hidden_states),
-                                        qwen_attention_metadata {
+                                        attention_metadata {
                                             .positions = zero,
                                             .slots = zero,
                                             .block_table = zero,

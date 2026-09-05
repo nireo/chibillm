@@ -9,7 +9,10 @@ namespace chibillm {
 result<inference_engine, inference_engine_errc>
 inference_engine::make(scheduler_config config, model_runner& runner)
 {
-    auto scheduler_result = scheduler::make(config);
+    auto state = runner.make_state(config);
+    if (!state)
+        return fail(inference_engine_errc::scheduler_creation_failed);
+    auto scheduler_result = scheduler::make(config, std::move(*state));
     if (!scheduler_result) {
         return fail(inference_engine_errc::scheduler_creation_failed);
     }
@@ -64,43 +67,23 @@ inference_engine::step()
         return fail_after_abort(*scheduled, inference_engine_errc::model_batch_build_failed);
     }
 
-    auto sampled_tokens = runner_->execute(*batch);
+    if (!scheduler_.begin_execution(*batch)) {
+        return fail_after_abort(*scheduled, inference_engine_errc::model_execution_failed);
+    }
+    auto sampled_tokens = runner_->execute(*batch, scheduler_.state());
     if (!sampled_tokens) {
         return fail_after_abort(*scheduled, inference_engine_errc::model_execution_failed);
     }
 
-    if (sampled_tokens->size() != scheduled->items.size()) {
+    if (sampled_tokens->size() != batch->sample_count()) {
         return fail_after_abort(*scheduled, inference_engine_errc::runner_result_count_mismatch);
     }
 
-    std::vector<std::size_t> completion_counts;
-    completion_counts.reserve(scheduled->items.size());
-    for (const auto& item : scheduled->items) {
-        const auto* sequence = scheduler_.find_sequence(item.id);
-        if (sequence == nullptr) {
-            return fail_after_abort(*scheduled, inference_engine_errc::batch_completion_failed);
-        }
-        completion_counts.push_back(sequence->completion_token_count());
-    }
-
-    auto completed = scheduler_.complete(*scheduled, *sampled_tokens);
+    auto completed = scheduler_.complete(scheduled->id, *sampled_tokens);
     if (!completed) {
-        return fail(inference_engine_errc::batch_completion_failed);
+        return fail_after_abort(*scheduled, inference_engine_errc::batch_completion_failed);
     }
-
-    std::vector<sequence_update> updates;
-    updates.reserve(scheduled->items.size());
-    for (std::size_t index = 0; index < scheduled->items.size(); ++index) {
-        const auto* sequence = scheduler_.find_sequence(scheduled->items[index].id);
-        if (sequence != nullptr && sequence->completion_token_count() > completion_counts[index]) {
-            updates.push_back({
-                .id = sequence->id(),
-                .token = sequence->last_token(),
-                .reason = sequence->reason(),
-            });
-        }
-    }
-    return updates;
+    return std::move(*completed);
 }
 
 result<void, inference_engine_errc>
@@ -124,7 +107,7 @@ inference_engine::remove(seq_id id)
 std::unexpected<inference_engine_errc>
 inference_engine::fail_after_abort(const scheduled_batch& batch, inference_engine_errc error)
 {
-    auto aborted = scheduler_.abort(batch);
+    auto aborted = scheduler_.abort(batch.id);
     if (!aborted) {
         return fail(inference_engine_errc::batch_abort_failed);
     }

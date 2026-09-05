@@ -9,7 +9,7 @@
 
 using chibillm::batch_phase;
 using chibillm::finish_reason;
-using chibillm::sampling_params;
+using chibillm::generation_params;
 using chibillm::scheduled_batch;
 using chibillm::scheduled_item;
 using chibillm::scheduler;
@@ -20,6 +20,11 @@ using chibillm::seq_status;
 using chibillm::token_id;
 
 namespace {
+const chibillm::block_manager&
+paged_state(const scheduler& scheduler)
+{
+    return dynamic_cast<const chibillm::block_manager&>(scheduler.state());
+}
 
 scheduler_config
 test_config()
@@ -68,8 +73,8 @@ TEST_CASE("scheduler construction validates limits and exposes cache geometry")
     CHECK(result->waiting_count() == 0);
     CHECK(result->running_count() == 0);
     CHECK(result->is_finished());
-    CHECK(result->cache().block_count() == 8);
-    CHECK(result->cache().block_size() == 2);
+    CHECK(paged_state(*result).block_count() == 8);
+    CHECK(paged_state(*result).block_size() == 2);
 }
 
 TEST_CASE("completion without an active batch is rejected")
@@ -84,7 +89,7 @@ TEST_CASE("completion without an active batch is rejected")
     };
     const std::array<token_id, 1> sample { 42 };
 
-    auto completed = scheduler_result->complete(phantom, sample);
+    auto completed = scheduler_result->complete(phantom.id, sample);
     REQUIRE_FALSE(completed.has_value());
     CHECK(completed.error() == scheduler_errc::no_batch_in_flight);
     CHECK_FALSE(scheduler_result->has_in_flight_batch());
@@ -93,7 +98,7 @@ TEST_CASE("completion without an active batch is rejected")
 TEST_CASE("add admits one pristine waiting sequence and rejects a duplicate ID")
 {
     auto scheduler_result = scheduler::make(test_config());
-    auto first = seq::make(10, { 1, 2 }, sampling_params {}, 2);
+    auto first = seq::make(10, { 1, 2 }, generation_params {});
     REQUIRE(scheduler_result.has_value());
     REQUIRE(first.has_value());
     auto& engine = *scheduler_result;
@@ -104,7 +109,7 @@ TEST_CASE("add admits one pristine waiting sequence and rejects a duplicate ID")
     CHECK(engine.running_count() == 0);
     REQUIRE(engine.find_sequence(10) != nullptr);
 
-    auto duplicate = seq::make(10, { 8 }, sampling_params {}, 2);
+    auto duplicate = seq::make(10, { 8 }, generation_params {});
     REQUIRE(duplicate.has_value());
     auto added_twice = engine.add(std::move(*duplicate));
     REQUIRE_FALSE(added_twice.has_value());
@@ -118,7 +123,7 @@ TEST_CASE("prefill can be chunked and only the final chunk appends a sample")
     auto config = test_config();
     config.max_batch_tokens = 2;
     auto scheduler_result = scheduler::make(config);
-    auto sequence = seq::make(1, { 10, 20, 30 }, sampling_params {}, 2);
+    auto sequence = seq::make(1, { 10, 20, 30 }, generation_params {});
     REQUIRE(scheduler_result.has_value());
     REQUIRE(sequence.has_value());
     auto& engine = *scheduler_result;
@@ -134,11 +139,11 @@ TEST_CASE("prefill can be chunked and only the final chunk appends a sample")
     REQUIRE_FALSE(overlapping.has_value());
     CHECK(overlapping.error() == scheduler_errc::batch_in_flight);
 
-    const std::array<token_id, 1> intermediate_sample { 777 };
-    REQUIRE(engine.complete(*first_batch, intermediate_sample).has_value());
+    const std::array<token_id, 0> intermediate_sample {};
+    REQUIRE(engine.complete(first_batch->id, intermediate_sample).has_value());
     const auto* after_first = engine.find_sequence(1);
     REQUIRE(after_first != nullptr);
-    CHECK(after_first->cached_token_count() == 2);
+    CHECK(after_first->processed_token_count() == 2);
     CHECK(after_first->token_count() == 3);
     CHECK(after_first->status() == seq_status::waiting);
 
@@ -149,11 +154,11 @@ TEST_CASE("prefill can be chunked and only the final chunk appends a sample")
     CHECK(final_batch->items[0].token_count == 1);
 
     const std::array<token_id, 1> final_sample { 40 };
-    REQUIRE(engine.complete(*final_batch, final_sample).has_value());
+    REQUIRE(engine.complete(final_batch->id, final_sample).has_value());
     const auto* completed_prompt = engine.find_sequence(1);
     REQUIRE(completed_prompt != nullptr);
     CHECK(completed_prompt->status() == seq_status::running);
-    CHECK(completed_prompt->cached_token_count() == 3);
+    CHECK(completed_prompt->processed_token_count() == 3);
     CHECK(completed_prompt->completion_token_count() == 1);
     CHECK(completed_prompt->last_token() == 40);
     CHECK(engine.waiting_count() == 0);
@@ -163,7 +168,7 @@ TEST_CASE("prefill can be chunked and only the final chunk appends a sample")
 TEST_CASE("decode commits the old sample and creates the next one-token cache gap")
 {
     auto scheduler_result = scheduler::make(test_config());
-    auto sequence = seq::make(1, { 10, 20 }, sampling_params {}, 2);
+    auto sequence = seq::make(1, { 10, 20 }, generation_params {});
     REQUIRE(scheduler_result.has_value());
     REQUIRE(sequence.has_value());
     auto& engine = *scheduler_result;
@@ -172,12 +177,12 @@ TEST_CASE("decode commits the old sample and creates the next one-token cache ga
     auto prefill = engine.schedule();
     REQUIRE(prefill.has_value());
     const std::array<token_id, 1> first_sample { 30 };
-    REQUIRE(engine.complete(*prefill, first_sample).has_value());
+    REQUIRE(engine.complete(prefill->id, first_sample).has_value());
 
     const auto* before_decode = engine.find_sequence(1);
     REQUIRE(before_decode != nullptr);
     CHECK(before_decode->token_count() == 3);
-    CHECK(before_decode->cached_token_count() == 2);
+    CHECK(before_decode->processed_token_count() == 2);
 
     auto decode = engine.schedule();
     REQUIRE(decode.has_value());
@@ -186,20 +191,21 @@ TEST_CASE("decode commits the old sample and creates the next one-token cache ga
     CHECK(decode->items[0].token_count == 1);
 
     const std::array<token_id, 1> next_sample { 40 };
-    REQUIRE(engine.complete(*decode, next_sample).has_value());
+    REQUIRE(engine.complete(decode->id, next_sample).has_value());
     const auto* after_decode = engine.find_sequence(1);
     REQUIRE(after_decode != nullptr);
     CHECK(after_decode->token_count() == 4);
-    CHECK(after_decode->cached_token_count() == 3);
-    CHECK(after_decode->uncached_token_count() == 1);
+    CHECK(after_decode->processed_token_count() == 3);
+    CHECK(after_decode->unprocessed_token_count() == 1);
     CHECK(after_decode->last_token() == 40);
 }
 
 TEST_CASE("sequences finish on EOS or length limit and release cache blocks")
 {
-    auto check_finish = [](sampling_params params, token_id sample, finish_reason expected_reason) {
+    auto check_finish = [](generation_params params, token_id sample,
+                           finish_reason expected_reason) {
         auto scheduler_result = scheduler::make(test_config());
-        auto sequence = seq::make(1, { 10, 20 }, params, 2);
+        auto sequence = seq::make(1, { 10, 20 }, params);
         REQUIRE(scheduler_result.has_value());
         REQUIRE(sequence.has_value());
         auto& engine = *scheduler_result;
@@ -207,25 +213,25 @@ TEST_CASE("sequences finish on EOS or length limit and release cache blocks")
 
         auto prefill = engine.schedule();
         REQUIRE(prefill.has_value());
-        REQUIRE(engine.complete(*prefill, std::array<token_id, 1> { sample }).has_value());
+        REQUIRE(engine.complete(prefill->id, std::array<token_id, 1> { sample }).has_value());
 
         const auto* finished = engine.find_sequence(1);
         REQUIRE(finished != nullptr);
         CHECK(finished->status() == seq_status::finished);
         CHECK(finished->reason() == expected_reason);
-        CHECK(finished->block_table().empty());
-        CHECK(engine.cache().used_block_count() == 0);
+        CHECK(engine.state().resources(1).blocks.empty());
+        CHECK(paged_state(engine).used_block_count() == 0);
         CHECK(engine.is_finished());
     };
 
-    check_finish(sampling_params {}, 99, finish_reason::eos);
-    check_finish(sampling_params { .max_new_tokens = 1 }, 42, finish_reason::len_limit);
+    check_finish(generation_params {}, 99, finish_reason::eos);
+    check_finish(generation_params { .max_new_tokens = 1 }, 42, finish_reason::len_limit);
 }
 
 TEST_CASE("cancel releases a running sequence and allows it to be retired")
 {
     auto scheduler_result = scheduler::make(test_config());
-    auto sequence = seq::make(1, { 10, 20 }, sampling_params {}, 2);
+    auto sequence = seq::make(1, { 10, 20 }, generation_params {});
     REQUIRE(scheduler_result.has_value());
     REQUIRE(sequence.has_value());
     auto& engine = *scheduler_result;
@@ -234,14 +240,14 @@ TEST_CASE("cancel releases a running sequence and allows it to be retired")
     auto prefill = engine.schedule();
     REQUIRE(prefill.has_value());
     const std::array<token_id, 1> sample { 30 };
-    REQUIRE(engine.complete(*prefill, sample).has_value());
-    CHECK(engine.cache().used_block_count() == 1);
+    REQUIRE(engine.complete(prefill->id, sample).has_value());
+    CHECK(paged_state(engine).used_block_count() == 1);
 
     REQUIRE(engine.cancel(1).has_value());
     const auto* cancelled = engine.find_sequence(1);
     REQUIRE(cancelled != nullptr);
     CHECK(cancelled->reason() == finish_reason::cancelled);
-    CHECK(engine.cache().used_block_count() == 0);
+    CHECK(paged_state(engine).used_block_count() == 0);
     CHECK(engine.is_finished());
 
     REQUIRE(engine.remove(1).has_value());
@@ -252,7 +258,7 @@ TEST_CASE("cancel releases a running sequence and allows it to be retired")
 TEST_CASE("completion validation leaves an in-flight reservation untouched")
 {
     auto scheduler_result = scheduler::make(test_config());
-    auto sequence = seq::make(1, { 10 }, sampling_params {}, 2);
+    auto sequence = seq::make(1, { 10 }, generation_params {});
     REQUIRE(scheduler_result.has_value());
     REQUIRE(sequence.has_value());
     auto& engine = *scheduler_result;
@@ -261,20 +267,20 @@ TEST_CASE("completion validation leaves an in-flight reservation untouched")
     REQUIRE(batch.has_value());
 
     const std::array<token_id, 0> no_samples {};
-    auto completed = engine.complete(*batch, no_samples);
+    auto completed = engine.complete(batch->id, no_samples);
     REQUIRE_FALSE(completed.has_value());
     CHECK(completed.error() == scheduler_errc::result_count_mismatch);
     CHECK(engine.has_in_flight_batch());
     const auto* unchanged = engine.find_sequence(1);
     REQUIRE(unchanged != nullptr);
     CHECK(unchanged->scheduled_token_count() == 1);
-    CHECK(unchanged->cached_token_count() == 0);
+    CHECK(unchanged->processed_token_count() == 0);
 }
 
 TEST_CASE("abort validates active batch and restores reservations")
 {
     auto scheduler_result = scheduler::make(test_config());
-    auto sequence = seq::make(1, { 10, 20, 30 }, sampling_params {}, 2);
+    auto sequence = seq::make(1, { 10, 20, 30 }, generation_params {});
     REQUIRE(scheduler_result.has_value());
     REQUIRE(sequence.has_value());
     auto& engine = *scheduler_result;
@@ -282,24 +288,24 @@ TEST_CASE("abort validates active batch and restores reservations")
 
     auto batch = engine.schedule();
     REQUIRE(batch.has_value());
-    CHECK(engine.cache().used_block_count() == 2);
+    CHECK(paged_state(engine).used_block_count() == 2);
 
     auto wrong_batch = *batch;
     ++wrong_batch.id;
-    CHECK(engine.abort(wrong_batch).error() == scheduler_errc::batch_id_mismatch);
+    CHECK(engine.abort(wrong_batch.id).error() == scheduler_errc::batch_id_mismatch);
     CHECK(engine.has_in_flight_batch());
 
-    REQUIRE(engine.abort(*batch).has_value());
+    REQUIRE(engine.abort(batch->id).has_value());
     CHECK_FALSE(engine.has_in_flight_batch());
     CHECK(engine.waiting_count() == 1);
     CHECK(engine.running_count() == 0);
-    CHECK(engine.cache().used_block_count() == 2);
+    CHECK(paged_state(engine).used_block_count() == 2);
 
     const auto* unchanged = engine.find_sequence(1);
     REQUIRE(unchanged != nullptr);
-    CHECK(unchanged->cached_token_count() == 0);
+    CHECK(unchanged->processed_token_count() == 0);
     CHECK(unchanged->scheduled_token_count() == 0);
-    CHECK(unchanged->block_table().size() == 2);
+    CHECK(engine.state().resources(1).blocks.size() == 2);
 
     auto retried = engine.schedule();
     REQUIRE(retried.has_value());
@@ -311,7 +317,7 @@ TEST_CASE("abort validates active batch and restores reservations")
 TEST_CASE("waiting prefill work is chosen before existing decode work")
 {
     auto scheduler_result = scheduler::make(test_config());
-    auto first = seq::make(1, { 10 }, sampling_params {}, 2);
+    auto first = seq::make(1, { 10 }, generation_params {});
     REQUIRE(scheduler_result.has_value());
     REQUIRE(first.has_value());
     auto& engine = *scheduler_result;
@@ -320,9 +326,9 @@ TEST_CASE("waiting prefill work is chosen before existing decode work")
     auto first_prefill = engine.schedule();
     REQUIRE(first_prefill.has_value());
     const std::array<token_id, 1> first_sample { 11 };
-    REQUIRE(engine.complete(*first_prefill, first_sample).has_value());
+    REQUIRE(engine.complete(first_prefill->id, first_sample).has_value());
 
-    auto newcomer = seq::make(2, { 20 }, sampling_params {}, 2);
+    auto newcomer = seq::make(2, { 20 }, generation_params {});
     REQUIRE(newcomer.has_value());
     REQUIRE(engine.add(std::move(*newcomer)).has_value());
 
@@ -338,7 +344,7 @@ TEST_CASE("cache exhaustion reports an error without partially scheduling")
     auto config = test_config();
     config.kv_block_count = 1;
     auto scheduler_result = scheduler::make(config);
-    auto sequence = seq::make(1, { 10, 20, 30 }, sampling_params {}, 2);
+    auto sequence = seq::make(1, { 10, 20, 30 }, generation_params {});
     REQUIRE(scheduler_result.has_value());
     REQUIRE(sequence.has_value());
     auto& engine = *scheduler_result;
@@ -348,10 +354,10 @@ TEST_CASE("cache exhaustion reports an error without partially scheduling")
     REQUIRE_FALSE(batch.has_value());
     CHECK(batch.error() == scheduler_errc::cache_capacity_exhausted);
     CHECK_FALSE(engine.has_in_flight_batch());
-    CHECK(engine.cache().used_block_count() == 0);
+    CHECK(paged_state(engine).used_block_count() == 0);
     const auto* unchanged = engine.find_sequence(1);
     REQUIRE(unchanged != nullptr);
     CHECK(unchanged->scheduled_token_count() == 0);
-    CHECK(unchanged->block_table().empty());
+    CHECK(engine.state().resources(1).blocks.empty());
     CHECK(unchanged->status() == seq_status::waiting);
 }

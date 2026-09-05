@@ -47,3 +47,26 @@ Run the tests with:
 ```sh
 make test
 ```
+
+## Code structure
+
+- `model_factory` selects a runner from the checkpoint's `model_type`.
+- `inference_engine` executes scheduler reservations and publishes completion updates.
+- `model_state` owns per-engine resources and provides batch begin/commit/abort and sequence release. Paged Metal state combines the block allocator and KV buffers; other architectures can provide their own state without changing sequence progress.
+- `tensor/` contains reusable embedding, normalization, SwiGLU, attention, and fused greedy output operations. Attention metadata is prepared once per batch and its input tensors remain alive through the forward pass.
+- `metal/` separates device/pass ownership, resource pooling, and kernel encoding.
+- `model_format/weight_reader` validates and loads the same weight layouts, including packed projections.
+- `serving_runtime` owns request execution; `server` maps requests and events to HTTP/JSON/SSE. Each request has a model-provided incremental text decoder.
+
+To add an architecture, implement its runner, weight layout, and state, then add its factory entry. State that is mutated during execution must restore its pre-batch value on abort. Chat formatting and incremental decoding are separate from the forward pass. Qwen3.5 configuration and weight loading are available; its forward pass is not implemented yet.
+
+## Basic benchmark
+
+Use the same release build, checkpoint, and machine for both runs. Save the old executable before rebuilding, then run:
+
+```sh
+python3 scripts/benchmark.py --binary /tmp/chibillm-before --output /tmp/before.json
+python3 scripts/benchmark.py --binary build/chibillm --output /tmp/after.json
+```
+
+The script uses fixed short and long prompts, excludes one warmup per prompt from the medians, and records output hashes alongside prefill/decode rates and latency. CLI timing is rounded, so token rates are more precise than the printed first-token time.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -29,10 +30,21 @@ struct model_info {
     token_id eos_token;
 };
 
+class text_decoder {
+public:
+    virtual ~text_decoder() = default;
+    virtual result<std::string, model_runner_errc> push(token_id token, bool final) = 0;
+};
+
 // Adapts one model family to the generic scheduler and serving layers.
 class model_runner {
 public:
     virtual ~model_runner() = default;
+
+    virtual std::unique_ptr<text_decoder> make_decoder() const;
+
+    virtual result<std::unique_ptr<model_state>, model_runner_errc>
+    make_state(scheduler_config config) const;
 
     [[nodiscard]] virtual const model_info& info() const noexcept = 0;
 
@@ -43,28 +55,7 @@ public:
     decode(std::span<const token_id> tokens) const = 0;
 
     [[nodiscard]] virtual result<std::vector<token_id>, model_runner_errc>
-    execute(const model_batch& batch) = 0;
-};
-
-// returns a fixed token while the real model backend is unavailable.
-class fake_model_runner final : public model_runner {
-public:
-    explicit fake_model_runner(token_id output_token) noexcept;
-
-    [[nodiscard]] const model_info& info() const noexcept override;
-
-    [[nodiscard]] result<std::vector<token_id>, model_runner_errc>
-    encode_chat(std::span<const chat_message> messages) override;
-
-    [[nodiscard]] result<std::string, model_runner_errc>
-    decode(std::span<const token_id> tokens) const override;
-
-    [[nodiscard]] result<std::vector<token_id>, model_runner_errc>
-    execute(const model_batch& batch) override;
-
-private:
-    model_info info_ { .id = "fake", .max_context_tokens = 4096, .eos_token = -1 };
-    token_id output_token_;
+    execute(const model_batch& batch, model_state& state) = 0;
 };
 
 } // namespace chibillm
