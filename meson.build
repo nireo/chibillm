@@ -84,6 +84,7 @@ chibillm_qwen = static_library(
   'chibillm_qwen',
   [
     'src/qwen/qwen_configs.cc',
+    'src/qwen/qwen3_5_model_state.cc',
     'src/qwen/qwen_chat.cc',
     'src/qwen/qwen_layer.cc',
     'src/qwen/qwen_model_runner.cc',
@@ -155,6 +156,7 @@ foreach spec : [
   {'name': 'model batch', 'sources': ['tests/model_batch_test.cc'], 'library': chibillm_core},
   {'name': 'inference engine', 'sources': ['tests/inference_engine_test.cc', 'tests/fake_model_runner.cc'], 'library': chibillm_core},
   {'name': 'server', 'sources': ['tests/server_test.cc'], 'library': chibillm_server, 'deps': [cpp_httplib_dep, nlohmann_json_dep]},
+  {'name': 'qwen hybrid state', 'sources': ['tests/qwen3_5_model_state_test.cc'], 'library': chibillm_qwen},
   {'name': 'qwen config', 'sources': ['tests/qwen_config_test.cc'], 'library': chibillm_qwen, 'deps': [nlohmann_json_dep]},
   {'name': 'qwen tokenizer', 'sources': ['tests/qwen_tokenizer_test.cc'], 'library': chibillm_qwen, 'deps': [nlohmann_json_dep]},
   {'name': 'safetensors', 'sources': ['tests/safetensors_test.cc'], 'library': chibillm_model_format, 'deps': [nlohmann_json_dep]},
