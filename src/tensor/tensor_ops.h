@@ -40,6 +40,7 @@ enum class tensor_op_errc : std::uint8_t {
     cache_head_dimension_mismatch,
     invalid_kv_head_mapping,
     backend_failure,
+    unsupported_aliasing,
 };
 
 [[nodiscard]] result<metal_tensor, tensor_op_errc>

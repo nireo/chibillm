@@ -297,6 +297,13 @@ metal_context::make(std::string_view shader_source)
         CL_TRY_ASSIGN(implementation->paged_attention_reduce_f32_pipeline,
                       make_compute_pipeline(device, library, @"paged_attention_reduce_f32"));
 
+        CL_TRY_ASSIGN(implementation->causal_conv1d_silu_pipeline,
+                      make_compute_pipeline(device, library, @"causal_conv1d_silu"));
+        CL_TRY_ASSIGN(implementation->gated_delta_rule_pipeline,
+                      make_compute_pipeline(device, library, @"gated_delta_rule"));
+        CL_TRY_ASSIGN(implementation->rms_norm_gated_pipeline,
+                      make_compute_pipeline(device, library, @"rms_norm_gated"));
+
         const char* device_name = device.name.UTF8String;
         implementation->device = device;
         implementation->command_queue = command_queue;

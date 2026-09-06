@@ -117,6 +117,9 @@ struct metal_context::implementation {
     id<MTLComputePipelineState> linear_split_bf16_decode_pipeline;
     id<MTLComputePipelineState> embedding_bf16_pipeline;
     id<MTLComputePipelineState> rms_norm_bf16_pipeline;
+    id<MTLComputePipelineState> causal_conv1d_silu_pipeline;
+    id<MTLComputePipelineState> gated_delta_rule_pipeline;
+    id<MTLComputePipelineState> rms_norm_gated_pipeline;
     id<MTLComputePipelineState> gather_rows_f32_pipeline;
     id<MTLComputePipelineState> linear_bf16_partial_argmax_pipeline;
     id<MTLComputePipelineState> reduce_argmax_pipeline;

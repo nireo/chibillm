@@ -1012,3 +1012,124 @@ paged_attention_reduce_f32(device const float* partials [[buffer(0)]],
         + ulong(thread_index);
     output[output_index] = accumulator / softmax_state[0];
 }
+
+// DeltaNet primitives use f32 activations and state with native checkpoint
+// weight types. Each dispatch processes consecutive tokens from one sequence.
+inline float
+deltanet_sigmoid(float x)
+{
+    const float e = exp(-abs(x));
+    return x >= 0.0F ? 1.0F / (1.0F + e) : e / (1.0F + e);
+}
+
+kernel void
+causal_conv1d_silu(device const float* input [[buffer(0)]],
+                   device const bf16_storage* weight [[buffer(1)]],
+                   device float* history [[buffer(2)]],
+                   device float* output [[buffer(3)]],
+                   constant uint* geometry [[buffer(4)]],
+                   uint channel [[thread_position_in_grid]])
+{
+    const uint rows = geometry[0], channels = geometry[1], kernel_size = geometry[2];
+    if (channel >= channels)
+        return;
+    const ulong base = ulong(channel) * kernel_size;
+    for (uint t = 0; t < rows; ++t) {
+        const ulong index = ulong(t) * channels + channel;
+        const float current = input[index];
+        float sum = current * load_bf16(weight[base + kernel_size - 1]);
+        // One thread owns a channel, so shifting its raw history is race-free.
+        for (uint j = 0; j + 1 < kernel_size; ++j) {
+            const float previous = history[base + j + 1];
+            sum += previous * load_bf16(weight[base + j]);
+            history[base + j] = previous;
+        }
+        history[base + kernel_size - 1] = current;
+        output[index] = sum * deltanet_sigmoid(sum);
+    }
+}
+
+kernel void
+gated_delta_rule(device const float* qkv [[buffer(0)]],
+                 device const float* a [[buffer(1)]],
+                 device const float* b [[buffer(2)]],
+                 device const float* A_log [[buffer(3)]],
+                 device const bf16_storage* dt_bias [[buffer(4)]],
+                 device float* state [[buffer(5)]],
+                 device float* output [[buffer(6)]],
+                 constant uint* geometry [[buffer(7)]],
+                 constant float& epsilon [[buffer(8)]],
+                 uint column [[thread_position_in_grid]])
+{
+    const uint rows = geometry[0], key_heads = geometry[1], value_heads = geometry[2];
+    const uint key_dim = geometry[3], value_dim = geometry[4];
+    const uint value_width = value_heads * value_dim;
+    if (column >= value_width)
+        return;
+    const uint head = column / value_dim, value = column % value_dim;
+    const uint key_head = head / (value_heads / key_heads);
+    const uint key_width = key_heads * key_dim, packed_width = 2 * key_width + value_width;
+    const ulong state_base = ulong(head) * key_dim * value_dim + value;
+    const float decay_rate = exp(A_log[head]);
+    const float bias = load_bf16(dt_bias[head]);
+    // Threads own independent state columns; value columns are contiguous in
+    // memory. The sequential scan is also a correctness baseline for prefill.
+    for (uint t = 0; t < rows; ++t) {
+        const ulong q_base = ulong(t) * packed_width + key_head * key_dim;
+        const ulong k_base = q_base + key_width;
+        float q_square = 0.0F, k_square = 0.0F;
+        for (uint j = 0; j < key_dim; ++j) {
+            q_square += qkv[q_base + j] * qkv[q_base + j];
+            k_square += qkv[k_base + j] * qkv[k_base + j];
+        }
+        const float q_scale = rsqrt(q_square + epsilon) * rsqrt(float(key_dim));
+        const float k_scale = rsqrt(k_square + epsilon);
+        const ulong gate_index = ulong(t) * value_heads + head;
+        const float x = a[gate_index] + bias;
+        // Metal has no log1p; preserve the small tail when 1 + tail rounds to 1.
+        const float tail = exp(-abs(x));
+        const float log_term = tail < 1e-4F ? tail * (1.0F - 0.5F * tail) : log(1.0F + tail);
+        const float softplus = max(x, 0.0F) + log_term;
+        const float decay = exp(-decay_rate * softplus);
+        const float beta = deltanet_sigmoid(b[gate_index]);
+        float prediction = 0.0F;
+        for (uint j = 0; j < key_dim; ++j) {
+            const ulong index = state_base + ulong(j) * value_dim;
+            state[index] *= decay;
+            prediction += state[index] * (qkv[k_base + j] * k_scale);
+        }
+        const float v = qkv[ulong(t) * packed_width + 2 * key_width + column];
+        const float delta = (v - prediction) * beta;
+        float result = 0.0F;
+        for (uint j = 0; j < key_dim; ++j) {
+            const ulong index = state_base + ulong(j) * value_dim;
+            const float updated = state[index] + qkv[k_base + j] * k_scale * delta;
+            state[index] = updated;
+            result += updated * (qkv[q_base + j] * q_scale);
+        }
+        output[ulong(t) * value_width + column] = result;
+    }
+}
+
+kernel void
+rms_norm_gated(device const float* input [[buffer(0)]],
+               device const float* gate [[buffer(1)]],
+               device const float* weight [[buffer(2)]],
+               device float* output [[buffer(3)]],
+               constant uint* geometry [[buffer(4)]],
+               constant float& epsilon [[buffer(5)]],
+               uint group [[thread_position_in_grid]])
+{
+    const uint groups = geometry[0], width = geometry[1];
+    if (group >= groups)
+        return;
+    const ulong base = ulong(group) * width;
+    float square = 0.0F;
+    for (uint j = 0; j < width; ++j)
+        square += input[base + j] * input[base + j];
+    const float scale = rsqrt(square / float(width) + epsilon);
+    for (uint j = 0; j < width; ++j) {
+        const float z = gate[base + j];
+        output[base + j] = input[base + j] * scale * weight[j] * z * deltanet_sigmoid(z);
+    }
+}

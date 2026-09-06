@@ -68,6 +68,7 @@ chibillm_metal = static_library(
     'src/tensor/output.cc',
     'src/tensor/embedding.cc',
     'src/tensor/layers.cc',
+    'src/tensor/deltanet.cc',
     'src/tensor/attention.cc',
     'src/metal/metal_kv_cache.cc',
     'src/model_format/weight_reader.cc',
@@ -160,6 +161,7 @@ foreach spec : [
   {'name': 'qwen weights', 'sources': ['tests/qwen_weights_test.cc'], 'library': chibillm_qwen, 'deps': [nlohmann_json_dep]},
   {'name': 'kv cache', 'sources': ['tests/metal_kv_cache_test.cc'], 'library': chibillm_metal},
   {'name': 'tensor', 'sources': ['tests/tensor_test.cc'], 'library': chibillm_metal},
+  {'name': 'deltanet', 'sources': ['tests/deltanet_test.cc'], 'library': chibillm_metal},
   {'name': 'tensor ops', 'sources': ['tests/tensor_ops_test.cc'], 'library': chibillm_metal},
 ]
   name = spec['name'] == 'unit' ? 'chibillm_tests' : 'chibillm_' + spec['name'].replace(' ', '_') + '_tests'

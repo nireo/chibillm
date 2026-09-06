@@ -120,6 +120,36 @@ public:
                                                std::size_t block_table_entry_count,
                                                std::size_t query_tile_count) const;
 
+    [[nodiscard]] result<void, metal_error> dispatch_causal_conv1d_silu(const metal_buffer& input,
+                                                                        const metal_buffer& weight,
+                                                                        metal_buffer& history,
+                                                                        metal_buffer& output,
+                                                                        std::size_t rows,
+                                                                        std::size_t channels,
+                                                                        std::size_t kernel) const;
+
+    [[nodiscard]] result<void, metal_error> dispatch_gated_delta_rule(const metal_buffer& qkv,
+                                                                      const metal_buffer& a,
+                                                                      const metal_buffer& b,
+                                                                      const metal_buffer& A_log,
+                                                                      const metal_buffer& dt_bias,
+                                                                      metal_buffer& state,
+                                                                      metal_buffer& output,
+                                                                      std::size_t rows,
+                                                                      std::size_t key_heads,
+                                                                      std::size_t value_heads,
+                                                                      std::size_t key_dim,
+                                                                      std::size_t value_dim,
+                                                                      float epsilon) const;
+
+    [[nodiscard]] result<void, metal_error> dispatch_rms_norm_gated(const metal_buffer& input,
+                                                                    const metal_buffer& gate,
+                                                                    const metal_buffer& weight,
+                                                                    metal_buffer& output,
+                                                                    std::size_t groups,
+                                                                    std::size_t width,
+                                                                    float epsilon) const;
+
 private:
     const metal_context& context_;
 };

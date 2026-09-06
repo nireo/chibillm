@@ -884,4 +884,141 @@ metal_kernels::dispatch_paged_attention_f32(const metal_buffer& queries,
     }
 }
 
+result<void, metal_error>
+metal_kernels::dispatch_causal_conv1d_silu(const metal_buffer& input,
+                                           const metal_buffer& weight,
+                                           metal_buffer& history,
+                                           metal_buffer& output,
+                                           std::size_t rows,
+                                           std::size_t channels,
+                                           std::size_t kernel) const
+{
+    @autoreleasepool {
+        const auto& implementation_ = context_.implementation_;
+        constexpr auto limit = std::numeric_limits<std::uint32_t>::max();
+        if (rows == 0
+            || rows > limit
+            || channels == 0
+            || channels > limit
+            || kernel == 0
+            || kernel > limit)
+            return fail(
+                make_error(metal_errc::invalid_input, "invalid DeltaNet shader dimensions"));
+        const std::uint32_t geometry[] = { static_cast<std::uint32_t>(rows),
+                                           static_cast<std::uint32_t>(channels),
+                                           static_cast<std::uint32_t>(kernel) };
+        const auto pipeline = implementation_->causal_conv1d_silu_pipeline;
+        auto opened = implementation_->open_dispatch_encoder();
+        if (!opened)
+            return fail(opened.error());
+        id<MTLComputeCommandEncoder> encoder = opened->encoder;
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:weight.implementation_->buffer offset:0 atIndex:1];
+        [encoder setBuffer:history.implementation_->buffer offset:0 atIndex:2];
+        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:3];
+        [encoder setBytes:geometry length:sizeof(geometry) atIndex:4];
+        const auto threads = std::min<std::size_t>(256, pipeline.maxTotalThreadsPerThreadgroup);
+        [encoder dispatchThreads:MTLSizeMake(channels, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        return implementation_->complete_dispatch_encoder(*opened, "causal_conv1d_silu");
+    }
+}
+
+result<void, metal_error>
+metal_kernels::dispatch_gated_delta_rule(const metal_buffer& qkv,
+                                         const metal_buffer& a,
+                                         const metal_buffer& b,
+                                         const metal_buffer& A_log,
+                                         const metal_buffer& dt_bias,
+                                         metal_buffer& state,
+                                         metal_buffer& output,
+                                         std::size_t rows,
+                                         std::size_t key_heads,
+                                         std::size_t value_heads,
+                                         std::size_t key_dim,
+                                         std::size_t value_dim,
+                                         float epsilon) const
+{
+    @autoreleasepool {
+        const auto& implementation_ = context_.implementation_;
+        constexpr auto limit = std::numeric_limits<std::uint32_t>::max();
+        if (rows == 0
+            || rows > limit
+            || key_heads == 0
+            || key_heads > limit
+            || value_heads == 0
+            || value_heads > limit
+            || key_dim == 0
+            || key_dim > limit
+            || value_dim == 0
+            || value_dim > limit
+            || value_heads % key_heads != 0
+            || value_heads > limit / value_dim
+            || key_heads > (limit - value_heads * value_dim) / key_dim / 2)
+            return fail(
+                make_error(metal_errc::invalid_input, "invalid DeltaNet shader dimensions"));
+        const std::uint32_t geometry[] = { static_cast<std::uint32_t>(rows),
+                                           static_cast<std::uint32_t>(key_heads),
+                                           static_cast<std::uint32_t>(value_heads),
+                                           static_cast<std::uint32_t>(key_dim),
+                                           static_cast<std::uint32_t>(value_dim) };
+        const auto pipeline = implementation_->gated_delta_rule_pipeline;
+        auto opened = implementation_->open_dispatch_encoder();
+        if (!opened)
+            return fail(opened.error());
+        id<MTLComputeCommandEncoder> encoder = opened->encoder;
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:qkv.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:a.implementation_->buffer offset:0 atIndex:1];
+        [encoder setBuffer:b.implementation_->buffer offset:0 atIndex:2];
+        [encoder setBuffer:A_log.implementation_->buffer offset:0 atIndex:3];
+        [encoder setBuffer:dt_bias.implementation_->buffer offset:0 atIndex:4];
+        [encoder setBuffer:state.implementation_->buffer offset:0 atIndex:5];
+        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:6];
+        [encoder setBytes:geometry length:sizeof(geometry) atIndex:7];
+        [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:8];
+        const auto threads = std::min<std::size_t>(256, pipeline.maxTotalThreadsPerThreadgroup);
+        [encoder dispatchThreads:MTLSizeMake(value_heads * value_dim, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        return implementation_->complete_dispatch_encoder(*opened, "gated_delta_rule");
+    }
+}
+
+result<void, metal_error>
+metal_kernels::dispatch_rms_norm_gated(const metal_buffer& input,
+                                       const metal_buffer& gate,
+                                       const metal_buffer& weight,
+                                       metal_buffer& output,
+                                       std::size_t groups,
+                                       std::size_t width,
+                                       float epsilon) const
+{
+    @autoreleasepool {
+        const auto& implementation_ = context_.implementation_;
+        constexpr auto limit = std::numeric_limits<std::uint32_t>::max();
+        if (groups == 0 || groups > limit || width == 0 || width > limit)
+            return fail(
+                make_error(metal_errc::invalid_input, "invalid DeltaNet shader dimensions"));
+        const std::uint32_t geometry[] = { static_cast<std::uint32_t>(groups),
+                                           static_cast<std::uint32_t>(width) };
+        const auto pipeline = implementation_->rms_norm_gated_pipeline;
+        auto opened = implementation_->open_dispatch_encoder();
+        if (!opened)
+            return fail(opened.error());
+        id<MTLComputeCommandEncoder> encoder = opened->encoder;
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:gate.implementation_->buffer offset:0 atIndex:1];
+        [encoder setBuffer:weight.implementation_->buffer offset:0 atIndex:2];
+        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:3];
+        [encoder setBytes:geometry length:sizeof(geometry) atIndex:4];
+        [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:5];
+        const auto threads = std::min<std::size_t>(256, pipeline.maxTotalThreadsPerThreadgroup);
+        [encoder dispatchThreads:MTLSizeMake(groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        return implementation_->complete_dispatch_encoder(*opened, "rms_norm_gated");
+    }
+}
+
 } // namespace chibillm

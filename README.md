@@ -58,7 +58,7 @@ make test
 - `model_format/weight_reader` validates and loads the same weight layouts, including packed projections.
 - `serving_runtime` owns request execution; `server` maps requests and events to HTTP/JSON/SSE. Each request has a model-provided incremental text decoder.
 
-To add an architecture, implement its runner, weight layout, and state, then add its factory entry. State that is mutated during execution must restore its pre-batch value on abort. Chat formatting and incremental decoding are separate from the forward pass. Qwen3.5 configuration and weight loading are available; its forward pass is not implemented yet.
+To add an architecture, implement its runner, weight layout, and state, then add its factory entry. State that is mutated during execution must restore its pre-batch value on abort. Chat formatting and incremental decoding are separate from the forward pass. Qwen3.5 configuration, weight loading, and DeltaNet tensor primitives are available; its model forward pass is not implemented yet. `tensor/deltanet.h` provides stateful causal convolution with SiLU, the recurrent gated delta rule (including Q/K normalization and gate computation), and gated RMSNorm. The kernels process one sequence chunk per call with caller-owned FP32 state and support both prefill and decode; prefill currently uses a sequential scan. The caller must initialize state for new sequences and restore it on batch abort.
 
 ## Basic benchmark
 

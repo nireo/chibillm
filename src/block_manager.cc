@@ -26,7 +26,7 @@ sequence_resources
 block_manager::resources(seq_id id) const noexcept
 {
     auto found = tables_.find(id);
-    return found == tables_.end() ? sequence_resources {} : sequence_resources { found->second };
+    return found == tables_.end() ? sequence_resources { } : sequence_resources { found->second };
 }
 
 result<void, state_errc>
@@ -42,18 +42,17 @@ block_manager::reserve(seq_id id, std::size_t tokens)
     if (additional > free_.size())
         return fail(state_errc::capacity_exhausted);
     if (!additional)
-        return {};
+        return { };
     auto& table = tables_[id];
     table.reserve(required);
     for (std::size_t i = 0; i < additional; ++i) {
         table.push_back(free_.front());
         free_.pop_front();
     }
-    return {};
+    return { };
 }
 
-void
-block_manager::release(seq_id id) noexcept
+void block_manager::release(seq_id id) noexcept
 {
     const auto found = tables_.find(id);
     if (found == tables_.end())
