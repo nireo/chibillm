@@ -83,19 +83,35 @@ linear_split(const metal_context& context,
                                                     const metal_tensor& up,
                                                     metal_tensor& output);
 
+// Multiplies input by sigmoid(gate), without the extra gate factor in SiLU.
+[[nodiscard]] result<void, tensor_op_errc> sigmoid_mul(const metal_context& context,
+                                                       const metal_tensor& gate,
+                                                       const metal_tensor& input,
+                                                       metal_tensor& output);
+
+// Splits [rows, heads * 2 * head_dim] into two [rows, heads * head_dim] tensors.
+// Each head stores its first half followed by its second half; outputs cannot alias.
+[[nodiscard]] result<void, tensor_op_errc> split_heads(const metal_context& context,
+                                                       const metal_tensor& input,
+                                                       std::size_t head_count,
+                                                       metal_tensor& first,
+                                                       metal_tensor& second);
+
 // adds lhs and rhs elementwise into output.
 [[nodiscard]] result<void, tensor_op_errc> add(const metal_context& context,
                                                const metal_tensor& lhs,
                                                const metal_tensor& rhs,
                                                metal_tensor& output);
 
-// applies qwen rotary positions to flattened attention heads.
+// Rotates the first rotary_dimension features of each head, preserving the tail.
+// Zero selects the full head. Text-only Qwen3.5 uses the same position on all MRoPE axes.
 [[nodiscard]] result<void, tensor_op_errc> rope(const metal_context& context,
                                                 const metal_tensor& input,
                                                 const metal_tensor& positions,
                                                 std::size_t head_count,
                                                 float theta,
-                                                metal_tensor& output);
+                                                metal_tensor& output,
+                                                std::size_t rotary_dimension = 0);
 
 // writes new f32 keys and values into physical cache slots for one layer.
 [[nodiscard]] result<void, tensor_op_errc> store_kv(const metal_context& context,

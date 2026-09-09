@@ -253,11 +253,13 @@ rms_norm(const metal_context& context,
     return {};
 }
 
+namespace {
 result<void, tensor_op_errc>
-silu_mul(const metal_context& context,
+gate_mul(const metal_context& context,
          const metal_tensor& gate,
          const metal_tensor& up,
-         metal_tensor& output)
+         metal_tensor& output,
+         bool sigmoid_only)
 {
     const auto& gate_descriptor = gate.descriptor();
     const auto& up_descriptor = up.descriptor();
@@ -287,12 +289,32 @@ silu_mul(const metal_context& context,
     }
 
     const auto dispatched = metal_kernels(context).dispatch_silu_mul_f32(
-        gate.buffer(), up.buffer(), output.buffer(), gate_shape.element_count());
+        gate.buffer(), up.buffer(), output.buffer(), gate_shape.element_count(), sigmoid_only);
     if (!dispatched) {
         return fail(tensor_op_errc::backend_failure);
     }
 
     return {};
+}
+
+} // namespace
+
+result<void, tensor_op_errc>
+silu_mul(const metal_context& context,
+         const metal_tensor& gate,
+         const metal_tensor& up,
+         metal_tensor& output)
+{
+    return gate_mul(context, gate, up, output, false);
+}
+
+result<void, tensor_op_errc>
+sigmoid_mul(const metal_context& context,
+            const metal_tensor& gate,
+            const metal_tensor& input,
+            metal_tensor& output)
+{
+    return gate_mul(context, gate, input, output, true);
 }
 
 result<void, tensor_op_errc>
@@ -338,12 +360,57 @@ add(const metal_context& context,
 }
 
 result<void, tensor_op_errc>
+split_heads(const metal_context& context,
+            const metal_tensor& input,
+            std::size_t head_count,
+            metal_tensor& first,
+            metal_tensor& second)
+{
+    const auto& shape = input.descriptor().shape();
+    if (shape.rank() != 2
+        || first.descriptor().shape().rank() != 2
+        || second.descriptor().shape().rank() != 2)
+        return fail(tensor_op_errc::invalid_rank);
+
+    if (input.descriptor().type() != dtype::f32
+        || first.descriptor().type() != dtype::f32
+        || second.descriptor().type() != dtype::f32)
+        return fail(tensor_op_errc::unsupported_dtype);
+
+    if (head_count == 0)
+        return fail(tensor_op_errc::invalid_head_count);
+
+    const auto dims = shape.dimensions();
+    if (dims[1] % head_count != 0 || (dims[1] / head_count) % 2 != 0)
+        return fail(tensor_op_errc::invalid_head_dimension);
+
+    for (const auto* output : { &first, &second }) {
+        const auto out = output->descriptor().shape().dimensions();
+        if (out[0] != dims[0] || out[1] != dims[1] / 2)
+            return fail(tensor_op_errc::output_shape_mismatch);
+    }
+
+    if (first.buffer().bytes().data() == second.buffer().bytes().data()
+        || input.buffer().bytes().data() == first.buffer().bytes().data()
+        || input.buffer().bytes().data() == second.buffer().bytes().data())
+        return fail(tensor_op_errc::unsupported_aliasing);
+
+    if (!metal_kernels(context).dispatch_split_heads_f32(input.buffer(), first.buffer(),
+                                                         second.buffer(), dims[0], head_count,
+                                                         dims[1] / head_count / 2))
+        return fail(tensor_op_errc::backend_failure);
+
+    return {};
+}
+
+result<void, tensor_op_errc>
 rope(const metal_context& context,
      const metal_tensor& input,
      const metal_tensor& positions,
      std::size_t head_count,
      float theta,
-     metal_tensor& output)
+     metal_tensor& output,
+     std::size_t rotary_dimension)
 {
     const auto& input_shape = input.descriptor().shape();
     const auto& position_shape = positions.descriptor().shape();
@@ -375,7 +442,10 @@ rope(const metal_context& context,
     }
 
     const auto head_dimension = feature_count / head_count;
-    if (head_dimension % 2 != 0) {
+    if (rotary_dimension == 0)
+        rotary_dimension = head_dimension;
+
+    if (head_dimension % 2 != 0 || rotary_dimension % 2 != 0 || rotary_dimension > head_dimension) {
         return fail(tensor_op_errc::invalid_head_dimension);
     }
 
@@ -389,7 +459,7 @@ rope(const metal_context& context,
 
     const auto dispatched = metal_kernels(context).dispatch_rope_f32(
         input.buffer(), positions.buffer(), output.buffer(), rows, head_count, head_dimension,
-        theta);
+        theta, rotary_dimension);
     if (!dispatched) {
         return fail(tensor_op_errc::backend_failure);
     }

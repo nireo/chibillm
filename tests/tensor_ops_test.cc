@@ -395,6 +395,77 @@ TEST_CASE("rope rotates split-half feature pairs for every head")
     }
 }
 
+TEST_CASE("partial rope rotates only the prefix with rotary-width frequencies")
+{
+    const auto& context = test_context();
+    auto input = make_tensor(context, dtype::f32, { 2, 16 });
+    auto output = make_tensor(context, dtype::f32, { 2, 16 });
+    auto positions = make_tensor(context, dtype::u32, { 2 });
+    std::vector<float> values(32);
+    for (std::size_t i = 0; i < values.size(); ++i)
+        values[i] = float(i) - 8.0F;
+    write_floats(input, values);
+    write_u32(positions, { 1, 3 });
+
+    // Exercise the frequency cache with full and partial rotations of the same heads.
+    for (std::size_t rotary : { 8, 4, 8, 4 }) {
+        auto expected = values;
+        for (std::size_t row = 0; row < 2; ++row) {
+            for (std::size_t head = 0; head < 2; ++head) {
+                for (std::size_t pair = 0; pair < rotary / 2; ++pair) {
+                    const auto a = row * 16 + head * 8 + pair;
+                    const auto b = a + rotary / 2;
+                    const float angle =
+                        float(1 + row * 2) * std::pow(100.0F, -2.0F * float(pair) / float(rotary));
+                    expected[a] = values[a] * std::cos(angle) - values[b] * std::sin(angle);
+                    expected[b] = values[b] * std::cos(angle) + values[a] * std::sin(angle);
+                }
+            }
+        }
+
+        REQUIRE(rope(context, input, positions, 2, 100.0F, output, rotary).has_value());
+        check_floats(output, expected);
+
+        write_floats(output, values);
+        REQUIRE(rope(context, output, positions, 2, 100.0F, output, rotary).has_value());
+        check_floats(output, expected);
+    }
+
+    for (std::size_t invalid : { 3, 10 }) {
+        CHECK(rope(context, input, positions, 2, 100.0F, output, invalid).error()
+              == tensor_op_errc::invalid_head_dimension);
+    }
+}
+
+TEST_CASE("attention gates split within each head and use sigmoid instead of SiLU")
+{
+    const auto& context = test_context();
+    auto packed = make_tensor(context, dtype::f32, { 2, 8 });
+    auto query = make_tensor(context, dtype::f32, { 2, 4 });
+    auto gate = make_tensor(context, dtype::f32, { 2, 4 });
+    write_floats(packed, { 1, 2, 0, 1, 3, 4, -1, 2, 5, 6, -1000, 1000, 7, 8, 0, -2 });
+
+    REQUIRE(chibillm::split_heads(context, packed, 2, query, gate).has_value());
+    check_floats(query, { 1, 2, 3, 4, 5, 6, 7, 8 });
+    check_floats(gate, { 0, 1, -1, 2, -1000, 1000, 0, -2 });
+
+    REQUIRE(chibillm::sigmoid_mul(context, gate, query, query).has_value());
+    check_floats(query,
+                 { 0.5F, 2.0F / (1 + std::exp(-1.0F)), 3.0F / (1 + std::exp(1.0F)),
+                   4.0F / (1 + std::exp(-2.0F)), 0.0F, 6.0F, 3.5F, 8.0F / (1 + std::exp(2.0F)) });
+
+    CHECK(chibillm::split_heads(context, packed, 0, query, gate).error()
+          == tensor_op_errc::invalid_head_count);
+    CHECK(chibillm::split_heads(context, packed, 3, query, gate).error()
+          == tensor_op_errc::invalid_head_dimension);
+    CHECK(chibillm::split_heads(context, packed, 2, query, query).error()
+          == tensor_op_errc::unsupported_aliasing);
+    CHECK(chibillm::split_heads(context, packed, 2, packed, gate).error()
+          == tensor_op_errc::output_shape_mismatch);
+    CHECK(chibillm::sigmoid_mul(context, packed, query, query).error()
+          == tensor_op_errc::input_shape_mismatch);
+}
+
 TEST_CASE("rope validates inputs, shapes, and theta")
 {
     const auto& context = test_context();

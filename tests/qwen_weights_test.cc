@@ -648,3 +648,165 @@ TEST_CASE("Qwen layers execute forward pass with residual connections")
     }
     check_floats(*layer_output, layer_expected);
 }
+
+TEST_CASE("Qwen3.5 full attention matches CPU for prefill and cached decode")
+{
+    auto config = qwen3_5_test_config();
+    config.head_dimension = 4;
+    config.partial_rotary_factor = 0.5F;
+    config.rms_epsilon = 0.125F;
+
+    auto file = write_weights(expected_qwen3_5_tensors(config), "qwen3_5_attention.safetensors");
+    auto safetensors = safetensors_file::open(file.path());
+    REQUIRE(safetensors.has_value());
+    auto made = metal_context::make(load_shader_source());
+    REQUIRE(made.has_value());
+    auto& context = *made;
+    auto weights = load_qwen3_5_weights(context, *safetensors, config);
+    REQUIRE(weights.has_value());
+    auto& layer = weights->layers[1];
+    auto& attention = std::get<qwen3_5_full_attention_weights>(layer.mixer);
+
+    const std::vector<float> input { 1, 2, -1, 0.5F, -2, 1, 3, 1, 0.5F, -1, 2, 3 };
+    const std::vector<float> input_norm { 0, 0.5F, -0.25F, 0.125F };
+    const std::vector<float> qk_norm { 0, 0.25F, -0.25F, 0.5F };
+    std::vector<float> projection(24 * 4), output_weight(4 * 8);
+    for (std::size_t i = 0; i < projection.size(); ++i)
+        projection[i] = float(int((i * 7 + 3) % 13) - 6) * 0.125F;
+    for (std::size_t i = 0; i < output_weight.size(); ++i)
+        output_weight[i] = float(int((i * 3 + 1) % 7) - 3) * 0.125F;
+
+    write_bf16(layer.input_norm, input_norm);
+    write_bf16(attention.query_norm, qk_norm);
+    write_bf16(attention.key_norm, qk_norm);
+    write_bf16(attention.qkv_packed, projection);
+    write_bf16(attention.output, output_weight);
+
+    // Independent CPU reference: two query heads share one KV head.
+    auto normalize = [&](std::vector<float> x, const std::vector<float>& weight) {
+        float square = 0;
+        for (float value : x)
+            square += value * value;
+        const float scale = 1.0F / std::sqrt(square / float(x.size()) + config.rms_epsilon);
+        for (std::size_t i = 0; i < x.size(); ++i)
+            x[i] *= scale * (1.0F + weight[i]);
+        return x;
+    };
+    auto rotate = [](std::vector<float> x, std::size_t position) {
+        const float cosine = std::cos(float(position)), sine = std::sin(float(position));
+        const float a = x[0], b = x[1];
+        x[0] = a * cosine - b * sine;
+        x[1] = b * cosine + a * sine;
+        return x;
+    };
+
+    std::vector<std::vector<float>> keys, values, gates, queries;
+    for (std::size_t row = 0; row < 3; ++row) {
+        auto hidden = normalize(
+            std::vector<float>(input.begin() + row * 4, input.begin() + (row + 1) * 4), input_norm);
+        std::vector<float> projected(24, 0);
+        for (std::size_t out = 0; out < 24; ++out)
+            for (std::size_t in = 0; in < 4; ++in)
+                projected[out] += projection[out * 4 + in] * hidden[in];
+
+        for (std::size_t head = 0; head < 2; ++head) {
+            auto start = projected.begin() + head * 8;
+            queries.push_back(
+                rotate(normalize(std::vector<float>(start, start + 4), qk_norm), row));
+            gates.emplace_back(start + 4, start + 8);
+        }
+        keys.push_back(rotate(
+            normalize(std::vector<float>(projected.begin() + 16, projected.begin() + 20), qk_norm),
+            row));
+        values.emplace_back(projected.begin() + 20, projected.end());
+    }
+
+    auto expected = input;
+    for (std::size_t row = 0; row < 3; ++row) {
+        std::vector<float> attended(8, 0);
+        for (std::size_t head = 0; head < 2; ++head) {
+            std::vector<float> scores(row + 1, 0);
+            for (std::size_t token = 0; token <= row; ++token)
+                for (std::size_t feature = 0; feature < 4; ++feature)
+                    scores[token] += queries[row * 2 + head][feature] * keys[token][feature] / 2.0F;
+
+            const float maximum = *std::max_element(scores.begin(), scores.end());
+            float sum = 0;
+            for (auto& score : scores) {
+                score = std::exp(score - maximum);
+                sum += score;
+            }
+            for (std::size_t feature = 0; feature < 4; ++feature) {
+                float value = 0;
+                for (std::size_t token = 0; token <= row; ++token)
+                    value += scores[token] / sum * values[token][feature];
+                attended[head * 4 + feature] =
+                    value / (1.0F + std::exp(-gates[row * 2 + head][feature]));
+            }
+        }
+        for (std::size_t out = 0; out < 4; ++out)
+            for (std::size_t in = 0; in < 8; ++in)
+                expected[row * 4 + out] += output_weight[out * 8 + in] * attended[in];
+    }
+
+    // Both paths target compact cache layer 1 and physical block 1.
+    for (bool decode : { false, true }) {
+        auto cache = metal_kv_cache::make(context, { 2, 2, 4, 1, 4 });
+        REQUIRE(cache.has_value());
+        write_floats(cache->keys(), std::vector<float>(cache->element_count(), 0));
+        write_floats(cache->values(), std::vector<float>(cache->element_count(), 0));
+        std::vector<float> actual;
+
+        for (std::size_t start = 0; start < 3; start += decode ? 1 : 3) {
+            const std::size_t count = decode ? 1 : 3;
+            auto hidden = make_tensor(context, chibillm::dtype::f32, { count, 4 });
+            write_floats(
+                hidden,
+                std::vector<float>(input.begin() + start * 4, input.begin() + (start + count) * 4));
+            std::vector<std::uint32_t> positions(count), slots(count), table(count, 1),
+                offsets(count), lengths(count, 1);
+            for (std::size_t i = 0; i < count; ++i) {
+                positions[i] = start + i;
+                slots[i] = 4 + start + i;
+                offsets[i] = i;
+            }
+            auto uploaded = chibillm::upload_attention_metadata(
+                context, { positions, slots, table, offsets, lengths });
+            REQUIRE(uploaded.has_value());
+            auto prepared = chibillm::prepared_attention_batch::make(
+                context, uploaded->positions, uploaded->block_table, uploaded->table_offsets,
+                uploaded->table_lengths, *cache);
+            REQUIRE(prepared.has_value());
+
+            chibillm::compute_pass pass(context);
+            REQUIRE(pass.begin().has_value());
+            auto result = chibillm::run_qwen3_5_full_attention(
+                context, config, layer, hidden, uploaded->slots, *prepared, 1, *cache);
+            REQUIRE(result.has_value());
+            REQUIRE(pass.finish().has_value());
+            auto chunk = read_floats(*result);
+            actual.insert(actual.end(), chunk.begin(), chunk.end());
+        }
+
+        REQUIRE(actual.size() == expected.size());
+        for (std::size_t i = 0; i < actual.size(); ++i)
+            CHECK(actual[i] == doctest::Approx(expected[i]).epsilon(1e-4));
+
+        const auto cached_keys = read_floats(cache->keys());
+        const auto cached_values = read_floats(cache->values());
+        for (std::size_t i = 0; i < cache->elements_per_layer(); ++i) {
+            CHECK(cached_keys[i] == 0.0F);
+            CHECK(cached_values[i] == 0.0F);
+        }
+        for (std::size_t row = 0; row < 3; ++row) {
+            auto offset = cache->element_offset(1, 1, row, 0, 0);
+            REQUIRE(offset.has_value());
+            for (std::size_t feature = 0; feature < 4; ++feature) {
+                CHECK(cached_keys[*offset + feature]
+                      == doctest::Approx(keys[row][feature]).epsilon(1e-4));
+                CHECK(cached_values[*offset + feature]
+                      == doctest::Approx(values[row][feature]).epsilon(1e-4));
+            }
+        }
+    }
+}

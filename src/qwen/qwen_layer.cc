@@ -162,4 +162,79 @@ run_qwen_layers(const metal_context& context,
     return std::move(hidden_states);
 }
 
+result<metal_tensor, tensor_op_errc>
+run_qwen3_5_full_attention(const metal_context& context,
+                           const qwen3_5_config& config,
+                           const qwen3_5_layer_weights& weights,
+                           const metal_tensor& hidden_states,
+                           const metal_tensor& slots,
+                           const prepared_attention_batch& prepared,
+                           std::size_t cache_layer,
+                           metal_kv_cache& cache)
+{
+    const auto* attention = std::get_if<qwen3_5_full_attention_weights>(&weights.mixer);
+    const auto& shape = hidden_states.descriptor().shape();
+    if (!attention
+        || !config.attention_output_gate
+        || shape.rank() != 2
+        || shape.dimensions()[1] != config.hidden_size
+        || config.kv_head_count != cache.kv_head_count()
+        || config.head_dimension != cache.head_dimension()
+        || config.query_head_count == 0
+        || config.query_head_count % cache.kv_head_count() != 0
+        || cache_layer >= cache.layer_count()
+        || config.rotary_dimension() == 0)
+        return fail(tensor_op_errc::input_shape_mismatch);
+
+    const auto rows = shape.dimensions()[0];
+    auto normalized = allocate_tensor(context, dtype::f32, { rows, config.hidden_size });
+    if (!normalized)
+        return fail(normalized.error());
+    CL_TRY(rms_norm(context, hidden_states, weights.input_norm, config.rms_epsilon, *normalized,
+                    true));
+
+    auto query_gate = allocate_tensor(context, dtype::f32, { rows, 2 * config.query_width() });
+    if (!query_gate)
+        return fail(query_gate.error());
+    auto key = allocate_tensor(context, dtype::f32, { rows, config.kv_width() });
+    if (!key)
+        return fail(key.error());
+    auto value = allocate_tensor(context, dtype::f32, { rows, config.kv_width() });
+    if (!value)
+        return fail(value.error());
+    CL_TRY(linear_split(context, *normalized, attention->qkv_packed,
+                        { &*query_gate, &*key, &*value }));
+
+    auto query = allocate_tensor(context, dtype::f32, { rows, config.query_width() });
+    if (!query)
+        return fail(query.error());
+    auto gate = allocate_tensor(context, dtype::f32, { rows, config.query_width() });
+    if (!gate)
+        return fail(gate.error());
+    CL_TRY(split_heads(context, *query_gate, config.query_head_count, *query, *gate));
+
+    // Each norm and rotation supports in-place operation on independent heads.
+    CL_TRY(rms_norm(context, *query, attention->query_norm, config.rms_epsilon, *query, true));
+    CL_TRY(rms_norm(context, *key, attention->key_norm, config.rms_epsilon, *key, true));
+    CL_TRY(rope(context, *query, prepared.positions(), config.query_head_count, config.rope_theta,
+                *query, config.rotary_dimension()));
+    CL_TRY(rope(context, *key, prepared.positions(), config.kv_head_count, config.rope_theta, *key,
+                config.rotary_dimension()));
+    CL_TRY(store_kv(context, *key, *value, slots, cache_layer, cache));
+
+    auto attended = allocate_tensor(context, dtype::f32, { rows, config.query_width() });
+    if (!attended)
+        return fail(attended.error());
+    CL_TRY(paged_attention(context, *query, prepared, cache_layer, config.query_head_count, cache,
+                           *attended));
+    CL_TRY(sigmoid_mul(context, *gate, *attended, *attended));
+
+    auto output = allocate_tensor(context, dtype::f32, { rows, config.hidden_size });
+    if (!output)
+        return fail(output.error());
+    CL_TRY(linear_add(context, *attended, attention->output, hidden_states, *output));
+
+    return std::move(*output);
+}
+
 } // namespace chibillm

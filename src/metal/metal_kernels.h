@@ -58,12 +58,21 @@ public:
     [[nodiscard]] result<void, metal_error> dispatch_silu_mul_f32(const metal_buffer& gate,
                                                                   const metal_buffer& up,
                                                                   metal_buffer& output,
-                                                                  std::size_t element_count) const;
+                                                                  std::size_t element_count,
+                                                                  bool sigmoid_only) const;
 
     [[nodiscard]] result<void, metal_error> dispatch_add_f32(const metal_buffer& lhs,
                                                              const metal_buffer& rhs,
                                                              metal_buffer& output,
                                                              std::size_t element_count) const;
+
+    [[nodiscard]] result<void, metal_error>
+    dispatch_split_heads_f32(const metal_buffer& input,
+                             metal_buffer& first,
+                             metal_buffer& second,
+                             std::size_t rows,
+                             std::size_t head_count,
+                             std::size_t head_dimension) const;
 
     [[nodiscard]] result<void, metal_error> dispatch_rope_f32(const metal_buffer& input,
                                                               const metal_buffer& positions,
@@ -71,7 +80,8 @@ public:
                                                               std::size_t rows,
                                                               std::size_t head_count,
                                                               std::size_t head_dimension,
-                                                              float theta) const;
+                                                              float theta,
+                                                              std::size_t rotary_dimension) const;
 
     [[nodiscard]] result<void, metal_error> dispatch_store_kv_f32(const metal_buffer& keys,
                                                                   const metal_buffer& values,

@@ -420,6 +420,7 @@ silu_mul_f32(device const float* gate [[buffer(0)]],
              device const float* up [[buffer(1)]],
              device float* output [[buffer(2)]],
              constant uint& element_count [[buffer(3)]],
+             constant uint& sigmoid_only [[buffer(4)]],
              uint position [[thread_position_in_grid]])
 {
     if (position >= element_count) {
@@ -427,7 +428,7 @@ silu_mul_f32(device const float* gate [[buffer(0)]],
     }
 
     const float x = gate[position];
-    const float silu = x / (1.0F + exp(-x));
+    const float silu = (sigmoid_only ? 1.0F : x) / (1.0F + exp(-x));
 
     output[position] = silu * up[position];
 }
@@ -447,6 +448,23 @@ add_f32(device const float* lhs [[buffer(0)]],
 }
 
 kernel void
+split_heads_f32(device const float* input [[buffer(0)]],
+                device float* first [[buffer(1)]],
+                device float* second [[buffer(2)]],
+                constant uint& width [[buffer(3)]],
+                constant uint& head_dimension [[buffer(4)]],
+                uint2 position [[thread_position_in_grid]])
+{
+    const ulong column = position.x;
+    const ulong source = ulong(position.y) * width * 2
+        + (column / head_dimension) * head_dimension * 2
+        + column % head_dimension;
+    const ulong destination = ulong(position.y) * width + column;
+    first[destination] = input[source];
+    second[destination] = input[source + head_dimension];
+}
+
+kernel void
 rope_f32(device const float* input [[buffer(0)]],
          device const uint* positions [[buffer(1)]],
          device float* output [[buffer(2)]],
@@ -454,6 +472,7 @@ rope_f32(device const float* input [[buffer(0)]],
          constant uint& head_count [[buffer(4)]],
          constant uint& head_dimension [[buffer(5)]],
          device const float* inverse_frequencies [[buffer(6)]],
+         constant uint& rotary_dimension [[buffer(7)]],
          uint2 grid_position [[thread_position_in_grid]])
 {
     const uint half_dimension = head_dimension / 2;
@@ -467,8 +486,16 @@ rope_f32(device const float* input [[buffer(0)]],
     const uint pair = grid_position.x % half_dimension;
     const ulong head_offset =
         (ulong(row) * ulong(head_count) + ulong(head)) * ulong(head_dimension);
+    const uint half_rotary = rotary_dimension / 2;
+    if (pair >= half_rotary) {
+        const ulong tail = head_offset + rotary_dimension + 2 * (pair - half_rotary);
+        output[tail] = input[tail];
+        output[tail + 1] = input[tail + 1];
+        return;
+    }
+
     const ulong first_index = head_offset + ulong(pair);
-    const ulong second_index = first_index + ulong(half_dimension);
+    const ulong second_index = first_index + ulong(half_rotary);
 
     const float angle = float(positions[row]) * inverse_frequencies[pair];
     const float cosine = cos(angle);

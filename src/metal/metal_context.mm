@@ -283,6 +283,8 @@ metal_context::make(std::string_view shader_source)
                       make_compute_pipeline(device, library, @"silu_mul_f32"));
         CL_TRY_ASSIGN(implementation->add_f32_pipeline,
                       make_compute_pipeline(device, library, @"add_f32"));
+        CL_TRY_ASSIGN(implementation->split_heads_f32_pipeline,
+                      make_compute_pipeline(device, library, @"split_heads_f32"));
         CL_TRY_ASSIGN(implementation->rope_f32_pipeline,
                       make_compute_pipeline(device, library, @"rope_f32"));
         CL_TRY_ASSIGN(implementation->store_kv_f32_pipeline,

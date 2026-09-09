@@ -398,7 +398,8 @@ result<void, metal_error>
 metal_kernels::dispatch_silu_mul_f32(const metal_buffer& gate,
                                      const metal_buffer& up,
                                      metal_buffer& output,
-                                     std::size_t element_count) const
+                                     std::size_t element_count,
+                                     bool sigmoid_only) const
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
@@ -420,6 +421,8 @@ metal_kernels::dispatch_silu_mul_f32(const metal_buffer& gate,
         [encoder setBuffer:up.implementation_->buffer offset:0 atIndex:1];
         [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:2];
         [encoder setBytes:&shader_element_count length:sizeof(shader_element_count) atIndex:3];
+        const std::uint32_t shader_sigmoid_only = sigmoid_only;
+        [encoder setBytes:&shader_sigmoid_only length:sizeof(shader_sigmoid_only) atIndex:4];
 
         constexpr std::size_t preferred_threadgroup_size = 256;
         const auto threadgroup_size =
@@ -429,7 +432,8 @@ metal_kernels::dispatch_silu_mul_f32(const metal_buffer& gate,
 
         [encoder dispatchThreads:MTLSizeMake(element_count, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
-        return implementation_->complete_dispatch_encoder(*opened, "silu_mul");
+        return implementation_->complete_dispatch_encoder(
+            *opened, sigmoid_only ? "sigmoid_mul" : "silu_mul");
     }
 }
 
@@ -473,13 +477,51 @@ metal_kernels::dispatch_add_f32(const metal_buffer& lhs,
 }
 
 result<void, metal_error>
+metal_kernels::dispatch_split_heads_f32(const metal_buffer& input,
+                                        metal_buffer& first,
+                                        metal_buffer& second,
+                                        std::size_t rows,
+                                        std::size_t head_count,
+                                        std::size_t head_dimension) const
+{
+    @autoreleasepool {
+        const auto& implementation_ = context_.implementation_;
+        const auto width = head_count * head_dimension;
+        const auto max_dimension = std::numeric_limits<std::uint32_t>::max();
+        if (rows > max_dimension || width > max_dimension) {
+            return fail(make_error(metal_errc::invalid_input,
+                                   "head split dimensions exceed the shader uint range"));
+        }
+
+        auto opened = implementation_->open_dispatch_encoder();
+        if (!opened)
+            return fail(opened.error());
+
+        auto encoder = opened->encoder;
+        const auto pipeline = implementation_->split_heads_f32_pipeline;
+        const auto shader_width = static_cast<std::uint32_t>(width);
+        const auto shader_head_dimension = static_cast<std::uint32_t>(head_dimension);
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:first.implementation_->buffer offset:0 atIndex:1];
+        [encoder setBuffer:second.implementation_->buffer offset:0 atIndex:2];
+        [encoder setBytes:&shader_width length:sizeof(shader_width) atIndex:3];
+        [encoder setBytes:&shader_head_dimension length:sizeof(shader_head_dimension) atIndex:4];
+        [encoder dispatchThreads:MTLSizeMake(width, rows, 1)
+            threadsPerThreadgroup:adaptive_2d_threadgroup_size(pipeline, width, rows)];
+        return implementation_->complete_dispatch_encoder(*opened, "split_heads");
+    }
+}
+
+result<void, metal_error>
 metal_kernels::dispatch_rope_f32(const metal_buffer& input,
                                  const metal_buffer& positions,
                                  metal_buffer& output,
                                  std::size_t rows,
                                  std::size_t head_count,
                                  std::size_t head_dimension,
-                                 float theta) const
+                                 float theta,
+                                 std::size_t rotary_dimension) const
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
@@ -497,17 +539,18 @@ metal_kernels::dispatch_rope_f32(const metal_buffer& input,
         const auto shader_head_count = static_cast<std::uint32_t>(head_count);
         const auto shader_head_dimension = static_cast<std::uint32_t>(head_dimension);
 
+        const auto shader_rotary_dimension = static_cast<std::uint32_t>(rotary_dimension);
         const auto frequency_key =
-            std::pair { shader_head_dimension, std::bit_cast<std::uint32_t>(theta) };
+            std::pair { shader_rotary_dimension, std::bit_cast<std::uint32_t>(theta) };
         id<MTLBuffer> frequency_buffer;
         {
             const std::scoped_lock lock(implementation_->rope_frequency_mutex);
             auto found = implementation_->rope_frequency_buffers.find(frequency_key);
             if (found == implementation_->rope_frequency_buffers.end()) {
-                std::vector<float> frequencies(head_dimension / 2);
+                std::vector<float> frequencies(rotary_dimension / 2);
                 for (std::size_t pair = 0; pair < frequencies.size(); ++pair) {
                     const auto exponent =
-                        -2.0F * static_cast<float>(pair) / static_cast<float>(head_dimension);
+                        -2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dimension);
                     frequencies[pair] = std::pow(theta, exponent);
                 }
                 frequency_buffer =
@@ -538,6 +581,9 @@ metal_kernels::dispatch_rope_f32(const metal_buffer& input,
         [encoder setBytes:&shader_head_count length:sizeof(shader_head_count) atIndex:4];
         [encoder setBytes:&shader_head_dimension length:sizeof(shader_head_dimension) atIndex:5];
         [encoder setBuffer:frequency_buffer offset:0 atIndex:6];
+        [encoder setBytes:&shader_rotary_dimension
+                   length:sizeof(shader_rotary_dimension)
+                  atIndex:7];
 
         [encoder dispatchThreads:MTLSizeMake(pair_columns, rows, 1)
             threadsPerThreadgroup:adaptive_2d_threadgroup_size(implementation_->rope_f32_pipeline,

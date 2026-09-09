@@ -126,6 +126,7 @@ struct metal_context::implementation {
     id<MTLComputePipelineState> silu_mul_f32_pipeline;
     id<MTLComputePipelineState> add_f32_pipeline;
     id<MTLComputePipelineState> rope_f32_pipeline;
+    id<MTLComputePipelineState> split_heads_f32_pipeline;
     id<MTLComputePipelineState> store_kv_f32_pipeline;
     id<MTLComputePipelineState> paged_attention_f32_pipeline;
     id<MTLComputePipelineState> paged_flash_attention_prefill_f32_pipeline;
