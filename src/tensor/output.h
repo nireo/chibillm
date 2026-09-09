@@ -21,7 +21,8 @@ encode_greedy(const metal_context& context,
               const metal_tensor& vocabulary_weight,
               float epsilon,
               const metal_tensor& hidden_states,
-              std::span<const std::size_t> logits_indices);
+              std::span<const std::size_t> logits_indices,
+              bool zero_centered = false);
 
 // Reads token IDs after the command buffer containing encode_greedy has completed.
 [[nodiscard]] std::vector<token_id> read_greedy(const metal_tensor& token_ids);

@@ -37,7 +37,8 @@ public:
                                                                    metal_buffer& output,
                                                                    std::size_t rows,
                                                                    std::size_t hidden_size,
-                                                                   float epsilon) const;
+                                                                   float epsilon,
+                                                                   bool zero_centered) const;
 
     [[nodiscard]] result<void, metal_error>
     dispatch_greedy_vocabulary_bf16(const metal_buffer& hidden_states,
@@ -51,7 +52,8 @@ public:
                                     std::size_t hidden_size,
                                     std::size_t vocabulary_size,
                                     std::size_t partial_count,
-                                    float epsilon) const;
+                                    float epsilon,
+                                    bool zero_centered) const;
 
     [[nodiscard]] result<void, metal_error> dispatch_silu_mul_f32(const metal_buffer& gate,
                                                                   const metal_buffer& up,

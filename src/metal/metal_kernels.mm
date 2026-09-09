@@ -245,7 +245,8 @@ metal_kernels::dispatch_rms_norm_bf16(const metal_buffer& input,
                                       metal_buffer& output,
                                       std::size_t rows,
                                       std::size_t hidden_size,
-                                      float epsilon) const
+                                      float epsilon,
+                                      bool zero_centered) const
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
@@ -272,6 +273,9 @@ metal_kernels::dispatch_rms_norm_bf16(const metal_buffer& input,
         [encoder setBytes:&shader_hidden_size length:sizeof(shader_hidden_size) atIndex:4];
         [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:5];
 
+        const float weight_offset = zero_centered ? 1.0F : 0.0F;
+        [encoder setBytes:&weight_offset length:sizeof(weight_offset) atIndex:6];
+
         constexpr std::size_t preferred_thread_count = 256;
         const auto max_threads = static_cast<std::size_t>(
             implementation_->rms_norm_bf16_pipeline.maxTotalThreadsPerThreadgroup);
@@ -296,7 +300,8 @@ metal_kernels::dispatch_greedy_vocabulary_bf16(const metal_buffer& hidden_states
                                                std::size_t hidden_size,
                                                std::size_t vocabulary_size,
                                                std::size_t partial_count,
-                                               float epsilon) const
+                                               float epsilon,
+                                               bool zero_centered) const
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
@@ -359,6 +364,10 @@ metal_kernels::dispatch_greedy_vocabulary_bf16(const metal_buffer& hidden_states
         [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:3];
         [encoder setBytes:&shader_hidden_size length:sizeof(shader_hidden_size) atIndex:4];
         [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:5];
+
+        const float weight_offset = zero_centered ? 1.0F : 0.0F;
+        [encoder setBytes:&weight_offset length:sizeof(weight_offset) atIndex:6];
+
         [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
 

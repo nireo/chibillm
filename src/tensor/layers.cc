@@ -8,7 +8,8 @@ normalized_swiglu(const metal_context& context,
                   const metal_tensor& gateup,
                   const metal_tensor& down,
                   float epsilon,
-                  const metal_tensor& hidden_states)
+                  const metal_tensor& hidden_states,
+                  bool zero_centered)
 {
     if (norm.descriptor().shape().rank() != 1 || down.descriptor().shape().rank() != 2) {
         return fail(tensor_op_errc::input_shape_mismatch);
@@ -26,7 +27,7 @@ normalized_swiglu(const metal_context& context,
     auto normalized = allocate_tensor(context, dtype::f32, { rows, hidden_size });
     if (!normalized)
         return fail(normalized.error());
-    CL_TRY(rms_norm(context, hidden_states, norm, epsilon, *normalized));
+    CL_TRY(rms_norm(context, hidden_states, norm, epsilon, *normalized, zero_centered));
     auto gate = allocate_tensor(context, dtype::f32, { rows, intermediate_size });
     if (!gate)
         return fail(gate.error());

@@ -246,6 +246,7 @@ rms_norm_bf16(device const float* input [[buffer(0)]],
               constant uint& row_count [[buffer(3)]],
               constant uint& hidden_size [[buffer(4)]],
               constant float& epsilon [[buffer(5)]],
+              constant float& weight_offset [[buffer(6)]],
               uint thread_index [[thread_index_in_threadgroup]],
               uint lane [[thread_index_in_simdgroup]],
               uint simdgroup [[simdgroup_index_in_threadgroup]],
@@ -288,7 +289,7 @@ rms_norm_bf16(device const float* input [[buffer(0)]],
     const float inverse_rms = partial_sums[0];
     for (uint feature = thread_index; feature < hidden_size; feature += thread_count) {
         const ulong index = row_offset + ulong(feature);
-        const float weight_value = load_bf16(weight[feature]);
+        const float weight_value = load_bf16(weight[feature]) + weight_offset;
         output[index] = input[index] * inverse_rms * weight_value;
     }
 }

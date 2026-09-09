@@ -68,12 +68,14 @@ linear_split(const metal_context& context,
                                                             const metal_tensor& weight,
                                                             metal_tensor& output);
 
-// normalizes each contiguous weight-sized group and scales it with the bf16 weight.
+// Normalizes each contiguous weight-sized group. Zero-centered norms use
+// (1 + weight) in FP32; ordinary norms use the bf16 weight directly.
 [[nodiscard]] result<void, tensor_op_errc> rms_norm(const metal_context& context,
                                                     const metal_tensor& input,
                                                     const metal_tensor& weight,
                                                     float epsilon,
-                                                    metal_tensor& output);
+                                                    metal_tensor& output,
+                                                    bool zero_centered = false);
 
 // applies silu to gate and multiplies it elementwise by up.
 [[nodiscard]] result<void, tensor_op_errc> silu_mul(const metal_context& context,

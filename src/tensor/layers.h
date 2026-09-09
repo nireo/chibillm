@@ -7,5 +7,6 @@ result<metal_tensor, tensor_op_errc> normalized_swiglu(const metal_context& cont
                                                        const metal_tensor& gateup,
                                                        const metal_tensor& down,
                                                        float epsilon,
-                                                       const metal_tensor& hidden_states);
+                                                       const metal_tensor& hidden_states,
+                                                       bool zero_centered = false);
 }

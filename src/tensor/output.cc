@@ -17,7 +17,8 @@ encode_greedy(const metal_context& context,
               const metal_tensor& vocabulary_weight,
               float epsilon,
               const metal_tensor& hidden_states,
-              std::span<const std::size_t> logits_indices)
+              std::span<const std::size_t> logits_indices,
+              bool zero_centered)
 {
     const auto& norm_shape = norm_weight.descriptor().shape();
     const auto& vocabulary_shape = vocabulary_weight.descriptor().shape();
@@ -82,7 +83,7 @@ encode_greedy(const metal_context& context,
         hidden_states.buffer(), row_indices->buffer(), norm_weight.buffer(),
         vocabulary_weight.buffer(), normalized->buffer(), partial_maxima->buffer(),
         token_ids->buffer(), logits_indices.size(), hidden_size, vocabulary_size, partial_count,
-        epsilon);
+        epsilon, zero_centered);
     if (!operation) {
         return fail(tensor_op_errc::backend_failure);
     }

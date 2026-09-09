@@ -209,7 +209,8 @@ rms_norm(const metal_context& context,
          const metal_tensor& input,
          const metal_tensor& weight,
          float epsilon,
-         metal_tensor& output)
+         metal_tensor& output,
+         bool zero_centered)
 {
     const auto& input_shape = input.descriptor().shape();
     const auto& weight_shape = weight.descriptor().shape();
@@ -244,7 +245,7 @@ rms_norm(const metal_context& context,
     const auto groups_per_row = hidden_size / group_size;
     const auto dispatched = metal_kernels(context).dispatch_rms_norm_bf16(
         input.buffer(), weight.buffer(), output.buffer(), rows * groups_per_row, group_size,
-        epsilon);
+        epsilon, zero_centered);
     if (!dispatched) {
         return fail(tensor_op_errc::backend_failure);
     }

@@ -13,6 +13,8 @@
 
 #include "metal/metal_kv_cache.h"
 #include "metal_test_support.h"
+#include "tensor/layers.h"
+#include "tensor/output.h"
 #include "tensor/tensor_ops.h"
 
 using chibillm::add;
@@ -200,6 +202,60 @@ TEST_CASE("rms norm normalizes full rows and repeated groups")
     check_floats(grouped_output,
                  { 1.0F / std::sqrt(2.0F), 1.0F / std::sqrt(2.0F), 2.0F / std::sqrt(5.0F),
                    2.0F / std::sqrt(5.0F) });
+}
+
+TEST_CASE("zero-centered rms norm preserves FP32 offsets for rows and head groups")
+{
+    const auto& context = test_context();
+    auto weight = make_tensor(context, dtype::bf16, { 3 });
+    write_bf16(weight, { 0.0F, -1.0F, 0.00390625F });
+
+    // The same groups represent either hidden rows or two heads in one row.
+    for (const auto& shape :
+         { std::vector<std::size_t> { 2, 3 }, std::vector<std::size_t> { 1, 6 } }) {
+        auto input = make_tensor(context, dtype::f32, shape);
+        auto output = make_tensor(context, dtype::f32, shape);
+        write_floats(input, { 1.0F, 2.0F, 2.0F, 2.0F, 4.0F, 4.0F });
+
+        REQUIRE(rms_norm(context, input, weight, 1.0F, output, true).has_value());
+        check_floats(output,
+                     { 0.5F, 0.0F, 1.00390625F, 2.0F / std::sqrt(13.0F), 0.0F,
+                       4.0F * 1.00390625F / std::sqrt(13.0F) });
+    }
+}
+
+TEST_CASE("zero-centered normalization reaches MLP and greedy output")
+{
+    auto made = metal_context::make(load_shader_source());
+    REQUIRE(made.has_value());
+    auto& context = *made;
+
+    auto input = make_tensor(context, dtype::f32, { 2, 2 });
+    auto norm = make_tensor(context, dtype::bf16, { 2 });
+    auto gateup = make_tensor(context, dtype::bf16, { 4, 2 });
+    auto down = make_tensor(context, dtype::bf16, { 2, 2 });
+    auto vocabulary = make_tensor(context, dtype::bf16, { 2, 2 });
+    write_floats(input, { 1.0F, 2.0F, -1.0F, 2.0F });
+    write_bf16(norm, { 0.0F, -1.0F });
+    write_bf16(gateup, { 1.0F, 0.0F, 0.0F, 1.0F, 1.0F, 0.0F, 0.0F, 1.0F });
+    write_bf16(down, { 1.0F, 0.0F, 0.0F, 1.0F });
+    write_bf16(vocabulary, { 1.0F, 0.0F, -1.0F, 0.0F });
+
+    chibillm::compute_pass pass(context);
+    REQUIRE(pass.begin().has_value());
+
+    auto mlp = chibillm::normalized_swiglu(context, norm, gateup, down, 1.5F, input, true);
+    REQUIRE(mlp.has_value());
+
+    const std::vector<std::size_t> rows { 1, 0 };
+    auto tokens = chibillm::encode_greedy(context, norm, vocabulary, 1.5F, input, rows, true);
+    REQUIRE(tokens.has_value());
+    REQUIRE(pass.finish().has_value());
+
+    check_floats(*mlp,
+                 { 1.0F + 0.25F / (1.0F + std::exp(-0.5F)), 2.0F,
+                   -1.0F + 0.25F / (1.0F + std::exp(0.5F)), 2.0F });
+    CHECK(chibillm::read_greedy(*tokens) == std::vector<chibillm::token_id> { 1, 0 });
 }
 
 TEST_CASE("rms norm validates inputs, shapes, and epsilon")
