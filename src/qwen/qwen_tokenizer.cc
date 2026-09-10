@@ -389,16 +389,21 @@ qwen_tokenizer::load(const std::filesystem::path& model_directory)
     std::unordered_map<std::string, std::size_t> merge_ranks;
     merge_ranks.reserve(vocabulary.size());
     std::string line;
-    if (!std::getline(merges, line) || !line.starts_with("#version:")) {
-        return fail(qwen_tokenizer_errc::invalid_merge);
-    }
     std::size_t rank = 0;
+    bool first_line = true;
     while (std::getline(merges, line)) {
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();
         }
+        // Qwen3 exports a version header; Qwen3.5 starts with the first merge.
+        if (std::exchange(first_line, false) && line.starts_with("#version:")) {
+            continue;
+        }
         const auto separator = line.find(' ');
-        if (separator == std::string::npos || separator == 0 || separator + 1 >= line.size()) {
+        if (separator == std::string::npos
+            || separator == 0
+            || separator + 1 >= line.size()
+            || line.find(' ', separator + 1) != std::string::npos) {
             return fail(qwen_tokenizer_errc::invalid_merge);
         }
         merge_ranks.emplace(merge_key(std::string_view(line).substr(0, separator),
@@ -407,6 +412,9 @@ qwen_tokenizer::load(const std::filesystem::path& model_directory)
     }
     if (merges.bad()) {
         return fail(qwen_tokenizer_errc::file_read_failed);
+    }
+    if (first_line) {
+        return fail(qwen_tokenizer_errc::invalid_merge);
     }
 
     std::ranges::sort(added_tokens, [](const auto& first, const auto& second) {

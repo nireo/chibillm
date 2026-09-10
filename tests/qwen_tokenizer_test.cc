@@ -98,3 +98,26 @@ TEST_CASE("Qwen tokenizer exposes and skips chat special tokens")
     CHECK(*thinking == std::vector<chibillm::token_id> { 21 });
     CHECK(tokenizer->decode(*thinking).value() == "<think>");
 }
+
+TEST_CASE("Qwen tokenizer accepts headerless Qwen3.5 merges without losing the first pair")
+{
+    tokenizer_fixture fixture;
+    std::ofstream(fixture.path() / "merges.txt")
+        << "H e\r\nHe l\r\nHel l\r\nHell o\r\nw o\r\nwo r\r\nwor l\r\nworl d\r\nĠ world\r\n";
+
+    auto tokenizer = chibillm::qwen_tokenizer::load(fixture.path());
+    REQUIRE(tokenizer.has_value());
+    CHECK(tokenizer->encode("Hello world!\n").value()
+          == std::vector<chibillm::token_id> { 8, 17, 0, 18 });
+}
+
+TEST_CASE("Qwen tokenizer still rejects malformed merges")
+{
+    tokenizer_fixture fixture;
+    const auto contents = GENERATE("", "not a merge", " H", "H ", "H", "#version: 0.2\n\n");
+    std::ofstream(fixture.path() / "merges.txt") << contents;
+
+    auto tokenizer = chibillm::qwen_tokenizer::load(fixture.path());
+    REQUIRE_FALSE(tokenizer.has_value());
+    CHECK(tokenizer.error() == chibillm::qwen_tokenizer_errc::invalid_merge);
+}

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <system_error>
 #include <vector>
 
 #include "model_format/safetensors.h"
@@ -15,6 +16,37 @@ using chibillm::safetensors_dtype;
 using chibillm::safetensors_errc;
 using chibillm::safetensors_file;
 using safetensors_test::temporary_file;
+
+namespace {
+
+class temporary_directory {
+public:
+    explicit temporary_directory(const char* name)
+        : path_(std::filesystem::temp_directory_path() / name)
+    {
+        REQUIRE(std::filesystem::create_directory(path_));
+    }
+
+    temporary_directory(const temporary_directory&) = delete;
+    temporary_directory& operator=(const temporary_directory&) = delete;
+
+    ~temporary_directory()
+    {
+        std::error_code ignored;
+        std::filesystem::remove_all(path_, ignored);
+    }
+
+    [[nodiscard]] const std::filesystem::path&
+    path() const noexcept
+    {
+        return path_;
+    }
+
+private:
+    std::filesystem::path path_;
+};
+
+} // namespace
 
 TEST_CASE("safetensors exposes metadata and reads exact tensor bytes")
 {
@@ -47,6 +79,131 @@ TEST_CASE("safetensors exposes metadata and reads exact tensor bytes")
     CHECK(opened->read("weight", wrong_size).error()
           == safetensors_errc::destination_size_mismatch);
     CHECK(opened->read("missing", wrong_size).error() == safetensors_errc::tensor_not_found);
+}
+
+TEST_CASE("safetensors model resolution prefers the canonical file")
+{
+    temporary_directory directory("chibillm_safetensors_model_canonical");
+    nlohmann::json header;
+    std::vector<std::byte> data;
+    safetensors_test::add_tensor(header, data, "canonical", "BF16", { 1 });
+    temporary_file canonical((directory.path() / "model.safetensors").string(), header, data);
+    temporary_file first((directory.path() / "first.safetensors").string(),
+                         nlohmann::json::object(), {});
+    temporary_file second((directory.path() / "second.safetensors").string(),
+                          nlohmann::json::object(), {});
+
+    auto opened = safetensors_file::open_model(directory.path());
+    REQUIRE(opened.has_value());
+    CHECK(opened->tensor_count() == 1);
+    CHECK(opened->find("canonical") != nullptr);
+}
+
+TEST_CASE("safetensors model resolution opens a sole noncanonical shard")
+{
+    temporary_directory directory("chibillm_safetensors_model_sole");
+    nlohmann::json header;
+    std::vector<std::byte> data;
+    safetensors_test::add_tensor(header, data, "weight", "BF16", { 1 });
+    data[0] = std::byte { 42 };
+    temporary_file file(
+        (directory.path() / "model.safetensors-00001-of-00001.safetensors").string(), header, data);
+    REQUIRE(std::filesystem::create_directory(directory.path() / "ignored.safetensors"));
+    std::ofstream(directory.path() / "model.safetensors.index.json") << "{}";
+
+    auto opened = safetensors_file::open_model(directory.path());
+    REQUIRE(opened.has_value());
+    CHECK(opened->tensor_count() == 1);
+    std::vector<std::byte> bytes(data.size());
+    REQUIRE(opened->read("weight", bytes).has_value());
+    CHECK(bytes == data);
+}
+
+TEST_CASE("safetensors model resolution rejects multiple fallback candidates")
+{
+    temporary_directory directory("chibillm_safetensors_model_ambiguous");
+    temporary_file first((directory.path() / "model-00001-of-00002.safetensors").string(),
+                         nlohmann::json::object(), {});
+    temporary_file second((directory.path() / "model-00002-of-00002.safetensors").string(),
+                          nlohmann::json::object(), {});
+
+    auto opened = safetensors_file::open_model(directory.path());
+    REQUIRE_FALSE(opened.has_value());
+    CHECK(opened.error() == safetensors_errc::ambiguous_checkpoint);
+}
+
+TEST_CASE("safetensors model resolution rejects missing checkpoints")
+{
+    temporary_directory directory("chibillm_safetensors_model_missing");
+    auto path = directory.path();
+
+    SUBCASE("missing directory")
+    {
+        path /= "missing";
+    }
+    SUBCASE("empty directory") {}
+    SUBCASE("no regular safetensors files")
+    {
+        REQUIRE(std::filesystem::create_directory(path / "nested.safetensors"));
+        temporary_file nested((path / "nested.safetensors" / "weights.safetensors").string(),
+                              nlohmann::json::object(), {});
+        std::ofstream(path / "config.json") << "{}";
+        auto opened = safetensors_file::open_model(path);
+        REQUIRE_FALSE(opened.has_value());
+        CHECK(opened.error() == safetensors_errc::file_open_failed);
+    }
+
+    auto opened = safetensors_file::open_model(path);
+    REQUIRE_FALSE(opened.has_value());
+    CHECK(opened.error() == safetensors_errc::file_open_failed);
+}
+
+TEST_CASE("safetensors model resolution returns filesystem errors")
+{
+    temporary_directory directory("chibillm_safetensors_model_filesystem_error");
+    auto path = directory.path();
+
+    SUBCASE("non-directory argument")
+    {
+        path /= "not_a_directory";
+        std::ofstream(path) << "not a directory";
+    }
+    SUBCASE("canonical status error")
+    {
+        std::filesystem::create_symlink("model.safetensors", path / "model.safetensors");
+    }
+    SUBCASE("candidate status error")
+    {
+        std::filesystem::create_symlink("loop.safetensors", path / "loop.safetensors");
+    }
+
+    auto opened = safetensors_file::open_model(path);
+    REQUIRE_FALSE(opened.has_value());
+    CHECK(opened.error() == safetensors_errc::file_open_failed);
+}
+
+TEST_CASE("safetensors model resolution preserves selected file errors")
+{
+    temporary_directory directory("chibillm_safetensors_model_malformed");
+
+    SUBCASE("malformed canonical file does not fall back to a valid alternative")
+    {
+        temporary_file canonical((directory.path() / "model.safetensors").string(),
+                                 nlohmann::json::array(), {});
+        temporary_file alternative((directory.path() / "weights.safetensors").string(),
+                                   nlohmann::json::object(), {});
+        auto opened = safetensors_file::open_model(directory.path());
+        REQUIRE_FALSE(opened.has_value());
+        CHECK(opened.error() == safetensors_errc::invalid_header_json);
+    }
+    SUBCASE("sole candidate with a truncated header")
+    {
+        const auto path = directory.path() / "weights.safetensors";
+        std::ofstream(path, std::ios::binary) << "short";
+        auto opened = safetensors_file::open_model(directory.path());
+        REQUIRE_FALSE(opened.has_value());
+        CHECK(opened.error() == safetensors_errc::invalid_header_size);
+    }
 }
 
 TEST_CASE("safetensors rejects malformed headers")

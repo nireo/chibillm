@@ -49,12 +49,20 @@ enum class safetensors_errc : std::uint8_t {
     invalid_data_layout,
     tensor_not_found,
     destination_size_mismatch,
+    ambiguous_checkpoint,
 };
 
 class safetensors_file {
 public:
     [[nodiscard]] static result<safetensors_file, safetensors_errc>
     open(const std::filesystem::path& path);
+
+    // Prefer model.safetensors when present; otherwise open the sole regular
+    // *.safetensors file directly in directory. No index parsing or shard merging.
+    // Missing directories/files and filesystem errors return file_open_failed;
+    // multiple fallback candidates return ambiguous_checkpoint. Preserve open() errors.
+    [[nodiscard]] static result<safetensors_file, safetensors_errc>
+    open_model(const std::filesystem::path& directory);
 
     [[nodiscard]] const safetensor_info* find(std::string_view name) const;
     [[nodiscard]] std::size_t tensor_count() const noexcept;

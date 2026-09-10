@@ -73,4 +73,48 @@ private:
     model_info info_;
 };
 
+// Text-only Qwen3.5 runner. The scheduler owns hybrid state transactions;
+// execute drains its compute pass before returning, including on failure.
+class qwen3_5_model_runner final : public model_runner {
+public:
+    [[nodiscard]] static result<qwen3_5_model_runner, qwen_model_runner_errc>
+    make(const std::filesystem::path& model_directory,
+         std::string_view shader_source,
+         std::size_t kv_block_count,
+         std::size_t kv_block_size,
+         std::string model_id = "chibillm-qwen3.5");
+
+    qwen3_5_model_runner(const qwen3_5_model_runner&) = delete;
+    qwen3_5_model_runner& operator=(const qwen3_5_model_runner&) = delete;
+    qwen3_5_model_runner(qwen3_5_model_runner&&) noexcept = default;
+    qwen3_5_model_runner& operator=(qwen3_5_model_runner&&) noexcept = default;
+
+    std::unique_ptr<text_decoder> make_decoder() const override;
+    result<std::unique_ptr<model_state>, model_runner_errc>
+    make_state(scheduler_config config) const override;
+    const model_info& info() const noexcept override;
+    result<std::vector<token_id>, model_runner_errc>
+    encode_chat(std::span<const chat_message> messages) override;
+    result<std::string, model_runner_errc> decode(std::span<const token_id> tokens) const override;
+    result<std::vector<token_id>, model_runner_errc> execute(const model_batch& batch,
+                                                             model_state& state) override;
+
+private:
+    qwen3_5_model_runner(metal_context context,
+                         qwen3_5_config config,
+                         qwen3_5_weights weights,
+                         std::size_t block_count,
+                         std::size_t block_size,
+                         qwen_tokenizer tokenizer,
+                         model_info info);
+
+    metal_context context_;
+    qwen3_5_config config_;
+    qwen3_5_weights weights_;
+    std::size_t block_count_;
+    std::size_t block_size_;
+    qwen_tokenizer tokenizer_;
+    model_info info_;
+};
+
 } // namespace chibillm

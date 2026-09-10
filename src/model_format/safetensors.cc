@@ -287,6 +287,50 @@ safetensors_file::open(const std::filesystem::path& path)
     return safetensors_file(path, data_start, std::move(tensors));
 }
 
+result<safetensors_file, safetensors_errc>
+safetensors_file::open_model(const std::filesystem::path& directory)
+{
+    const auto canonical = directory / "model.safetensors";
+    std::error_code error;
+    const auto canonical_exists = std::filesystem::exists(canonical, error);
+    if (error) {
+        return fail(safetensors_errc::file_open_failed);
+    }
+    if (canonical_exists) {
+        return open(canonical);
+    }
+
+    std::filesystem::directory_iterator current(directory, error);
+    if (error) {
+        return fail(safetensors_errc::file_open_failed);
+    }
+
+    std::filesystem::path checkpoint;
+    while (current != std::filesystem::directory_iterator {}) {
+        if (current->path().extension() == ".safetensors") {
+            const auto is_regular = current->is_regular_file(error);
+            if (error) {
+                return fail(safetensors_errc::file_open_failed);
+            }
+            if (is_regular) {
+                if (!checkpoint.empty()) {
+                    return fail(safetensors_errc::ambiguous_checkpoint);
+                }
+                checkpoint = current->path();
+            }
+        }
+        current.increment(error);
+        if (error) {
+            return fail(safetensors_errc::file_open_failed);
+        }
+    }
+
+    if (checkpoint.empty()) {
+        return fail(safetensors_errc::file_open_failed);
+    }
+    return open(checkpoint);
+}
+
 safetensors_file::safetensors_file(std::filesystem::path path,
                                    std::uint64_t data_start,
                                    std::unordered_map<std::string, safetensor_info> tensors)

@@ -28,6 +28,13 @@ load_model(const std::filesystem::path& directory,
             return fail(model_load_errc::load_failed);
         return std::make_unique<qwen_model_runner>(std::move(*runner));
     }
+    if (config["model_type"] == "qwen3_5") {
+        auto runner =
+            qwen3_5_model_runner::make(directory, shaders, block_count, block_size, std::move(id));
+        if (!runner)
+            return fail(model_load_errc::load_failed);
+        return std::make_unique<qwen3_5_model_runner>(std::move(*runner));
+    }
     return fail(model_load_errc::unsupported_architecture);
 }
 } // namespace chibillm
