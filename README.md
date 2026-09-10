@@ -1,6 +1,6 @@
 # chibillm
 
-A small C++23 inference engine for experimenting with Qwen inference on Metal. The model execution, paged KV cache, attention, tokenizer, scheduler, and generation loop are implemented in C++ and Metal. Currently the only model supported is Qwen3-0.6B, but I will try to implement different architectures for learning.
+A small C++23 inference engine for experimenting with Qwen inference on Metal. The model execution, paged KV cache, attention, tokenizer, scheduler, and generation loop are implemented in C++ and Metal. Supports Qwen3-0.6B and text generation with Qwen3.5-0.8B.
 
 ## Build and run
 
@@ -16,6 +16,36 @@ make run
 ```sh
 build/chibillm /path/to/qwen-model
 ```
+
+To use the local Qwen3.5 checkpoint:
+
+```sh
+build/chibillm qwen3_5_model
+```
+
+Qwen3.5 loading accepts `model.safetensors` or a single `.safetensors` file in the
+model directory, including the official single-shard filename. Multiple shards
+are not supported. This runner loads the text decoder with tied embeddings;
+image/video inputs and multi-token prediction are not supported.
+
+The app defaults to 32,768 tokens of context (prompt plus reply) and up to 8,192
+tokens per reply. Both limits can be set at startup, in chat or server mode:
+
+```sh
+build/chibillm --context-length 65536 --max-tokens 16384 qwen3_5_model
+build/chibillm --serve --context-length 65536 --max-tokens 16384 qwen3_5_model
+```
+
+Context length must be a positive multiple of 16 and is capped at the checkpoint's
+configured maximum: 262,144 for Qwen3.5-0.8B, or 32,768 for Qwen3-0.6B. Chat replies
+also stop at the remaining context capacity. In server mode, `--max-tokens` sets
+the default; individual requests can override it with `max_completion_tokens`.
+The server requires the prompt plus requested output budget to fit the context.
+
+Qwen3.5's FP32 KV cache uses 768 MiB at 32K context, 1.5 GiB at 64K, 3 GiB at 128K,
+and 6 GiB at 256K, in addition to approximately 1.4 GiB of text weights and runtime
+memory. Server requests share this cache capacity. Longer contexts take more time
+to process; increasing the limit does not force the model to produce longer replies.
 
 ## OpenAI-compatible server
 
@@ -50,6 +80,8 @@ make test
 
 ## Code structure
 
+- `main` handles argument errors and help, then starts the application. `cli_options` parses startup options; `application` loads the model and starts chat or server mode.
+- `repl` owns terminal input, conversation history, generation, sequence cleanup, and performance reporting.
 - `model_factory` selects a runner from the checkpoint's `model_type`.
 - `inference_engine` executes scheduler reservations and publishes completion updates.
 - `model_state` owns per-engine resources and provides batch begin/commit/abort and sequence release. Paged Metal state combines the block allocator and KV buffers; other architectures can provide their own state without changing sequence progress.
@@ -58,7 +90,24 @@ make test
 - `model_format/weight_reader` validates and loads the same weight layouts, including packed projections.
 - `serving_runtime` owns request execution; `server` maps requests and events to HTTP/JSON/SSE. Each request has a model-provided incremental text decoder.
 
-To add an architecture, implement its runner, weight layout, and state, then add its factory entry. State that is mutated during execution must restore its pre-batch value on abort. Chat formatting and incremental decoding are separate from the forward pass. Qwen3.5 configuration, weight loading, hybrid state, DeltaNet tensor primitives, and a text-only full-attention mixer are available; its hybrid layer loop and model runner are not implemented yet. `run_qwen3_5_full_attention` applies zero-centered input and Q/K norms, per-head query/gate splitting, partial RoPE, paged attention, sigmoid output gating, and the output projection with residual addition. It takes a compact KV layer index from the hybrid state. `tensor/deltanet.h` provides stateful causal convolution with SiLU, the recurrent gated delta rule (including Q/K normalization and gate computation), and gated RMSNorm. The kernels process one sequence chunk per call with caller-owned FP32 state and support both prefill and decode; prefill currently uses a sequential scan. `qwen/qwen3_5_model_state.h` owns zero-initialized per-sequence convolution/recurrent memory and a compact KV cache for full-attention layers. It snapshots participating sequences at batch start, restores DeltaNet memory on abort, and tracks committed positions so retries overwrite only uncommitted KV slots. GPU work must finish before the scheduler commits, aborts, or releases state.
+To add an architecture, implement its runner, weight layout, and state, then add its factory entry. State that is mutated during execution must restore its pre-batch value on abort. Chat formatting and incremental decoding are separate from the forward pass.
+
+Qwen3.5's runner executes the hybrid layer loop, applies zero-centered final RMSNorm,
+and uses the tied embedding for greedy output. It supports chunked prefill, cached
+decode, and multiple sequences through the same CLI and HTTP server as Qwen3.
+`run_qwen3_5_full_attention` applies zero-centered input and Q/K norms, per-head
+query/gate splitting, partial RoPE, paged attention, sigmoid output gating, and the
+output projection with residual addition. `tensor/deltanet.h` provides stateful
+causal convolution with SiLU, the recurrent gated delta rule, and gated RMSNorm.
+The kernels process one sequence chunk per call with caller-owned FP32 state;
+prefill currently uses a sequential scan.
+
+`qwen/qwen3_5_model_state.h` owns zero-initialized per-sequence convolution/recurrent
+memory and a compact KV cache for full-attention layers. It snapshots participating
+sequences at batch start, restores DeltaNet memory on abort, and tracks committed
+positions so retries overwrite only uncommitted KV slots. GPU work finishes before
+the scheduler commits, aborts, or releases state. The tests also check generation
+with the official Qwen3.5 checkpoint when it is installed in `qwen3_5_model/`.
 
 ## Basic benchmark
 

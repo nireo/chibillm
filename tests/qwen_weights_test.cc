@@ -19,7 +19,9 @@
 #include "metal/metal_context.h"
 #include "metal/metal_kv_cache.h"
 #include "metal_test_support.h"
+#include "model_factory.h"
 #include "model_format/safetensors.h"
+#include "qwen/qwen3_5_model_state.h"
 #include "qwen/qwen_configs.h"
 #include "qwen/qwen_layer.h"
 #include "qwen/qwen_model_runner.h"
@@ -286,6 +288,37 @@ write_tokenizer(const std::filesystem::path& path)
     std::ofstream merges(path / "merges.txt");
     REQUIRE(merges.good());
     merges << "#version: 0.2\n";
+}
+
+void
+write_config(const std::filesystem::path& path, const qwen3_5_config& config)
+{
+    std::ifstream fixture(QWEN3_5_CONFIG_FIXTURE_PATH);
+    auto json = nlohmann::json::parse(fixture);
+    auto& text = json["text_config"];
+    text.update({
+        { "vocab_size", config.vocabulary_size },
+        { "hidden_size", config.hidden_size },
+        { "intermediate_size", config.intermediate_size },
+        { "num_hidden_layers", config.layer_count },
+        { "num_attention_heads", config.query_head_count },
+        { "num_key_value_heads", config.kv_head_count },
+        { "head_dim", config.head_dimension },
+        { "max_position_embeddings", config.max_position_embeddings },
+        { "rms_norm_eps", config.rms_epsilon },
+        { "eos_token_id", config.eos_token_id },
+        { "full_attention_interval", config.full_attention_interval },
+        { "layer_types", { "linear_attention", "full_attention" } },
+        { "linear_conv_kernel_dim", config.linear_conv_kernel_dimension },
+        { "linear_key_head_dim", config.linear_key_head_dimension },
+        { "linear_num_key_heads", config.linear_key_head_count },
+        { "linear_value_head_dim", config.linear_value_head_dimension },
+        { "linear_num_value_heads", config.linear_value_head_count },
+    });
+    text["rope_parameters"]["rope_theta"] = config.rope_theta;
+    text["rope_parameters"]["partial_rotary_factor"] = config.partial_rotary_factor;
+    text["rope_parameters"]["mrope_section"] = config.mrope_sections;
+    std::ofstream(path) << json;
 }
 
 } // namespace
@@ -565,6 +598,149 @@ TEST_CASE("Qwen model runner executes a flattened multi-sequence batch")
     auto rejected = runner->execute(invalid, **state);
     REQUIRE_FALSE(rejected.has_value());
     CHECK(rejected.error() == chibillm::model_runner_errc::inconsistent_batch);
+}
+
+TEST_CASE("Qwen3.5 factory loads a sole shard and generates with tied zero-centered output")
+{
+    auto config = qwen3_5_test_config();
+    config.head_dimension = 8;
+    config.mrope_sections = { 2, 1, 1 };
+    temporary_model_directory directory;
+    write_config(directory.path() / "config.json", config);
+    write_tokenizer(directory.path());
+    nlohmann::json header;
+    std::vector<std::byte> data;
+    for (const auto& spec : expected_qwen3_5_tensors(config))
+        safetensors_test::add_tensor(header, data, spec.name, spec.dtype, spec.shape);
+    // Zero mixers preserve the embeddings. Token 4 wins the tied projection;
+    // forgetting the +1 in the final RMSNorm instead yields token 0.
+    for (std::size_t token = 0; token < config.vocabulary_size; ++token) {
+        const auto value = bf16::from_float(token == 4 ? 2.0F : 1.0F).bits();
+        std::memcpy(data.data() + token * config.hidden_size * sizeof(value), &value,
+                    sizeof(value));
+    }
+    temporary_file weights((directory.path() / "model-00001-of-00001.safetensors").string(), header,
+                           data);
+    auto loaded = chibillm::load_model(directory.path(), load_shader_source(), 8, 2, "tiny-hybrid");
+    REQUIRE(loaded.has_value());
+    auto& runner = **loaded;
+    REQUIRE(dynamic_cast<chibillm::qwen3_5_model_runner*>(&runner) != nullptr);
+    CHECK(runner.info().id == "tiny-hybrid");
+    CHECK(runner.info().max_context_tokens == 16);
+    CHECK(runner.info().eos_token == config.eos_token_id);
+    auto state = runner.make_state({ .kv_block_count = 8, .kv_block_size = 2 });
+    REQUIRE(state.has_value());
+    CHECK(dynamic_cast<chibillm::qwen3_5_model_state*>(state->get()) != nullptr);
+    CHECK_FALSE(runner.make_state({ .kv_block_count = 9, .kv_block_size = 2 }).has_value());
+    CHECK_FALSE(runner.make_state({ .kv_block_count = 8, .kv_block_size = 1 }).has_value());
+    CHECK(runner.execute({}, **state).error() == chibillm::model_runner_errc::empty_batch);
+    CHECK(runner.encode_chat({}).error() == chibillm::model_runner_errc::invalid_chat);
+
+    auto engine = chibillm::inference_engine::make({ .max_sequences = 2,
+                                                     .max_batch_tokens = 2,
+                                                     .kv_block_count = 8,
+                                                     .kv_block_size = 2,
+                                                     .eos_token = config.eos_token_id },
+                                                   runner);
+    REQUIRE(engine.has_value());
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        auto first = chibillm::seq::make(10, { 1, 2, 3, 1, 2 }, { .max_new_tokens = 3 });
+        auto second = chibillm::seq::make(20, { 3 }, { .max_new_tokens = 3 });
+        REQUIRE(first.has_value());
+        REQUIRE(second.has_value());
+        REQUIRE(engine->add(std::move(*first)).has_value());
+        REQUIRE(engine->add(std::move(*second)).has_value());
+        auto partial = engine->step();
+        REQUIRE(partial.has_value());
+        CHECK(partial->empty());
+        for (int step = 0; !engine->is_finished() && step < 16; ++step)
+            REQUIRE(engine->step().has_value());
+        REQUIRE(engine->is_finished());
+        for (const auto id : { 10, 20 }) {
+            const auto* sequence = engine->find_sequence(id);
+            REQUIRE(sequence != nullptr);
+            CHECK(std::ranges::equal(sequence->completion_tokens(),
+                                     std::vector<chibillm::token_id> { 4, 4, 4 }));
+            CHECK(sequence->reason() == chibillm::finish_reason::len_limit);
+            CHECK(runner.decode(sequence->completion_tokens()).value() == "eee");
+            REQUIRE(engine->remove(id).has_value());
+        }
+    }
+}
+
+TEST_CASE("Qwen3.5 official checkpoint generates consistently across batching and cancellation")
+{
+    const std::filesystem::path directory { QWEN3_5_MODEL_PATH };
+    if (!std::filesystem::exists(directory / "config.json")) {
+        MESSAGE("Qwen3.5 model is not installed; skipping local generation validation");
+        return;
+    }
+    auto loaded = chibillm::load_model(directory, load_shader_source(), 16, 16, "qwen3.5");
+    REQUIRE(loaded.has_value());
+    auto& runner = **loaded;
+    const std::vector<chibillm::chat_message> first_chat {
+        { "user", "Reply with just the answer: What is 2 + 2?" },
+    };
+    const std::vector<chibillm::chat_message> second_chat {
+        { "user", "Reply with just the answer: What is 3 + 3?" },
+    };
+    auto first_prompt = runner.encode_chat(first_chat);
+    auto second_prompt = runner.encode_chat(second_chat);
+    REQUIRE(first_prompt.has_value());
+    REQUIRE(second_prompt.has_value());
+    std::vector<std::vector<chibillm::token_id>> reference;
+    for (const std::size_t budget : { 128, 7 }) {
+        auto engine = chibillm::inference_engine::make({ .max_sequences = 2,
+                                                         .max_batch_tokens = budget,
+                                                         .kv_block_count = 16,
+                                                         .kv_block_size = 16,
+                                                         .eos_token = runner.info().eos_token },
+                                                       runner);
+        REQUIRE(engine.has_value());
+        const auto add = [&](chibillm::seq_id id, const std::vector<chibillm::token_id>& prompt) {
+            auto sequence = chibillm::seq::make(id, prompt, { .max_new_tokens = 16 });
+            REQUIRE(sequence.has_value());
+            REQUIRE(engine->add(std::move(*sequence)).has_value());
+        };
+        if (budget == 7) {
+            // Release a partially populated recurrent state and reuse its ID/pages.
+            add(1, *second_prompt);
+            auto partial = engine->step();
+            REQUIRE(partial.has_value());
+            CHECK(partial->empty());
+            REQUIRE(engine->cancel(1).has_value());
+            REQUIRE(engine->remove(1).has_value());
+        }
+        add(1, *first_prompt);
+        add(2, *second_prompt);
+        for (int step = 0; !engine->is_finished() && step < 64; ++step)
+            REQUIRE(engine->step().has_value());
+        REQUIRE(engine->is_finished());
+        for (const auto id : { 1, 2 }) {
+            const auto* sequence = engine->find_sequence(id);
+            REQUIRE(sequence != nullptr);
+            CHECK(sequence->reason() == chibillm::finish_reason::eos);
+            const auto tokens = sequence->completion_tokens();
+            auto decoded = runner.decode(tokens);
+            REQUIRE(decoded.has_value());
+            const auto start = decoded->find_first_not_of(" \r\n\t");
+            const auto end = decoded->find_last_not_of(" \r\n\t");
+            REQUIRE(start != std::string::npos);
+            CHECK(decoded->substr(start, end - start + 1) == (id == 1 ? "4" : "6"));
+            auto decoder = runner.make_decoder();
+            std::string streamed;
+            for (std::size_t i = 0; i < tokens.size(); ++i) {
+                auto delta = decoder->push(tokens[i], i + 1 == tokens.size());
+                REQUIRE(delta.has_value());
+                streamed += *delta;
+            }
+            CHECK(streamed == *decoded);
+            if (budget == 128)
+                reference.emplace_back(tokens.begin(), tokens.end());
+            else
+                CHECK(std::ranges::equal(tokens, reference[id - 1]));
+        }
+    }
 }
 
 TEST_CASE("Qwen layers execute forward pass with residual connections")

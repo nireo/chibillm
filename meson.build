@@ -124,7 +124,12 @@ chibillm_server = static_library(
 
 executable(
   'chibillm',
-  'src/main.cpp',
+  [
+    'src/main.cpp',
+    'src/application.cc',
+    'src/cli_options.cc',
+    'src/repl.cc',
+  ],
   include_directories: src_include,
   cpp_args: [
     '-DCHIBILLM_SHADER_PATH="' + join_paths(
@@ -162,7 +167,7 @@ foreach spec : [
   {'name': 'qwen config', 'sources': ['tests/qwen_config_test.cc'], 'library': chibillm_qwen, 'deps': [nlohmann_json_dep]},
   {'name': 'qwen tokenizer', 'sources': ['tests/qwen_tokenizer_test.cc'], 'library': chibillm_qwen, 'deps': [nlohmann_json_dep]},
   {'name': 'safetensors', 'sources': ['tests/safetensors_test.cc'], 'library': chibillm_model_format, 'deps': [nlohmann_json_dep]},
-  {'name': 'qwen weights', 'sources': ['tests/qwen_weights_test.cc'], 'library': chibillm_qwen, 'deps': [nlohmann_json_dep]},
+  {'name': 'qwen weights', 'sources': ['tests/qwen_weights_test.cc'], 'library': chibillm_models, 'deps': [nlohmann_json_dep]},
   {'name': 'kv cache', 'sources': ['tests/metal_kv_cache_test.cc'], 'library': chibillm_metal},
   {'name': 'tensor', 'sources': ['tests/tensor_test.cc'], 'library': chibillm_metal},
   {'name': 'deltanet', 'sources': ['tests/deltanet_test.cc'], 'library': chibillm_metal},
