@@ -110,7 +110,7 @@ linear_split(const metal_context& context,
         || packed_weight.descriptor().type() != dtype::bf16) {
         return fail(tensor_op_errc::unsupported_dtype);
     }
-    if (outputs.size() < 2 || outputs.size() > 3) {
+    if (outputs.size() == 0 || outputs.size() > 3) {
         return fail(tensor_op_errc::output_shape_mismatch);
     }
 

@@ -1,9 +1,11 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "metal/metal_kernels.h"
 #include "metal_test_support.h"
 #include "tensor/deltanet.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 
@@ -281,6 +283,204 @@ TEST_CASE("DeltaNet kernels compose within one compute pass with separate sequen
         near(state, state_data);
         near(history, history_data);
     }
+}
+
+TEST_CASE("DeltaNet batch chunks match standalone sequences in one compute pass")
+{
+    auto made = metal_context::make(load_shader_source());
+    REQUIRE(made);
+    auto& context = *made;
+    constexpr std::size_t rows = 8, kh = 2, vh = 4, kd = 3, vd = 5, kernel = 4;
+    constexpr std::size_t width = 2 * kh * kd + vh * vd, value_width = vh * vd;
+    constexpr float sentinel = -123.0F;
+    const std::array chunks { deltanet_chunk { 1, 2 }, deltanet_chunk { 4, 3 } };
+    const auto input_data = values(rows * width);
+    const auto a_data = values(rows * vh, 1), b_data = values(rows * vh, 2);
+    auto input = f32(context, { rows, width }, input_data);
+    auto weight = make_tensor(context, dtype::bf16, { width, 1, kernel });
+    write_bf16(weight, values(width * kernel, 3));
+    auto a = f32(context, { rows, vh }, a_data), b = f32(context, { rows, vh }, b_data);
+    auto logs = f32(context, { vh }, values(vh, 4));
+    auto bias = make_tensor(context, dtype::bf16, { vh });
+    write_bf16(bias, values(vh, 5));
+    std::vector<float> expected_conv(rows * width, sentinel);
+    std::vector<float> expected_delta(rows * value_width, sentinel);
+    auto conv = f32(context, { rows, width }, expected_conv);
+    auto delta = f32(context, { rows, value_width }, expected_delta);
+    std::vector<metal_tensor> histories, states;
+    std::vector<std::vector<float>> expected_histories, expected_states;
+
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+        const auto [offset, count] = chunks[i];
+        const auto initial_history = values(width * kernel, float(i) + 6);
+        const auto initial_state = values(vh * kd * vd, float(i) + 8);
+        histories.push_back(f32(context, { width, kernel }, initial_history));
+        states.push_back(f32(context, { vh, kd, vd }, initial_state));
+        auto history = f32(context, { width, kernel }, initial_history);
+        auto state = f32(context, { vh, kd, vd }, initial_state);
+        auto standalone_input = f32(context, { count, width },
+                                    slice(input_data, offset * width, (offset + count) * width));
+        auto standalone_a =
+            f32(context, { count, vh }, slice(a_data, offset * vh, (offset + count) * vh));
+        auto standalone_b =
+            f32(context, { count, vh }, slice(b_data, offset * vh, (offset + count) * vh));
+        auto standalone_conv = make_tensor(context, dtype::f32, { count, width });
+        auto standalone_delta = make_tensor(context, dtype::f32, { count, value_width });
+        REQUIRE(causal_conv1d_silu(context, standalone_input, weight, history, standalone_conv));
+        REQUIRE(gated_delta_rule(context, standalone_conv, standalone_a, standalone_b, logs, bias,
+                                 kh, state, standalone_delta));
+        const auto conv_values = read_floats(standalone_conv);
+        const auto delta_values = read_floats(standalone_delta);
+        std::copy(conv_values.begin(), conv_values.end(), expected_conv.begin() + offset * width);
+        std::copy(delta_values.begin(), delta_values.end(),
+                  expected_delta.begin() + offset * value_width);
+        expected_histories.push_back(read_floats(history));
+        expected_states.push_back(read_floats(state));
+    }
+
+    compute_pass pass(context);
+    REQUIRE(pass.begin());
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+        REQUIRE(causal_conv1d_silu(context, input, weight, histories[i], conv, chunks[i]));
+        REQUIRE(gated_delta_rule(context, conv, a, b, logs, bias, kh, states[i], delta, 1e-6F,
+                                 chunks[i]));
+    }
+    REQUIRE(pass.finish());
+    near(conv, expected_conv);
+    near(delta, expected_delta);
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+        CAPTURE(i);
+        near(histories[i], expected_histories[i]);
+        near(states[i], expected_states[i]);
+    }
+    const auto conv_values = read_floats(conv), delta_values = read_floats(delta);
+    for (const std::size_t row : { 0, 3, 7 }) {
+        CAPTURE(row);
+        CHECK(slice(conv_values, row * width, (row + 1) * width)
+              == std::vector<float>(width, sentinel));
+        CHECK(slice(delta_values, row * value_width, (row + 1) * value_width)
+              == std::vector<float>(value_width, sentinel));
+    }
+}
+
+TEST_CASE("DeltaNet rejects empty, out-of-bounds, and overflow chunks without mutation")
+{
+    auto made = metal_context::make(load_shader_source());
+    REQUIRE(made);
+    auto& context = *made;
+    constexpr std::size_t rows = 4, width = 8, vh = 2, kd = 2, vd = 2, kernel = 4;
+    const auto initial_history = values(width * kernel, 1), initial_state = values(vh * kd * vd, 2);
+    const std::vector<float> conv_sentinels(rows * width, -123.0F);
+    const std::vector<float> delta_sentinels(rows * vh * vd, -456.0F);
+    auto input = f32(context, { rows, width }, values(rows * width));
+    auto weight = make_tensor(context, dtype::bf16, { width, 1, kernel });
+    write_bf16(weight, values(width * kernel, 3));
+    auto history = f32(context, { width, kernel }, initial_history);
+    auto conv = f32(context, { rows, width }, conv_sentinels);
+    auto a = f32(context, { rows, vh }, values(rows * vh, 4));
+    auto b = f32(context, { rows, vh }, values(rows * vh, 5));
+    auto logs = f32(context, { vh }, values(vh, 6));
+    auto bias = make_tensor(context, dtype::bf16, { vh });
+    write_bf16(bias, values(vh, 7));
+    auto state = f32(context, { vh, kd, vd }, initial_state);
+    auto delta = f32(context, { rows, vh * vd }, delta_sentinels);
+    constexpr auto max = std::numeric_limits<std::size_t>::max();
+    const std::array chunks {
+        deltanet_chunk { 0, 0 },     deltanet_chunk { rows, 0 },
+        deltanet_chunk { rows, 1 },  deltanet_chunk { rows + 1, 1 },
+        deltanet_chunk { 1, rows },  deltanet_chunk { 0, max },
+        deltanet_chunk { 1, max },   deltanet_chunk { max, 1 },
+        deltanet_chunk { max, max }, deltanet_chunk { max / sizeof(float) / width + 1, 1 },
+    };
+    compute_pass pass(context);
+    REQUIRE(pass.begin());
+    for (const auto chunk : chunks) {
+        CAPTURE(chunk.offset);
+        CAPTURE(chunk.count);
+        const auto convolution = causal_conv1d_silu(context, input, weight, history, conv, chunk);
+        REQUIRE_FALSE(convolution);
+        CHECK(convolution.error() == tensor_op_errc::input_shape_mismatch);
+        const auto recurrence =
+            gated_delta_rule(context, input, a, b, logs, bias, 1, state, delta, 1e-6F, chunk);
+        REQUIRE_FALSE(recurrence);
+        CHECK(recurrence.error() == tensor_op_errc::input_shape_mismatch);
+
+        // Raw dispatch must also reject ranges before computing overflowing byte offsets.
+        const auto raw_conv = metal_kernels(context).dispatch_causal_conv1d_silu(
+            input.buffer(), weight.buffer(), history.buffer(), conv.buffer(), chunk.count, width,
+            kernel, chunk.offset);
+        REQUIRE_FALSE(raw_conv);
+        CHECK(raw_conv.error().code == metal_errc::invalid_input);
+        const auto raw_delta = metal_kernels(context).dispatch_gated_delta_rule(
+            input.buffer(), a.buffer(), b.buffer(), logs.buffer(), bias.buffer(), state.buffer(),
+            delta.buffer(), chunk.count, 1, vh, kd, vd, 1e-6F, chunk.offset);
+        REQUIRE_FALSE(raw_delta);
+        CHECK(raw_delta.error().code == metal_errc::invalid_input);
+    }
+    REQUIRE(pass.finish());
+    CHECK(read_floats(history) == initial_history);
+    CHECK(read_floats(state) == initial_state);
+    CHECK(read_floats(conv) == conv_sentinels);
+    CHECK(read_floats(delta) == delta_sentinels);
+}
+
+TEST_CASE("DeltaNet raw dispatch bounds-checks every token buffer")
+{
+    auto made = metal_context::make(load_shader_source());
+    REQUIRE(made);
+    auto& context = *made;
+    constexpr std::size_t rows = 4, width = 8, vh = 2, kd = 2, vd = 2, kernel = 4;
+    const auto initial_history = values(width * kernel, 1), initial_state = values(vh * kd * vd, 2);
+    const std::vector<float> conv_sentinels(rows * width, -123.0F);
+    const std::vector<float> delta_sentinels(rows * vh * vd, -456.0F);
+    auto input = f32(context, { rows, width }, values(rows * width));
+    auto weight = make_tensor(context, dtype::bf16, { width, 1, kernel });
+    write_bf16(weight, values(width * kernel, 3));
+    auto history = f32(context, { width, kernel }, initial_history);
+    auto conv = f32(context, { rows, width }, conv_sentinels);
+    auto a = f32(context, { rows, vh }, values(rows * vh, 4));
+    auto b = f32(context, { rows, vh }, values(rows * vh, 5));
+    auto logs = f32(context, { vh }, values(vh, 6));
+    auto bias = make_tensor(context, dtype::bf16, { vh });
+    write_bf16(bias, values(vh, 7));
+    auto state = f32(context, { vh, kd, vd }, initial_state);
+    auto delta = f32(context, { rows, vh * vd }, delta_sentinels);
+    auto short_input = f32(context, { rows - 1, width }, values((rows - 1) * width));
+    auto short_gate = f32(context, { rows - 1, vh }, values((rows - 1) * vh));
+    const std::vector<float> short_conv_sentinels((rows - 1) * width, -123.0F);
+    const std::vector<float> short_delta_sentinels((rows - 1) * vh * vd, -456.0F);
+    auto short_conv = f32(context, { rows - 1, width }, short_conv_sentinels);
+    auto short_delta = f32(context, { rows - 1, vh * vd }, short_delta_sentinels);
+    compute_pass pass(context);
+    REQUIRE(pass.begin());
+    // [2, 4) fits the full buffers but not a three-row buffer.
+    for (int short_buffer = 0; short_buffer < 2; ++short_buffer) {
+        CAPTURE(short_buffer);
+        const auto dispatched = metal_kernels(context).dispatch_causal_conv1d_silu(
+            short_buffer == 0 ? short_input.buffer() : input.buffer(), weight.buffer(),
+            history.buffer(), short_buffer == 1 ? short_conv.buffer() : conv.buffer(), 2, width,
+            kernel, 2);
+        REQUIRE_FALSE(dispatched);
+        CHECK(dispatched.error().code == metal_errc::invalid_input);
+    }
+    for (int short_buffer = 0; short_buffer < 4; ++short_buffer) {
+        CAPTURE(short_buffer);
+        const auto dispatched = metal_kernels(context).dispatch_gated_delta_rule(
+            short_buffer == 0 ? short_input.buffer() : input.buffer(),
+            short_buffer == 1 ? short_gate.buffer() : a.buffer(),
+            short_buffer == 2 ? short_gate.buffer() : b.buffer(), logs.buffer(), bias.buffer(),
+            state.buffer(), short_buffer == 3 ? short_delta.buffer() : delta.buffer(), 2, 1, vh, kd,
+            vd, 1e-6F, 2);
+        REQUIRE_FALSE(dispatched);
+        CHECK(dispatched.error().code == metal_errc::invalid_input);
+    }
+    REQUIRE(pass.finish());
+    CHECK(read_floats(history) == initial_history);
+    CHECK(read_floats(state) == initial_state);
+    CHECK(read_floats(conv) == conv_sentinels);
+    CHECK(read_floats(delta) == delta_sentinels);
+    CHECK(read_floats(short_conv) == short_conv_sentinels);
+    CHECK(read_floats(short_delta) == short_delta_sentinels);
 }
 
 TEST_CASE("DeltaNet gated RMSNorm normalizes heads independently and uses direct f32 weights")

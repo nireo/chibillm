@@ -55,7 +55,7 @@ upload_u32(const metal_context& context, std::span<const std::uint32_t> values);
                                                       const metal_tensor& residual,
                                                       metal_tensor& output);
 
-// Projects one input through two or three vertically packed bf16 weights in one launch.
+// Projects one input through one to three vertically packed bf16 weights in one launch.
 [[nodiscard]] result<void, tensor_op_errc>
 linear_split(const metal_context& context,
              const metal_tensor& input,

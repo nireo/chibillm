@@ -116,6 +116,37 @@ TEST_CASE("linear split projects multiple rows into separate outputs")
     CHECK(read_floats(output_c) == std::vector<float> { 4.0F, 10.0F, 8.0F, 26.0F });
 }
 
+TEST_CASE("linear split supports a single output for decode and prefill")
+{
+    const auto& context = test_context();
+    auto weight = make_tensor(context, dtype::bf16, { 4, 3 });
+    write_bf16(weight,
+               { 1.0F, 5.0F, 9.0F, 2.0F, 6.0F, 10.0F, 3.0F, 7.0F, 11.0F, 4.0F, 8.0F, 12.0F });
+    const std::vector<float> inputs { 1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F };
+    const std::vector<float> expected { 38.0F, 44.0F, 50.0F, 56.0F, 83.0F, 98.0F, 113.0F, 128.0F };
+    for (const std::size_t rows : { 1, 2 }) {
+        CAPTURE(rows);
+        auto input = make_tensor(context, dtype::f32, { rows, 3 });
+        auto output = make_tensor(context, dtype::f32, { rows, 4 });
+        write_floats(input, { inputs.begin(), inputs.begin() + rows * 3 });
+        write_floats(output, std::vector<float>(rows * 4, -100.0F));
+
+        REQUIRE(linear_split(context, input, weight, { &output }));
+        CHECK(read_floats(output)
+              == std::vector<float>(expected.begin(), expected.begin() + rows * 4));
+    }
+}
+
+TEST_CASE("linear split rejects an empty output list")
+{
+    const auto& context = test_context();
+    auto input = make_tensor(context, dtype::f32, { 2, 3 });
+    auto weight = make_tensor(context, dtype::bf16, { 4, 3 });
+    const auto projected = linear_split(context, input, weight, {});
+    REQUIRE_FALSE(projected);
+    CHECK(projected.error() == tensor_op_errc::output_shape_mismatch);
+}
+
 TEST_CASE("embedding lookup gathers token rows in input order")
 {
     const auto* context = &test_context();

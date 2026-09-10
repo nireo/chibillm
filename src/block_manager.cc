@@ -38,17 +38,20 @@ block_manager::reserve(seq_id id, std::size_t tokens)
     const auto existing = resources(id).blocks.size();
     if (required < existing)
         return fail(state_errc::invalid_reservation);
+
     const auto additional = required - existing;
     if (additional > free_.size())
         return fail(state_errc::capacity_exhausted);
     if (!additional)
         return { };
+
     auto& table = tables_[id];
     table.reserve(required);
     for (std::size_t i = 0; i < additional; ++i) {
         table.push_back(free_.front());
         free_.pop_front();
     }
+
     return { };
 }
 

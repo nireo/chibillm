@@ -20,6 +20,7 @@ load_model(const std::filesystem::path& directory,
         || !config["model_type"].is_string()) {
         return fail(model_load_errc::invalid_config);
     }
+
     if (config["model_type"] == "qwen3") {
         auto runner =
             qwen_model_runner::make(directory, shaders, block_count, block_size, std::move(id));

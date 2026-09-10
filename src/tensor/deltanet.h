@@ -2,20 +2,33 @@
 
 #include "tensor/tensor_ops.h"
 
+#include <cstddef>
+#include <optional>
+
 namespace chibillm {
 
-// One sequence per call; rows are consecutive tokens. State must be initialized
+struct deltanet_chunk {
+    std::size_t offset;
+    std::size_t count;
+};
+
+// One sequence per scan; its rows are consecutive tokens. State must be initialized
 // to zero for a new sequence and preserved across chunks. Calls in a compute
 // pass are asynchronous until the pass finishes. The caller owns rollback of
 // mutated state on failure. Outputs and state must not alias any other argument.
+// Both scans accept an optional chunk of contiguous rows in full-batch token
+// tensors; their shapes are unchanged and output rows outside the chunk are
+// untouched. By default, every row is scanned. A chunk must be nonempty and in bounds.
 //
 // input/output: f32 [tokens, channels], weight: bf16 [channels, 1, kernel].
 // history: f32 [channels, kernel], oldest to newest raw (pre-SiLU) inputs.
-[[nodiscard]] result<void, tensor_op_errc> causal_conv1d_silu(const metal_context& context,
-                                                              const metal_tensor& input,
-                                                              const metal_tensor& weight,
-                                                              metal_tensor& history,
-                                                              metal_tensor& output);
+[[nodiscard]] result<void, tensor_op_errc>
+causal_conv1d_silu(const metal_context& context,
+                   const metal_tensor& input,
+                   const metal_tensor& weight,
+                   metal_tensor& history,
+                   metal_tensor& output,
+                   std::optional<deltanet_chunk> chunk = std::nullopt);
 
 // Fused Qwen3.5 gate preparation and recurrent gated delta rule.
 // qkv: f32 [tokens, 2 * key_heads * key_dim + value_heads * value_dim],
@@ -29,16 +42,18 @@ namespace chibillm {
 // S *= exp(g); S += k outer (beta * (v - k^T S)); output = q^T S.
 // output: f32 [tokens, value_heads * value_dim]. A sequential scan supports
 // decode and arbitrary prefill chunks; this is not a parallel prefill kernel.
-[[nodiscard]] result<void, tensor_op_errc> gated_delta_rule(const metal_context& context,
-                                                            const metal_tensor& qkv,
-                                                            const metal_tensor& a,
-                                                            const metal_tensor& b,
-                                                            const metal_tensor& A_log,
-                                                            const metal_tensor& dt_bias,
-                                                            std::size_t key_heads,
-                                                            metal_tensor& state,
-                                                            metal_tensor& output,
-                                                            float epsilon = 1e-6F);
+[[nodiscard]] result<void, tensor_op_errc>
+gated_delta_rule(const metal_context& context,
+                 const metal_tensor& qkv,
+                 const metal_tensor& a,
+                 const metal_tensor& b,
+                 const metal_tensor& A_log,
+                 const metal_tensor& dt_bias,
+                 std::size_t key_heads,
+                 metal_tensor& state,
+                 metal_tensor& output,
+                 float epsilon = 1e-6F,
+                 std::optional<deltanet_chunk> chunk = std::nullopt);
 
 // input/gate/output: f32 [tokens, heads * value_dim], weight: f32 [value_dim].
 // Each head is normalized independently, then scaled by weight and SiLU(gate).

@@ -28,6 +28,17 @@ adaptive_2d_threadgroup_size(id<MTLComputePipelineState> pipeline,
     return MTLSizeMake(threadgroup_width, threadgroup_height, 1);
 }
 
+bool
+f32_rows_fit(const metal_buffer& buffer,
+             std::size_t row_offset,
+             std::size_t rows,
+             std::size_t width)
+{
+    // Width is nonzero after geometry validation. Divide before forming byte offsets.
+    const auto available_rows = buffer.size_bytes() / sizeof(float) / width;
+    return row_offset <= available_rows && rows <= available_rows - row_offset;
+}
+
 } // namespace
 
 result<void, metal_error>
@@ -946,7 +957,8 @@ metal_kernels::dispatch_causal_conv1d_silu(const metal_buffer& input,
                                            metal_buffer& output,
                                            std::size_t rows,
                                            std::size_t channels,
-                                           std::size_t kernel) const
+                                           std::size_t kernel,
+                                           std::size_t row_offset) const
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
@@ -959,6 +971,10 @@ metal_kernels::dispatch_causal_conv1d_silu(const metal_buffer& input,
             || kernel > limit)
             return fail(
                 make_error(metal_errc::invalid_input, "invalid DeltaNet shader dimensions"));
+        if (!f32_rows_fit(input, row_offset, rows, channels)
+            || !f32_rows_fit(output, row_offset, rows, channels))
+            return fail(make_error(metal_errc::invalid_input, "DeltaNet row range exceeds buffer"));
+        const auto row_offset_bytes = row_offset * channels * sizeof(float);
         const std::uint32_t geometry[] = { static_cast<std::uint32_t>(rows),
                                            static_cast<std::uint32_t>(channels),
                                            static_cast<std::uint32_t>(kernel) };
@@ -968,10 +984,10 @@ metal_kernels::dispatch_causal_conv1d_silu(const metal_buffer& input,
             return fail(opened.error());
         id<MTLComputeCommandEncoder> encoder = opened->encoder;
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
+        [encoder setBuffer:input.implementation_->buffer offset:row_offset_bytes atIndex:0];
         [encoder setBuffer:weight.implementation_->buffer offset:0 atIndex:1];
         [encoder setBuffer:history.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:3];
+        [encoder setBuffer:output.implementation_->buffer offset:row_offset_bytes atIndex:3];
         [encoder setBytes:geometry length:sizeof(geometry) atIndex:4];
         const auto threads = std::min<std::size_t>(256, pipeline.maxTotalThreadsPerThreadgroup);
         [encoder dispatchThreads:MTLSizeMake(channels, 1, 1)
@@ -993,7 +1009,8 @@ metal_kernels::dispatch_gated_delta_rule(const metal_buffer& qkv,
                                          std::size_t value_heads,
                                          std::size_t key_dim,
                                          std::size_t value_dim,
-                                         float epsilon) const
+                                         float epsilon,
+                                         std::size_t row_offset) const
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
@@ -1013,6 +1030,16 @@ metal_kernels::dispatch_gated_delta_rule(const metal_buffer& qkv,
             || key_heads > (limit - value_heads * value_dim) / key_dim / 2)
             return fail(
                 make_error(metal_errc::invalid_input, "invalid DeltaNet shader dimensions"));
+        const auto value_width = value_heads * value_dim;
+        const auto qkv_width = 2 * key_heads * key_dim + value_width;
+        if (!f32_rows_fit(qkv, row_offset, rows, qkv_width)
+            || !f32_rows_fit(a, row_offset, rows, value_heads)
+            || !f32_rows_fit(b, row_offset, rows, value_heads)
+            || !f32_rows_fit(output, row_offset, rows, value_width))
+            return fail(make_error(metal_errc::invalid_input, "DeltaNet row range exceeds buffer"));
+        const auto qkv_offset_bytes = row_offset * qkv_width * sizeof(float);
+        const auto gate_offset_bytes = row_offset * value_heads * sizeof(float);
+        const auto output_offset_bytes = row_offset * value_width * sizeof(float);
         const std::uint32_t geometry[] = { static_cast<std::uint32_t>(rows),
                                            static_cast<std::uint32_t>(key_heads),
                                            static_cast<std::uint32_t>(value_heads),
@@ -1024,13 +1051,13 @@ metal_kernels::dispatch_gated_delta_rule(const metal_buffer& qkv,
             return fail(opened.error());
         id<MTLComputeCommandEncoder> encoder = opened->encoder;
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:qkv.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:a.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:b.implementation_->buffer offset:0 atIndex:2];
+        [encoder setBuffer:qkv.implementation_->buffer offset:qkv_offset_bytes atIndex:0];
+        [encoder setBuffer:a.implementation_->buffer offset:gate_offset_bytes atIndex:1];
+        [encoder setBuffer:b.implementation_->buffer offset:gate_offset_bytes atIndex:2];
         [encoder setBuffer:A_log.implementation_->buffer offset:0 atIndex:3];
         [encoder setBuffer:dt_bias.implementation_->buffer offset:0 atIndex:4];
         [encoder setBuffer:state.implementation_->buffer offset:0 atIndex:5];
-        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:6];
+        [encoder setBuffer:output.implementation_->buffer offset:output_offset_bytes atIndex:6];
         [encoder setBytes:geometry length:sizeof(geometry) atIndex:7];
         [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:8];
         const auto threads = std::min<std::size_t>(256, pipeline.maxTotalThreadsPerThreadgroup);

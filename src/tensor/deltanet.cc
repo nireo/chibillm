@@ -31,10 +31,11 @@ namespace {
 
 result<void, tensor_op_errc>
 causal_conv1d_silu(const metal_context& context,
-    const metal_tensor& input,
-    const metal_tensor& weight,
-    metal_tensor& history,
-    metal_tensor& output)
+                   const metal_tensor& input,
+                   const metal_tensor& weight,
+                   metal_tensor& history,
+                   metal_tensor& output,
+                   std::optional<deltanet_chunk> chunk)
 {
     if (input.descriptor().shape().rank() != 2
         || weight.descriptor().shape().rank() != 3
@@ -53,12 +54,16 @@ causal_conv1d_silu(const metal_context& context,
     if (!shape_is(output, { dims[0], dims[1] }))
         return fail(tensor_op_errc::output_shape_mismatch);
 
+    const auto scan = chunk.value_or(deltanet_chunk { 0, dims[0] });
+    if (scan.count == 0 || scan.offset > dims[0] || scan.count > dims[0] - scan.offset)
+        return fail(tensor_op_errc::input_shape_mismatch);
+
     if (aliases(history, { &input, &weight, &output }) || aliases(output, { &input, &weight }))
         return fail(tensor_op_errc::unsupported_aliasing);
 
-    if (!metal_kernels(context).dispatch_causal_conv1d_silu(input.buffer(), weight.buffer(),
-            history.buffer(), output.buffer(),
-            dims[0], dims[1], kernel))
+    if (!metal_kernels(context).dispatch_causal_conv1d_silu(
+            input.buffer(), weight.buffer(), history.buffer(), output.buffer(), scan.count, dims[1],
+            kernel, scan.offset))
         return fail(tensor_op_errc::backend_failure);
 
     return { };
@@ -66,15 +71,16 @@ causal_conv1d_silu(const metal_context& context,
 
 result<void, tensor_op_errc>
 gated_delta_rule(const metal_context& context,
-    const metal_tensor& qkv,
-    const metal_tensor& a,
-    const metal_tensor& b,
-    const metal_tensor& A_log,
-    const metal_tensor& dt_bias,
-    std::size_t key_heads,
-    metal_tensor& state,
-    metal_tensor& output,
-    float epsilon)
+                 const metal_tensor& qkv,
+                 const metal_tensor& a,
+                 const metal_tensor& b,
+                 const metal_tensor& A_log,
+                 const metal_tensor& dt_bias,
+                 std::size_t key_heads,
+                 metal_tensor& state,
+                 metal_tensor& output,
+                 float epsilon,
+                 std::optional<deltanet_chunk> chunk)
 {
     if (qkv.descriptor().shape().rank() != 2
         || a.descriptor().shape().rank() != 2
@@ -112,13 +118,18 @@ gated_delta_rule(const metal_context& context,
     if (!shape_is(output, { rows, value_width }))
         return fail(tensor_op_errc::output_shape_mismatch);
 
+    const auto scan = chunk.value_or(deltanet_chunk { 0, rows });
+    if (scan.count == 0 || scan.offset > rows || scan.count > rows - scan.offset)
+        return fail(tensor_op_errc::input_shape_mismatch);
+
     if (aliases(state, { &qkv, &a, &b, &A_log, &dt_bias, &output })
         || aliases(output, { &qkv, &a, &b, &A_log, &dt_bias }))
         return fail(tensor_op_errc::unsupported_aliasing);
 
     if (!metal_kernels(context).dispatch_gated_delta_rule(
             qkv.buffer(), a.buffer(), b.buffer(), A_log.buffer(), dt_bias.buffer(), state.buffer(),
-            output.buffer(), rows, key_heads, heads, key_dim, value_dim, epsilon))
+            output.buffer(), scan.count, key_heads, heads, key_dim, value_dim, epsilon,
+            scan.offset))
         return fail(tensor_op_errc::backend_failure);
 
     return { };
