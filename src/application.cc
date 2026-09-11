@@ -58,6 +58,14 @@ run_server(model_runner& runner, std::size_t kv_block_count, std::size_t max_tok
 int
 run_application(const cli_options& settings, const std::filesystem::path& shader_path)
 {
+    std::ofstream metrics_file;
+    if (!settings.metrics_jsonl.empty()) {
+        metrics_file.open(settings.metrics_jsonl, std::ios::app);
+        if (!metrics_file) {
+            std::cerr << "failed to open metrics file: " << settings.metrics_jsonl << '\n';
+            return 1;
+        }
+    }
     constexpr auto kv_block_size = cli_options::kv_block_size;
     const auto& model_directory = settings.model_directory;
     const auto requested_blocks = settings.context_length / kv_block_size;
@@ -112,7 +120,8 @@ run_application(const cli_options& settings, const std::filesystem::path& shader
                       .kv_block_count = kv_block_count,
                       .kv_block_size = kv_block_size,
                       .eos_token = (*runner)->info().eos_token },
-                    max_tokens, settings.stream, settings.progress);
+                    settings.max_tokens, settings.stream, settings.progress,
+                    metrics_file.is_open() ? &metrics_file : nullptr);
 }
 
 } // namespace chibillm

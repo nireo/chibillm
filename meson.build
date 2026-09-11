@@ -129,6 +129,7 @@ executable(
     'src/application.cc',
     'src/cli_options.cc',
     'src/repl.cc',
+    'src/generation_metrics.cc',
   ],
   include_directories: src_include,
   cpp_args: [
@@ -140,6 +141,7 @@ executable(
   ],
   dependencies: [
     cpp_httplib_dep,
+    nlohmann_json_dep,
     metal_framework_dep,
   ],
   link_with: [
@@ -148,6 +150,9 @@ executable(
   ],
   install: true,
 )
+
+python = import('python').find_installation('python3')
+test('chibillm benchmark tests', python, args: [meson.project_source_root() / 'tests/benchmark_test.py'])
 
 test_args = [
   '-DCHIBILLM_SHADER_PATH="' + meson.project_source_root() / 'shaders/tensor_ops.metal' + '"',
@@ -158,7 +163,7 @@ test_args = [
 
 foreach spec : [
   {'name': 'unit', 'sources': ['tests/seq_test.cc', 'tests/block_manager_test.cc'], 'library': chibillm_core},
-  {'name': 'repl', 'sources': ['tests/repl_test.cc', 'src/repl.cc', 'src/cli_options.cc'], 'library': chibillm_core},
+  {'name': 'repl', 'sources': ['tests/repl_test.cc', 'tests/generation_metrics_test.cc', 'src/repl.cc', 'src/cli_options.cc', 'src/generation_metrics.cc'], 'library': chibillm_core, 'deps': [nlohmann_json_dep]},
   {'name': 'scheduler', 'sources': ['tests/scheduler_test.cc'], 'library': chibillm_core},
   {'name': 'model batch', 'sources': ['tests/model_batch_test.cc'], 'library': chibillm_core},
   {'name': 'inference engine', 'sources': ['tests/inference_engine_test.cc', 'tests/fake_model_runner.cc'], 'library': chibillm_core},

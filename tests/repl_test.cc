@@ -1,5 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
+#include <nlohmann/json.hpp>
 
 #include <functional>
 #include <iostream>
@@ -101,7 +102,10 @@ public:
 };
 
 int
-run(repl_runner& runner, bool stream = true, std::size_t budget = 8)
+run(repl_runner& runner,
+    bool stream = true,
+    std::size_t budget = 8,
+    std::ostream* metrics = nullptr)
 {
     return chibillm::run_repl(runner,
                               { .max_sequences = 1,
@@ -109,7 +113,7 @@ run(repl_runner& runner, bool stream = true, std::size_t budget = 8)
                                 .kv_block_count = 8,
                                 .kv_block_size = 2,
                                 .eos_token = 99 },
-                              budget, stream, false);
+                              budget, stream, false, metrics);
 }
 
 } // namespace
@@ -248,4 +252,95 @@ TEST_CASE("CLI accepts efficient REPL display controls")
     CHECK(settings->progress);
     args[1] = invalid;
     CHECK_FALSE(chibillm::parse_cli_options(2, args).has_value());
+}
+
+TEST_CASE("REPL metrics count committed batches and separate first token from text")
+{
+    for (bool stream : { true, false }) {
+        captured_terminal terminal("private prompt\n/quit\n");
+        std::ostringstream records;
+        repl_runner runner;
+        CHECK(run(runner, stream, 8, &records) == 0);
+        const auto row = nlohmann::json::parse(records.str());
+        CHECK(row["status"] == "ok");
+        CHECK(row["stage"] == "complete");
+        CHECK(row["stop_reason"] == "eos");
+        CHECK(row["prompt_tokens"] == 5);
+        CHECK(row["processed_prompt_tokens"] == 5);
+        CHECK(row["prefill_batches"] == 3);
+        CHECK(row["output_tokens"] == 3);
+        CHECK(row["output_bytes"] == 3);
+        CHECK(row["decode_step"]["samples"] == 2);
+        CHECK(row["inter_token"]["samples"] == 2);
+        CHECK(row["stream"] == stream);
+        CHECK(row["first_text_seconds"].get<double>() >= row["engine_ttft_seconds"].get<double>());
+        CHECK(row["end_to_end_seconds"].get<double>() >= row["first_text_seconds"].get<double>());
+        CHECK(row["prefill_seconds"].get<double>() + row["decode_engine_seconds"].get<double>()
+              <= row["end_to_end_seconds"].get<double>());
+        CHECK(records.str().find("private prompt") == std::string::npos);
+        CHECK(records.str().find("€") == std::string::npos);
+    }
+}
+
+TEST_CASE("failed requests produce partial metrics and distinct request IDs")
+{
+    captured_terminal terminal("hello\n/reset\nretry\n/quit\n");
+    std::ostringstream records;
+    repl_runner runner;
+    runner.failure_call = 5;
+    CHECK(run(runner, true, 8, &records) == 0);
+    std::istringstream lines(records.str());
+    std::string line;
+    for (int request = 1; request <= 2; ++request) {
+        REQUIRE(static_cast<bool>(std::getline(lines, line)));
+        const auto row = nlohmann::json::parse(line);
+        CHECK(row["request_id"] == request);
+        CHECK(row["status"] == "error");
+        CHECK(row["stage"] == "decode");
+        CHECK(row["output_tokens"] == 2);
+        CHECK(row["output_bytes"] == 3);
+        CHECK(row["decode_step"]["samples"] == 1); // Failed batch isn't committed work.
+    }
+    CHECK_FALSE(static_cast<bool>(std::getline(lines, line)));
+}
+
+TEST_CASE("metrics distinguish no text, early rejection and file write errors")
+{
+    for (bool reject : { true, false }) {
+        captured_terminal terminal("hello\n/quit\n");
+        std::ostringstream records;
+        repl_runner runner;
+        runner.immediate_eos = true;
+        if (reject)
+            runner.metadata.max_context_tokens = 5;
+        CHECK(run(runner, true, 8, &records) == 0);
+        const auto row = nlohmann::json::parse(records.str());
+        CHECK(row["first_text_seconds"].is_null());
+        CHECK(row["decode_step"]["p50_seconds"].is_null());
+        CHECK(row["engine_ttft_seconds"].is_null() == reject);
+        CHECK(row["status"] == (reject ? "error" : "ok"));
+        CHECK(row["stage"] == (reject ? "context_check" : "complete"));
+    }
+    captured_terminal terminal("hello\n/quit\n");
+    std::ostringstream failed;
+    failed.setstate(std::ios::badbit);
+    repl_runner runner;
+    CHECK(run(runner, true, 8, &failed) == 1);
+    CHECK(terminal.errors.str().find("failed to write metrics") != std::string::npos);
+}
+
+TEST_CASE("CLI validates REPL-only JSONL output")
+{
+    char program[] = "chibillm";
+    char option[] = "--metrics-jsonl";
+    char path[] = "metrics.jsonl";
+    char serve[] = "--serve";
+    char* args[] = { program, option, path, serve };
+    CHECK_FALSE(chibillm::parse_cli_options(2, args).has_value());
+    auto settings = chibillm::parse_cli_options(3, args);
+    REQUIRE(settings.has_value());
+    CHECK(settings->metrics_jsonl == "metrics.jsonl");
+    CHECK_FALSE(chibillm::parse_cli_options(4, args).has_value());
+    args[2] = serve;
+    CHECK_FALSE(chibillm::parse_cli_options(3, args).has_value());
 }

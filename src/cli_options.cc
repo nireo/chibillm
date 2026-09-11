@@ -15,6 +15,7 @@ print_usage(std::ostream& output)
               "  --serve             Start the HTTP server on 127.0.0.1:8000\n"
               "  --no-stream         Print REPL replies only when complete\n"
               "  --progress=auto|off  REPL prefill progress on terminals (default: auto)\n"
+              "  --metrics-jsonl PATH  Append full-precision REPL request metrics (no text)\n"
               "  --help              Show this help\n";
 }
 
@@ -31,6 +32,12 @@ parse_cli_options(int argc, char** argv)
             settings.stream = false;
         } else if (arg == "--progress=auto" || arg == "--progress=off") {
             settings.progress = arg == "--progress=auto";
+        } else if (arg == "--metrics-jsonl") {
+            if (++i >= argc
+                || std::string_view(argv[i]).empty()
+                || std::string_view(argv[i]).starts_with('-'))
+                return fail("missing path for --metrics-jsonl");
+            settings.metrics_jsonl = argv[i];
         } else if (arg == "--serve") {
             settings.serve = true;
         } else if (arg == "--context-length" || arg == "--max-tokens") {
@@ -57,6 +64,8 @@ parse_cli_options(int argc, char** argv)
             has_directory = true;
         }
     }
+    if (settings.serve && !settings.metrics_jsonl.empty())
+        return fail("--metrics-jsonl currently supports REPL mode only");
     return settings;
 }
 

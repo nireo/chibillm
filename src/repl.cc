@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <span>
@@ -12,30 +11,26 @@
 
 #include <unistd.h>
 
+#include "generation_metrics.h"
 #include "inference_engine.h"
 
 namespace chibillm {
 namespace {
+
+using clock = std::chrono::steady_clock;
+
+double
+seconds(clock::time_point start, clock::time_point end)
+{
+    return std::chrono::duration<double>(end - start).count();
+}
 
 enum class chat_errc {
     context_full,
     generation_failed
 };
 
-struct generation_result {
-    std::string text;
-    std::size_t prompt_tokens;
-    std::size_t output_tokens;
-    double time_to_first_token;
-    double total_time;
-    double decode_p50;
-    double decode_p95;
-    finish_reason reason;
-    bool context_limited;
-};
-
-// No thread or per-token formatting. Only prefill uses a transient status line;
-// once text arrives it owns the terminal until the final summary.
+// Only prefill uses a transient status line; generated text owns the terminal.
 class generation_display {
 public:
     generation_display(bool stream, bool progress)
@@ -51,13 +46,21 @@ public:
 
     ~generation_display()
     {
-        clear();
-        if (text_started_)
-            std::cout << '\n' << std::flush;
+        finish();
     }
 
     void
-    update(std::size_t processed, std::size_t total, std::chrono::steady_clock::time_point now)
+    finish()
+    {
+        clear();
+        if (text_started_) {
+            std::cout << '\n' << std::flush;
+            text_started_ = false;
+        }
+    }
+
+    void
+    update(std::size_t processed, std::size_t total, clock::time_point now)
     {
         if (!progress_ || text_started_ || now < next_refresh_)
             return;
@@ -76,7 +79,7 @@ public:
     void
     emit(const std::string& delta)
     {
-        if (!stream_ || delta.empty())
+        if (delta.empty())
             return;
         clear();
         start_text();
@@ -91,9 +94,15 @@ public:
             start_text();
     }
 
-private:
-    using clock = std::chrono::steady_clock;
+    void
+    buffered(const std::string& text)
+    {
+        clear();
+        start_text();
+        std::cout << text << std::flush;
+    }
 
+private:
     void
     clear()
     {
@@ -118,144 +127,179 @@ private:
     clock::time_point next_refresh_;
 };
 
-double
-percentile(std::vector<double> samples, double fraction)
-{
-    if (samples.empty()) {
-        return 0.0;
-    }
-    std::ranges::sort(samples);
-    const auto index = std::min(samples.size() - 1,
-                                static_cast<std::size_t>(std::ceil(fraction * samples.size()) - 1));
-    return samples[index];
-}
-
-result<generation_result, chat_errc>
-generate(chibillm::model_runner& runner,
-         chibillm::inference_engine& engine,
-         std::span<const chibillm::chat_message> history,
+result<std::string, chat_errc>
+generate(model_runner& runner,
+         inference_engine& engine,
+         std::span<const chat_message> history,
          std::size_t max_new_tokens,
          bool stream,
-         bool progress)
+         bool progress,
+         clock::time_point submitted,
+         generation_metrics& metrics)
 {
     generation_display display(stream, progress);
+    const auto encode_started = clock::now();
     auto prompt = runner.encode_chat(history);
-    if (!prompt) {
-        return chibillm::fail(chat_errc::generation_failed);
-    }
+    metrics.tokenization_seconds = seconds(encode_started, clock::now());
+    if (!prompt)
+        return fail(chat_errc::generation_failed);
+    metrics.prompt_tokens = prompt->size();
+    metrics.stage = "context_check";
     const auto context_length = runner.info().max_context_tokens;
     if (prompt->size() >= context_length) {
-        return chibillm::fail(chat_errc::context_full);
+        metrics.stop = "context_capacity";
+        return fail(chat_errc::context_full);
     }
 
-    const auto prompt_tokens = prompt->size();
-    const auto token_budget = std::min(max_new_tokens, context_length - prompt->size());
-    auto sequence = chibillm::seq::make(1, std::move(*prompt),
-                                        {
-                                            .max_new_tokens = token_budget,
-                                            .ignore_eos = false,
-                                        });
-    if (!sequence || !engine.add(std::move(*sequence))) {
-        return chibillm::fail(chat_errc::generation_failed);
-    }
+    metrics.token_budget = std::min(max_new_tokens, context_length - prompt->size());
+    metrics.stage = "admission";
+    auto sequence = seq::make(1, std::move(*prompt),
+                              { .max_new_tokens = metrics.token_budget, .ignore_eos = false });
+    metrics.admission_at = seconds(submitted, clock::now());
+    if (!sequence || !engine.add(std::move(*sequence)))
+        return fail(chat_errc::generation_failed);
 
+    metrics.stage = "decoder_setup";
     auto decoder = stream ? runner.make_decoder() : nullptr;
     if (stream && !decoder)
-        return chibillm::fail(chat_errc::generation_failed);
+        return fail(chat_errc::generation_failed);
     std::string text;
-    using clock = std::chrono::steady_clock;
-    const auto started = clock::now();
-    auto first_token = started;
-    bool produced_token = false;
-    std::vector<double> decode_latencies;
-    display.update(0, prompt_tokens, started);
+    display.update(0, metrics.prompt_tokens, clock::now());
     while (!engine.is_finished()) {
+        const auto* current = engine.find_sequence(1);
+        if (!current)
+            return fail(chat_errc::generation_failed);
+        const auto processed_before = current->processed_token_count();
+        const bool prefill = processed_before < metrics.prompt_tokens;
+        metrics.stage = prefill ? "prefill" : "decode";
         const auto step_started = clock::now();
         auto updates = engine.step();
-        if (!updates) {
-            return chibillm::fail(chat_errc::generation_failed);
-        }
         const auto step_finished = clock::now();
-        if (produced_token) {
-            decode_latencies.push_back(
-                std::chrono::duration<double>(step_finished - step_started).count());
-        }
-        const auto* current = engine.find_sequence(1);
-        if (!produced_token && current != nullptr && current->completion_token_count() != 0) {
-            first_token = step_finished;
-            produced_token = true;
+        if (!updates)
+            return fail(chat_errc::generation_failed);
+        metrics.record_batch(prefill,
+                             prefill ? current->processed_token_count() - processed_before : 0,
+                             seconds(step_started, step_finished));
+        if (prefill && !updates->empty())
             display.decoding();
-        }
-        if (!produced_token && current != nullptr)
-            display.update(current->processed_token_count(), prompt_tokens, step_finished);
-        if (stream) {
-            for (const auto& update : *updates) {
+        if (updates->empty())
+            display.update(current->processed_token_count(), metrics.prompt_tokens, step_finished);
+        for (const auto& update : *updates) {
+            metrics.record_token(seconds(submitted, step_finished));
+            if (stream) {
+                metrics.stage = "text_decode";
+                const auto decode_started = clock::now();
                 auto delta = decoder->push(update.token, update.reason != finish_reason::none);
+                if (delta) {
+                    text += *delta;
+                    metrics.output_bytes = text.size();
+                }
+                const auto decode_finished = clock::now();
+                metrics.text_decode_seconds += seconds(decode_started, decode_finished);
                 if (!delta)
-                    return chibillm::fail(chat_errc::generation_failed);
-                text += *delta;
-                display.emit(*delta);
+                    return fail(chat_errc::generation_failed);
+                if (!delta->empty()) {
+                    metrics.stage = "output";
+                    display.emit(*delta);
+                    const auto written = clock::now();
+                    metrics.output_write_seconds += seconds(decode_finished, written);
+                    if (!std::cout)
+                        return fail(chat_errc::generation_failed);
+                    if (!metrics.first_text_seconds)
+                        metrics.first_text_seconds = seconds(submitted, written);
+                }
             }
         }
     }
-    const auto finished_at = clock::now();
 
     const auto* finished = engine.find_sequence(1);
-    if (finished == nullptr || !produced_token) {
-        return chibillm::fail(chat_errc::generation_failed);
-    }
+    if (!finished || !metrics.first_token_at)
+        return fail(chat_errc::generation_failed);
     if (!stream) {
+        metrics.stage = "text_decode";
+        const auto decode_started = clock::now();
         auto response = runner.decode(finished->completion_tokens());
+        metrics.text_decode_seconds += seconds(decode_started, clock::now());
         if (!response)
-            return chibillm::fail(chat_errc::generation_failed);
+            return fail(chat_errc::generation_failed);
         text = std::move(*response);
+        metrics.output_bytes = text.size();
+        metrics.stage = "output";
+        const auto write_started = clock::now();
+        display.buffered(text);
+        const auto written = clock::now();
+        metrics.output_write_seconds += seconds(write_started, written);
+        if (!std::cout)
+            return fail(chat_errc::generation_failed);
+        if (!text.empty())
+            metrics.first_text_seconds = seconds(submitted, written);
     }
-    return generation_result {
-        .text = std::move(text),
-        .prompt_tokens = prompt_tokens,
-        .output_tokens = finished->completion_token_count(),
-        .time_to_first_token = std::chrono::duration<double>(first_token - started).count(),
-        .total_time = std::chrono::duration<double>(finished_at - started).count(),
-        .decode_p50 = percentile(decode_latencies, 0.50),
-        .decode_p95 = percentile(decode_latencies, 0.95),
-        .reason = finished->reason(),
-        .context_limited = token_budget < max_new_tokens,
-    };
+    metrics.stage = "output";
+    const auto write_started = clock::now();
+    display.finish();
+    metrics.output_write_seconds += seconds(write_started, clock::now());
+    if (!std::cout)
+        return fail(chat_errc::generation_failed);
+    metrics.stop = finished->reason() == finish_reason::eos ? "eos"
+        : metrics.token_budget < max_new_tokens             ? "context_capacity"
+                                                            : "token_limit";
+    metrics.status = "ok";
+    metrics.stage = "complete";
+    return text;
 }
 
 void
-print_performance(const generation_result& result)
+print_value(std::optional<double> value, double scale = 1)
 {
-    const auto prefill_rate = result.prompt_tokens / result.time_to_first_token;
-    const auto decode_tokens = result.output_tokens - 1;
-    const auto decode_time = result.total_time - result.time_to_first_token;
-    const auto decode_rate = decode_time > 0.0 ? decode_tokens / decode_time : 0.0;
+    if (value)
+        std::cerr << *value * scale;
+    else
+        std::cerr << "n/a";
+}
 
+void
+print_performance(const generation_metrics& m)
+{
     std::cerr
         << std::fixed
-        << std::setprecision(2)
+        << std::setprecision(3)
         << "[perf] prompt "
-        << result.prompt_tokens
+        << m.prompt_tokens
         << " tok | output "
-        << result.output_tokens
-        << " tok | first "
-        << result.time_to_first_token
-        << " s | prefill "
-        << prefill_rate
-        << " tok/s | decode "
-        << decode_rate
-        << " tok/s (p50 "
-        << result.decode_p50 * 1000.0
-        << " ms, p95 "
-        << result.decode_p95 * 1000.0
-        << " ms) | total "
-        << result.total_time
-        << " s\n";
+        << m.output_tokens
+        << " tok | tokenize "
+        << m.tokenization_seconds * 1000
+        << " ms | engine first ";
+    print_value(m.engine_ttft_seconds());
+    std::cerr << " s | first text ";
+    print_value(m.first_text_seconds);
+    std::cerr << " s | prefill " << m.prefill_seconds << " s (";
+    print_value(m.prefill_tokens_per_second());
+    std::cerr << " tok/s) | decode ";
+    print_value(m.decode_tokens_per_second());
     std::cerr
-        << "[stop] "
-        << (result.reason == finish_reason::eos ? "eos"
-                : result.context_limited        ? "context capacity"
-                                                : "token limit")
+        << " tok/s | total "
+        << m.end_to_end_seconds
+        << " s\n"
+        << "[latency] decode step p50 ";
+    print_value(m.decode_step.p50, 1000);
+    std::cerr << " ms, p95 ";
+    print_value(m.decode_step.p95, 1000);
+    std::cerr << " ms (n=" << m.decode_step.samples << ") | inter-token p50 ";
+    print_value(m.inter_token.p50, 1000);
+    std::cerr << " ms, p95 ";
+    print_value(m.inter_token.p95, 1000);
+    std::cerr
+        << " ms (n="
+        << m.inter_token.samples
+        << ") | text decode "
+        << m.text_decode_seconds * 1000
+        << " ms | output "
+        << m.output_write_seconds * 1000
+        << " ms\n[stop] "
+        << (m.stop == "context_capacity"  ? "context capacity"
+                : m.stop == "token_limit" ? "token limit"
+                                          : m.stop)
         << '\n';
 }
 
@@ -266,19 +310,22 @@ run_repl(model_runner& runner,
          scheduler_config config,
          std::size_t max_new_tokens,
          bool stream,
-         bool progress)
+         bool progress,
+         std::ostream* metrics_output)
 {
-    // Both streams must be terminals: never put redraw controls in captured output.
     progress = progress && ::isatty(STDOUT_FILENO) && ::isatty(STDERR_FILENO);
     auto engine = inference_engine::make(config, runner);
     if (!engine) {
         std::cerr << "failed to create inference state\n";
         return 1;
     }
-
+    // Disambiguates request IDs across append-mode sessions. Not a prompt identifier.
+    const auto session_id = std::to_string(::getpid())
+        + "-"
+        + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+    std::size_t request_id = 0;
     std::vector<chat_message> history;
     std::cout << "chibillm chat — /reset clears history, /quit exits\n";
-
     for (std::string input;;) {
         std::cout << "\nyou> " << std::flush;
         if (!std::getline(std::cin, input) || input == "/quit" || input == "/exit") {
@@ -290,13 +337,32 @@ run_repl(model_runner& runner,
             std::cout << "history cleared\n";
             continue;
         }
-        if (input.empty()) {
+        if (input.empty())
             continue;
-        }
 
+        const auto submitted = clock::now();
+        generation_metrics metrics;
+        metrics.requested_tokens = max_new_tokens;
+        ++request_id;
         history.push_back({ "user", input });
-        auto response = generate(runner, *engine, history, max_new_tokens, stream, progress);
-        if (engine->find_sequence(1) && (!engine->cancel(1) || !engine->remove(1))) {
+        auto response = generate(runner, *engine, history, max_new_tokens, stream, progress,
+                                 submitted, metrics);
+        // Ends after final answer flush (including buffered replies), before cleanup/reporting.
+        metrics.end_to_end_seconds = seconds(submitted, clock::now());
+        const bool cleanup_failed =
+            engine->find_sequence(1) && (!engine->cancel(1) || !engine->remove(1));
+        if (cleanup_failed) {
+            metrics.status = "error";
+            metrics.stage = "cleanup";
+        }
+        metrics.summarize();
+        if (metrics_output
+            && !write_metrics_jsonl(*metrics_output, metrics, runner.info(), config, session_id,
+                                    request_id, stream, progress)) {
+            std::cerr << "failed to write metrics\n";
+            return 1;
+        }
+        if (cleanup_failed) {
             std::cerr << "failed to release inference state\n";
             return 1;
         }
@@ -307,11 +373,8 @@ run_repl(model_runner& runner,
                               : "generation failed\n");
             continue;
         }
-
-        if (!stream)
-            std::cout << "qwen> " << response->text << '\n';
-        print_performance(*response);
-        history.push_back({ "assistant", std::move(response->text) });
+        print_performance(metrics);
+        history.push_back({ "assistant", std::move(*response) });
     }
     return 0;
 }
