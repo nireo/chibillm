@@ -1139,6 +1139,175 @@ gated_delta_rule(device const float* qkv [[buffer(0)]],
     }
 }
 
+// A bounded 32-token block. Q/K normalization is shared by all value columns
+// and grouped value heads. The remaining kernels implement
+// D_i = beta_i (V_i - exp(G_i) K_i S_0)
+//       - sum_{j<i} beta_i exp(G_i-G_j) (K_i K_j^T) D_j,
+// O_i = exp(G_i) Q_i S_0 + sum_{j<=i} exp(G_i-G_j) (Q_i K_j^T) D_j.
+// Decays use sums over the actual interval, never division by exp(G_j), so
+// underflow / a complete state reset cannot introduce 0/0 or inf-inf.
+constant uint delta_block = 32;
+
+kernel void
+delta_prepare(device const float* qkv [[buffer(0)]],
+              device const float* a [[buffer(1)]],
+              device const float* b [[buffer(2)]],
+              device const float* logs [[buffer(3)]],
+              device const bf16_storage* bias [[buffer(4)]],
+              device float* qk [[buffer(9)]],
+              device float* gates [[buffer(10)]],
+              constant uint* g [[buffer(7)]],
+              constant float& epsilon [[buffer(8)]],
+              uint2 id [[thread_position_in_grid]])
+{
+    uint t = id.x, h = id.y;
+    uint n = g[0], kh = g[1], vh = g[2], kd = g[3], vd = g[4];
+    if (t >= n || h >= vh)
+        return;
+    uint kw = kh * kd, packed = 2 * kw + vh * vd;
+    if (h < kh) {
+        float qs = epsilon, ks = epsilon;
+        for (uint k = 0; k < kd; ++k) {
+            float q = qkv[ulong(t) * packed + h * kd + k];
+            float v = qkv[ulong(t) * packed + kw + h * kd + k];
+            qs += q * q;
+            ks += v * v;
+        }
+        float qscale = rsqrt(qs) * rsqrt(float(kd)), kscale = rsqrt(ks);
+        for (uint k = 0; k < kd; ++k) {
+            qk[ulong(t) * 2 * kw + h * kd + k] = qkv[ulong(t) * packed + h * kd + k] * qscale;
+            qk[ulong(t) * 2 * kw + kw + h * kd + k] =
+                qkv[ulong(t) * packed + kw + h * kd + k] * kscale;
+        }
+    }
+    float x = a[ulong(t) * vh + h] + load_bf16(bias[h]);
+    float tail = exp(-abs(x));
+    float softplus = max(x, 0.0F) + (tail < 1e-4F ? tail * (1.0F - 0.5F * tail) : log(1.0F + tail));
+    ulong base = (ulong(h) * delta_block + t) * 3;
+    gates[base] = -exp(logs[h]) * softplus;
+    gates[base + 1] = deltanet_sigmoid(b[ulong(t) * vh + h]);
+}
+
+kernel void
+delta_products(device const float* qk [[buffer(9)]],
+               device float* gates [[buffer(10)]],
+               device float* products [[buffer(11)]],
+               constant uint* g [[buffer(7)]],
+               uint3 id [[thread_position_in_grid]])
+{
+    uint i = id.x, j = id.y, h = id.z;
+    uint n = g[0], kh = g[1], vh = g[2], kd = g[3];
+    if (i >= n || j > i || h >= vh)
+        return;
+    uint kw = kh * kd, head = h / (vh / kh);
+    ulong gi = (ulong(h) * delta_block + i) * 3;
+    if (j == 0) {
+        float prefix = 0;
+        for (uint t = 0; t <= i; ++t)
+            prefix += gates[(ulong(h) * delta_block + t) * 3];
+        gates[gi + 2] = exp(prefix);
+    }
+    float interval = 0;
+    for (uint t = j + 1; t <= i; ++t)
+        interval += gates[(ulong(h) * delta_block + t) * 3];
+    float decay = exp(interval), kk = 0, qk_dot = 0;
+    for (uint k = 0; k < kd; ++k) {
+        float kj = qk[ulong(j) * 2 * kw + kw + head * kd + k];
+        kk += qk[ulong(i) * 2 * kw + kw + head * kd + k] * kj;
+        qk_dot += qk[ulong(i) * 2 * kw + head * kd + k] * kj;
+    }
+    ulong p = ((ulong(h) * delta_block + i) * delta_block + j) * 3;
+    products[p] = kk * decay * gates[gi + 1];
+    products[p + 1] = qk_dot * decay;
+    products[p + 2] = decay;
+}
+
+// Parallel matrix products K S_0 and Q S_0; state remains read-only here.
+kernel void
+delta_project(device const float* qkv [[buffer(0)]],
+              device const float* state [[buffer(5)]],
+              device const float* qk [[buffer(9)]],
+              device const float* gates [[buffer(10)]],
+              device float* work [[buffer(12)]],
+              constant uint* g [[buffer(7)]],
+              uint2 id [[thread_position_in_grid]])
+{
+    uint c = id.x, t = id.y;
+    uint n = g[0], kh = g[1], vh = g[2], kd = g[3], vd = g[4];
+    if (c >= vh * vd || t >= n)
+        return;
+    uint h = c / vd, v = c % vd, kw = kh * kd, head = h / (vh / kh);
+    float ks = 0, qs = 0;
+    for (uint k = 0; k < kd; ++k) {
+        float s = state[(ulong(h) * kd + k) * vd + v];
+        ks += qk[ulong(t) * 2 * kw + kw + head * kd + k] * s;
+        qs += qk[ulong(t) * 2 * kw + head * kd + k] * s;
+    }
+    ulong gate = (ulong(h) * delta_block + t) * 3;
+    ulong w = ((ulong(h) * delta_block + t) * vd + v) * 3;
+    float value = qkv[ulong(t) * (2 * kw + vh * vd) + 2 * kw + c];
+    work[w] = gates[gate + 1] * (value - gates[gate + 2] * ks);
+    work[w + 1] = gates[gate + 2] * qs;
+}
+
+// Only the small unit-lower-triangular solve remains sequential, independently
+// for each value column. All key-dimension products are outside this scan.
+kernel void
+delta_solve(device const float* products [[buffer(11)]],
+            device float* work [[buffer(12)]],
+            constant uint* g [[buffer(7)]],
+            uint c [[thread_position_in_grid]])
+{
+    uint n = g[0], vh = g[2], vd = g[4];
+    if (c >= vh * vd)
+        return;
+    uint h = c / vd, v = c % vd;
+    float d[32];
+    for (uint i = 0; i < n; ++i) {
+        ulong w = ((ulong(h) * delta_block + i) * vd + v) * 3;
+        float value = work[w];
+        for (uint j = 0; j < i; ++j)
+            value -= products[((ulong(h) * delta_block + i) * delta_block + j) * 3] * d[j];
+        d[i] = value;
+        work[w + 2] = value;
+    }
+}
+
+// Parallel output matrix product and one state update per block. Output uses
+// saved Q S_0, so it never races the state writes in this dispatch.
+kernel void
+delta_finish(device float* state [[buffer(5)]],
+             device float* output [[buffer(6)]],
+             device const float* qk [[buffer(9)]],
+             device const float* gates [[buffer(10)]],
+             device const float* products [[buffer(11)]],
+             device const float* work [[buffer(12)]],
+             constant uint* g [[buffer(7)]],
+             uint2 id [[thread_position_in_grid]])
+{
+    uint c = id.x, i = id.y;
+    uint n = g[0], kh = g[1], vh = g[2], kd = g[3], vd = g[4];
+    if (c >= vh * vd)
+        return;
+    uint h = c / vd, v = c % vd, kw = kh * kd, head = h / (vh / kh);
+    if (i < n) {
+        float o = work[((ulong(h) * delta_block + i) * vd + v) * 3 + 1];
+        for (uint j = 0; j <= i; ++j)
+            o += products[((ulong(h) * delta_block + i) * delta_block + j) * 3 + 1]
+                * work[((ulong(h) * delta_block + j) * vd + v) * 3 + 2];
+        output[ulong(i) * vh * vd + c] = o;
+    }
+    if (i < kd) {
+        ulong s = (ulong(h) * kd + i) * vd + v;
+        float updated = gates[(ulong(h) * delta_block + n - 1) * 3 + 2] * state[s];
+        for (uint j = 0; j < n; ++j)
+            updated += qk[ulong(j) * 2 * kw + kw + head * kd + i]
+                * products[((ulong(h) * delta_block + n - 1) * delta_block + j) * 3 + 2]
+                * work[((ulong(h) * delta_block + j) * vd + v) * 3 + 2];
+        state[s] = updated;
+    }
+}
+
 kernel void
 rms_norm_gated(device const float* input [[buffer(0)]],
                device const float* gate [[buffer(1)]],

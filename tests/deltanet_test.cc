@@ -116,7 +116,9 @@ delta_reference(const std::vector<float>& qkv,
                 k[j] /= std::sqrt(knorm);
             }
             const double x = double(a[t * vh + h]) + bias[h];
-            const double decay = std::exp(-std::exp(double(logs[h])) * std::log1p(std::exp(x)));
+            const double decay =
+                std::exp(-std::exp(double(logs[h]))
+                         * (std::max(x, 0.0) + std::log1p(std::exp(-std::abs(x)))));
             const double beta = 1 / (1 + std::exp(-double(b[t * vh + h])));
             const auto base = h * kd * vd;
             for (std::size_t j = 0; j < kd * vd; ++j)
@@ -225,6 +227,116 @@ TEST_CASE(
         }
         near(state, expected_state);
     }
+}
+
+TEST_CASE("DeltaNet chunkwise prefill matches CPU and sequential GPU including continuation")
+{
+    auto made = metal_context::make(load_shader_source());
+    REQUIRE(made);
+    auto& context = *made;
+    for (const std::size_t kd : { 3, 128 }) {
+        for (const std::size_t count : { 31, 32, 33, 65, 129, 512 }) {
+            CAPTURE(kd);
+            CAPTURE(count);
+            constexpr std::size_t kh = 2, vh = 4, offset = 2;
+            const std::size_t vd = kd == 3 ? 5 : 128;
+            const auto rows = count + offset + 1, width = 2 * kh * kd + vh * vd;
+            auto packed = values(rows * width);
+            if (count == 512) {
+                // Deterministic broad-spectrum inputs in addition to the
+                // strongly correlated sinusoidal cases above.
+                std::uint32_t seed = 42;
+                for (auto& value : packed) {
+                    seed = seed * 1664525U + 1013904223U;
+                    value = float(seed >> 8) / 8388608.0F - 1.0F;
+                }
+            }
+            // Exercise zeros, nearly-collinear keys, and extreme decay/beta.
+            std::fill(packed.begin() + offset * width,
+                      packed.begin() + offset * width + 2 * kh * kd, 0);
+            auto av = values(rows * vh, 1), bv = values(rows * vh, 2);
+            av[(offset + 17) * vh] = 1000;
+            av[(offset + 18) * vh + 1] = -100;
+            bv[(offset + 19) * vh] = 100;
+            bv[(offset + 19) * vh + 1] = -100;
+            const std::vector<float> lv { -6, -2, 0, 2 };
+            const auto biasv = round_bf16(values(vh, 4));
+            const auto initial =
+                count == 33 ? std::vector<float>(vh * kd * vd, 0) : values(vh * kd * vd, 5);
+            auto cpu_state = initial;
+            const auto expected =
+                delta_reference(slice(packed, offset * width, (offset + count + 1) * width),
+                                slice(av, offset * vh, (offset + count + 1) * vh),
+                                slice(bv, offset * vh, (offset + count + 1) * vh), lv, biasv,
+                                cpu_state, count + 1, kh, vh, kd, vd);
+            auto qkv = f32(context, { rows, width }, packed);
+            auto a = f32(context, { rows, vh }, av), b = f32(context, { rows, vh }, bv);
+            auto logs = f32(context, { vh }, lv);
+            auto bias = make_tensor(context, dtype::bf16, { vh });
+            write_bf16(bias, biasv);
+            auto state = f32(context, { vh, kd, vd }, initial);
+            auto reference_state = f32(context, { vh, kd, vd }, initial);
+            std::vector<float> sentinels(rows * vh * vd, -123);
+            auto output = f32(context, { rows, vh * vd }, sentinels);
+            auto reference_output = f32(context, { rows, vh * vd }, sentinels);
+            compute_pass pass(context);
+            REQUIRE(pass.begin());
+            REQUIRE(gated_delta_rule(context, qkv, a, b, logs, bias, kh, state, output, 1e-6F,
+                                     deltanet_chunk { offset, count }));
+            REQUIRE(metal_kernels(context).dispatch_gated_delta_rule(
+                qkv.buffer(), a.buffer(), b.buffer(), logs.buffer(), bias.buffer(),
+                reference_state.buffer(), reference_output.buffer(), count, kh, vh, kd, vd, 1e-6F,
+                offset, false));
+            REQUIRE(pass.finish());
+            near(state, read_floats(reference_state));
+            near(output, read_floats(reference_output));
+            // The untouched suffix becomes a single-token decode using the
+            // state returned by prefill, in a later command buffer.
+            REQUIRE(gated_delta_rule(context, qkv, a, b, logs, bias, kh, state, output, 1e-6F,
+                                     deltanet_chunk { offset + count, 1 }));
+            std::copy(expected.begin(), expected.end(), sentinels.begin() + offset * vh * vd);
+            near(output, sentinels);
+            near(state, cpu_state);
+        }
+    }
+}
+
+TEST_CASE("DeltaNet chunkwise prefill composes across independent states and scratch reuse")
+{
+    auto made = metal_context::make(load_shader_source());
+    REQUIRE(made);
+    auto& context = *made;
+    constexpr std::size_t rows = 160, kh = 1, vh = 2, kd = 7, vd = 9;
+    constexpr std::size_t width = 2 * kh * kd + vh * vd;
+    auto qkv = f32(context, { rows, width }, values(rows * width));
+    auto a = f32(context, { rows, vh }, values(rows * vh, 1));
+    auto b = f32(context, { rows, vh }, values(rows * vh, 2));
+    auto logs = f32(context, { vh }, { -4, -1 });
+    auto bias = make_tensor(context, dtype::bf16, { vh });
+    write_bf16(bias, { 0, 0 });
+    auto initial = values(vh * kd * vd, 3);
+    auto state = f32(context, { vh, kd, vd }, initial);
+    auto other = f32(context, { vh, kd, vd }, initial);
+    auto reference = f32(context, { vh, kd, vd }, initial);
+    auto out = f32(context, { rows, vh * vd }, std::vector<float>(rows * vh * vd, -123));
+    auto other_out = f32(context, { rows, vh * vd }, read_floats(out));
+    auto expected = f32(context, { rows, vh * vd }, read_floats(out));
+    REQUIRE(metal_kernels(context).dispatch_gated_delta_rule(
+        qkv.buffer(), a.buffer(), b.buffer(), logs.buffer(), bias.buffer(), reference.buffer(),
+        expected.buffer(), 130, kh, vh, kd, vd, 1e-6F, 1, false));
+    compute_pass pass(context);
+    REQUIRE(pass.begin());
+    REQUIRE(gated_delta_rule(context, qkv, a, b, logs, bias, kh, state, out, 1e-6F,
+                             deltanet_chunk { 1, 65 }));
+    REQUIRE(gated_delta_rule(context, qkv, a, b, logs, bias, kh, other, other_out, 1e-6F,
+                             deltanet_chunk { 1, 130 }));
+    REQUIRE(gated_delta_rule(context, qkv, a, b, logs, bias, kh, state, out, 1e-6F,
+                             deltanet_chunk { 66, 65 }));
+    REQUIRE(pass.finish());
+    near(state, read_floats(reference));
+    near(other, read_floats(reference));
+    near(out, read_floats(expected));
+    near(other_out, read_floats(expected));
 }
 
 TEST_CASE("DeltaNet kernels compose within one compute pass with separate sequence states")

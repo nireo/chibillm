@@ -142,6 +142,8 @@ public:
                                 std::size_t kernel,
                                 std::size_t row_offset = 0) const;
 
+    // Automatic chunkwise prefill; use_chunkwise=false retains the original
+    // sequential GPU scan for correctness and performance comparisons.
     [[nodiscard]] result<void, metal_error>
     dispatch_gated_delta_rule(const metal_buffer& qkv,
                               const metal_buffer& a,
@@ -156,7 +158,8 @@ public:
                               std::size_t key_dim,
                               std::size_t value_dim,
                               float epsilon,
-                              std::size_t row_offset = 0) const;
+                              std::size_t row_offset = 0,
+                              bool use_chunkwise = true) const;
 
     [[nodiscard]] result<void, metal_error> dispatch_rms_norm_gated(const metal_buffer& input,
                                                                     const metal_buffer& gate,

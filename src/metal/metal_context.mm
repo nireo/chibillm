@@ -301,6 +301,16 @@ metal_context::make(std::string_view shader_source)
 
         CL_TRY_ASSIGN(implementation->causal_conv1d_silu_pipeline,
                       make_compute_pipeline(device, library, @"causal_conv1d_silu"));
+        CL_TRY_ASSIGN(implementation->delta_prepare_pipeline,
+                      make_compute_pipeline(device, library, @"delta_prepare"));
+        CL_TRY_ASSIGN(implementation->delta_products_pipeline,
+                      make_compute_pipeline(device, library, @"delta_products"));
+        CL_TRY_ASSIGN(implementation->delta_project_pipeline,
+                      make_compute_pipeline(device, library, @"delta_project"));
+        CL_TRY_ASSIGN(implementation->delta_solve_pipeline,
+                      make_compute_pipeline(device, library, @"delta_solve"));
+        CL_TRY_ASSIGN(implementation->delta_finish_pipeline,
+                      make_compute_pipeline(device, library, @"delta_finish"));
         CL_TRY_ASSIGN(implementation->gated_delta_rule_pipeline,
                       make_compute_pipeline(device, library, @"gated_delta_rule"));
         CL_TRY_ASSIGN(implementation->rms_norm_gated_pipeline,
@@ -311,6 +321,8 @@ metal_context::make(std::string_view shader_source)
         implementation->command_queue = command_queue;
         implementation->shader_library = library;
         implementation->device_name = device_name == nullptr ? "unknown Metal device" : device_name;
+        implementation->chunkwise_delta_enabled =
+            !environment_flag("CHIBILLM_DISABLE_CHUNKWISE_DELTA");
         implementation->profiling_enabled = environment_flag("CHIBILLM_PROFILE");
         implementation->tensorops_enabled = implementation->linear_bf16_tensorops_pipeline != nil
             && !environment_flag("CHIBILLM_DISABLE_TENSOROPS");

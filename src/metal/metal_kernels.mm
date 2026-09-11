@@ -1010,7 +1010,8 @@ metal_kernels::dispatch_gated_delta_rule(const metal_buffer& qkv,
                                          std::size_t key_dim,
                                          std::size_t value_dim,
                                          float epsilon,
-                                         std::size_t row_offset) const
+                                         std::size_t row_offset,
+                                         bool use_chunkwise) const
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
@@ -1037,6 +1038,78 @@ metal_kernels::dispatch_gated_delta_rule(const metal_buffer& qkv,
             || !f32_rows_fit(b, row_offset, rows, value_heads)
             || !f32_rows_fit(output, row_offset, rows, value_width))
             return fail(make_error(metal_errc::invalid_input, "DeltaNet row range exceeds buffer"));
+        // Allocate bounded scratch before encoding any state mutation. Metal's
+        // serial compute encoder orders dispatches, including scratch reuse in
+        // successive blocks; arena buffers stay alive until the pass completes.
+        constexpr std::size_t block = 32;
+        if (use_chunkwise && implementation_->chunkwise_delta_enabled && rows >= block) {
+            auto normalized =
+                context_.make_shared_buffer(block * 2 * key_heads * key_dim * sizeof(float));
+            if (!normalized)
+                return fail(normalized.error());
+            auto gates = context_.make_shared_buffer(block * value_heads * 3 * sizeof(float));
+            if (!gates)
+                return fail(gates.error());
+            auto products =
+                context_.make_shared_buffer(block * block * value_heads * 3 * sizeof(float));
+            if (!products)
+                return fail(products.error());
+            auto work = context_.make_shared_buffer(block * value_width * 3 * sizeof(float));
+            if (!work)
+                return fail(work.error());
+            auto opened = implementation_->open_dispatch_encoder();
+            if (!opened)
+                return fail(opened.error());
+            id<MTLComputeCommandEncoder> encoder = opened->encoder;
+            [encoder setBuffer:A_log.implementation_->buffer offset:0 atIndex:3];
+            [encoder setBuffer:dt_bias.implementation_->buffer offset:0 atIndex:4];
+            [encoder setBuffer:state.implementation_->buffer offset:0 atIndex:5];
+            [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:8];
+            [encoder setBuffer:normalized->implementation_->buffer offset:0 atIndex:9];
+            [encoder setBuffer:gates->implementation_->buffer offset:0 atIndex:10];
+            [encoder setBuffer:products->implementation_->buffer offset:0 atIndex:11];
+            [encoder setBuffer:work->implementation_->buffer offset:0 atIndex:12];
+            for (std::size_t begin = 0; begin < rows; begin += block) {
+                const auto count = std::min(block, rows - begin);
+                const auto offset = row_offset + begin;
+                const std::uint32_t geometry[] = { static_cast<std::uint32_t>(count),
+                                                   static_cast<std::uint32_t>(key_heads),
+                                                   static_cast<std::uint32_t>(value_heads),
+                                                   static_cast<std::uint32_t>(key_dim),
+                                                   static_cast<std::uint32_t>(value_dim) };
+                [encoder setBytes:geometry length:sizeof(geometry) atIndex:7];
+                [encoder setBuffer:qkv.implementation_->buffer
+                            offset:offset * qkv_width * sizeof(float)
+                           atIndex:0];
+                [encoder setBuffer:a.implementation_->buffer
+                            offset:offset * value_heads * sizeof(float)
+                           atIndex:1];
+                [encoder setBuffer:b.implementation_->buffer
+                            offset:offset * value_heads * sizeof(float)
+                           atIndex:2];
+                [encoder setBuffer:output.implementation_->buffer
+                            offset:offset * value_width * sizeof(float)
+                           atIndex:6];
+                auto dispatch = [&](id<MTLComputePipelineState> pipeline, MTLSize grid,
+                                    MTLSize threads) {
+                    [encoder setComputePipelineState:pipeline];
+                    [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+                };
+                dispatch(implementation_->delta_prepare_pipeline,
+                         MTLSizeMake(count, value_heads, 1), MTLSizeMake(32, 1, 1));
+                dispatch(implementation_->delta_products_pipeline,
+                         MTLSizeMake(count, count, value_heads), MTLSizeMake(8, 8, 1));
+                dispatch(implementation_->delta_project_pipeline,
+                         MTLSizeMake(value_width, count, 1), MTLSizeMake(32, 4, 1));
+                dispatch(implementation_->delta_solve_pipeline, MTLSizeMake(value_width, 1, 1),
+                         MTLSizeMake(128, 1, 1));
+                dispatch(implementation_->delta_finish_pipeline,
+                         MTLSizeMake(value_width, std::max(count, key_dim), 1),
+                         MTLSizeMake(32, 4, 1));
+            }
+            return implementation_->complete_dispatch_encoder(*opened,
+                                                              "gated_delta_rule_chunkwise");
+        }
         const auto qkv_offset_bytes = row_offset * qkv_width * sizeof(float);
         const auto gate_offset_bytes = row_offset * value_heads * sizeof(float);
         const auto output_offset_bytes = row_offset * value_width * sizeof(float);

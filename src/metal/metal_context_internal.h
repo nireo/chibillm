@@ -119,6 +119,12 @@ struct metal_context::implementation {
     id<MTLComputePipelineState> rms_norm_bf16_pipeline;
     id<MTLComputePipelineState> causal_conv1d_silu_pipeline;
     id<MTLComputePipelineState> gated_delta_rule_pipeline;
+    id<MTLComputePipelineState> delta_prepare_pipeline;
+    id<MTLComputePipelineState> delta_products_pipeline;
+    id<MTLComputePipelineState> delta_project_pipeline;
+    id<MTLComputePipelineState> delta_solve_pipeline;
+    id<MTLComputePipelineState> delta_finish_pipeline;
+
     id<MTLComputePipelineState> rms_norm_gated_pipeline;
     id<MTLComputePipelineState> gather_rows_f32_pipeline;
     id<MTLComputePipelineState> linear_bf16_partial_argmax_pipeline;
@@ -141,6 +147,7 @@ struct metal_context::implementation {
     bool profiling_enabled = false;
     bool tensorops_enabled = false;
     bool flash_attention_enabled = false;
+    bool chunkwise_delta_enabled = true;
     std::map<std::string, profile_stats> profile;
     std::mutex rope_frequency_mutex;
     std::map<std::pair<std::uint32_t, std::uint32_t>, id<MTLBuffer>> rope_frequency_buffers;

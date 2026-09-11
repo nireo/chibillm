@@ -40,8 +40,9 @@ causal_conv1d_silu(const metal_context& context,
 // g = -exp(A_log) * softplus(a + dt_bias).
 // state: f32 [value_heads, key_dim, value_dim], updated in place by
 // S *= exp(g); S += k outer (beta * (v - k^T S)); output = q^T S.
-// output: f32 [tokens, value_heads * value_dim]. A sequential scan supports
-// decode and arbitrary prefill chunks; this is not a parallel prefill kernel.
+// output: f32 [tokens, value_heads * value_dim]. Prefill of at least 32 tokens
+// uses chunkwise matrix products and a triangular solve with bounded scratch.
+// Short scans (including decode) use the original sequential reference kernel.
 [[nodiscard]] result<void, tensor_op_errc>
 gated_delta_rule(const metal_context& context,
                  const metal_tensor& qkv,
