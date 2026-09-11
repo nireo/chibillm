@@ -10,31 +10,31 @@
 
 namespace chibillm {
 namespace {
-    result<tensor_descriptor, state_errc>
-    f32_descriptor(std::vector<std::size_t> dimensions)
-    {
-        auto shape = tensor_shape::make(std::move(dimensions));
-        if (!shape)
-            return fail(state_errc::invalid_reservation);
-        auto descriptor = tensor_descriptor::make(dtype::f32, std::move(*shape));
-        if (!descriptor)
-            return fail(state_errc::invalid_reservation);
-        return std::move(*descriptor);
-    }
+result<tensor_descriptor, state_errc>
+f32_descriptor(std::vector<std::size_t> dimensions)
+{
+    auto shape = tensor_shape::make(std::move(dimensions));
+    if (!shape)
+        return fail(state_errc::invalid_reservation);
+    auto descriptor = tensor_descriptor::make(dtype::f32, std::move(*shape));
+    if (!descriptor)
+        return fail(state_errc::invalid_reservation);
+    return std::move(*descriptor);
+}
 
-    void
-    zero(metal_tensor& tensor)
-    {
-        auto bytes = tensor.buffer().bytes();
-        std::fill(bytes.begin(), bytes.end(), std::byte { 0 });
-    }
+void
+zero(metal_tensor& tensor)
+{
+    auto bytes = tensor.buffer().bytes();
+    std::fill(bytes.begin(), bytes.end(), std::byte { 0 });
+}
 } // namespace
 
 result<std::unique_ptr<qwen3_5_model_state>, state_errc>
 qwen3_5_model_state::make(const metal_context& context,
-    const qwen3_5_config& config,
-    std::size_t block_count,
-    std::size_t block_size)
+                          const qwen3_5_config& config,
+                          std::size_t block_count,
+                          std::size_t block_size)
 try {
     if (!config.layer_count
         || config.layer_types.size() != config.layer_count
@@ -74,8 +74,9 @@ try {
     if (kw > (max - vw) / 2)
         return fail(state_errc::invalid_reservation);
     auto convolution = f32_descriptor({ 2 * kw + vw, config.linear_conv_kernel_dimension });
-    auto recurrent = f32_descriptor({ config.linear_value_head_count, config.linear_key_head_dimension,
-        config.linear_value_head_dimension });
+    auto recurrent =
+        f32_descriptor({ config.linear_value_head_count, config.linear_key_head_dimension,
+                         config.linear_value_head_dimension });
 
     if (!convolution || !recurrent)
         return fail(state_errc::invalid_reservation);
@@ -90,22 +91,22 @@ try {
 
     if (!cache)
         return fail(cache.error() == kv_cache_errc::allocation_failed
-                ? state_errc::backend_failure
-                : state_errc::invalid_reservation);
+                        ? state_errc::backend_failure
+                        : state_errc::invalid_reservation);
 
     return std::unique_ptr<qwen3_5_model_state>(
         new qwen3_5_model_state(context, config, std::move(*pages), std::move(*cache),
-            std::move(*convolution), std::move(*recurrent)));
+                                std::move(*convolution), std::move(*recurrent)));
 } catch (const std::bad_alloc&) {
     return fail(state_errc::backend_failure);
 }
 
 qwen3_5_model_state::qwen3_5_model_state(const metal_context& context,
-    qwen3_5_config config,
-    block_manager pages,
-    metal_kv_cache cache,
-    tensor_descriptor convolution,
-    tensor_descriptor recurrent)
+                                         qwen3_5_config config,
+                                         block_manager pages,
+                                         metal_kv_cache cache,
+                                         tensor_descriptor convolution,
+                                         tensor_descriptor recurrent)
     : context_(context)
     , config_(std::move(config))
     , pages_(std::move(pages))
@@ -167,7 +168,7 @@ qwen3_5_model_state::reserve(seq_id id, std::size_t tokens)
         }
 
         found->second.reserved_tokens = tokens;
-        return { };
+        return {};
     } catch (const std::bad_alloc&) {
         if (!exists) {
             sequences_.erase(id);
@@ -178,7 +179,8 @@ qwen3_5_model_state::reserve(seq_id id, std::size_t tokens)
     }
 }
 
-void qwen3_5_model_state::release(seq_id id) noexcept
+void
+qwen3_5_model_state::release(seq_id id) noexcept
 {
     assert(!batch_open_);
     if (batch_open_)
@@ -206,7 +208,7 @@ try {
     if (batch_open_ || (batch.phase != batch_phase::prefill && batch.phase != batch_phase::decode))
         return fail(state_errc::invalid_reservation);
     if (!prepare_paged_batch(batch, config_.max_position_embeddings, cache_.block_count(),
-            block_size()))
+                             block_size()))
         return fail(state_errc::invalid_reservation);
     std::unordered_set<seq_id> seen;
     // Validate all sequences before copying state. Recurrent updates must append
@@ -233,7 +235,7 @@ try {
     snapshots.reserve(batch.items.size());
     for (const auto& item : batch.items) {
         const auto& sequence = sequences_.at(item.id);
-        sequence_snapshot snapshot { item.id, sequence.committed_tokens + item.token_count, { } };
+        sequence_snapshot snapshot { item.id, sequence.committed_tokens + item.token_count, {} };
         snapshot.layers.reserve(linear_count_);
 
         for (const auto& layer : sequence.layers) {
@@ -247,12 +249,13 @@ try {
 
     snapshots_ = std::move(snapshots);
     batch_open_ = true;
-    return { };
+    return {};
 } catch (const std::bad_alloc&) {
     return fail(state_errc::backend_failure);
 }
 
-void qwen3_5_model_state::commit_batch() noexcept
+void
+qwen3_5_model_state::commit_batch() noexcept
 {
     if (!batch_open_)
         return;
@@ -262,7 +265,8 @@ void qwen3_5_model_state::commit_batch() noexcept
     batch_open_ = false;
 }
 
-void qwen3_5_model_state::abort_batch() noexcept
+void
+qwen3_5_model_state::abort_batch() noexcept
 {
     if (!batch_open_)
         return;
@@ -273,9 +277,9 @@ void qwen3_5_model_state::abort_batch() noexcept
             const auto& saved = snapshot.layers[layer];
             auto& target = sequence.layers[layer];
             std::memcpy(target.convolution.buffer().bytes().data(), saved.convolution.data(),
-                saved.convolution.size());
+                        saved.convolution.size());
             std::memcpy(target.recurrent.buffer().bytes().data(), saved.recurrent.data(),
-                saved.recurrent.size());
+                        saved.recurrent.size());
         }
     }
 

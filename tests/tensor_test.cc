@@ -1,6 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "metal_test_support.h"
 #include <bit>
 #include <cmath>
 #include <cstddef>
@@ -11,7 +12,6 @@
 #include <string>
 #include <type_traits>
 #include <utility>
-#include "metal_test_support.h"
 
 #include "tensor/tensor_descriptor.h"
 #include "tensor/tensor_shape.h"

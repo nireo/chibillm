@@ -7,26 +7,26 @@
 
 namespace chibillm {
 namespace {
-    bool
-    shape_is(const metal_tensor& tensor, std::initializer_list<std::size_t> dimensions)
-    {
-        const auto actual = tensor.descriptor().shape().dimensions();
-        return std::ranges::equal(actual, dimensions);
-    }
+bool
+shape_is(const metal_tensor& tensor, std::initializer_list<std::size_t> dimensions)
+{
+    const auto actual = tensor.descriptor().shape().dimensions();
+    return std::ranges::equal(actual, dimensions);
+}
 
-    bool
-    aliases(const metal_tensor& writable, std::initializer_list<const metal_tensor*> tensors)
-    {
-        return std::ranges::any_of(
-            tensors, [&](const auto* tensor) { return &writable.buffer() == &tensor->buffer(); });
-    }
+bool
+aliases(const metal_tensor& writable, std::initializer_list<const metal_tensor*> tensors)
+{
+    return std::ranges::any_of(
+        tensors, [&](const auto* tensor) { return &writable.buffer() == &tensor->buffer(); });
+}
 
-    bool
-    all_f32(std::initializer_list<const metal_tensor*> tensors)
-    {
-        return std::ranges::all_of(
-            tensors, [](const auto* tensor) { return tensor->descriptor().type() == dtype::f32; });
-    }
+bool
+all_f32(std::initializer_list<const metal_tensor*> tensors)
+{
+    return std::ranges::all_of(
+        tensors, [](const auto* tensor) { return tensor->descriptor().type() == dtype::f32; });
+}
 } // namespace
 
 result<void, tensor_op_errc>
@@ -66,7 +66,7 @@ causal_conv1d_silu(const metal_context& context,
             kernel, scan.offset))
         return fail(tensor_op_errc::backend_failure);
 
-    return { };
+    return {};
 }
 
 result<void, tensor_op_errc>
@@ -132,16 +132,16 @@ gated_delta_rule(const metal_context& context,
             scan.offset))
         return fail(tensor_op_errc::backend_failure);
 
-    return { };
+    return {};
 }
 
 result<void, tensor_op_errc>
 rms_norm_gated(const metal_context& context,
-    const metal_tensor& input,
-    const metal_tensor& gate,
-    const metal_tensor& weight,
-    float epsilon,
-    metal_tensor& output)
+               const metal_tensor& input,
+               const metal_tensor& gate,
+               const metal_tensor& weight,
+               float epsilon,
+               metal_tensor& output)
 {
     if (input.descriptor().shape().rank() != 2
         || gate.descriptor().shape().rank() != 2
@@ -171,6 +171,6 @@ rms_norm_gated(const metal_context& context,
             input.descriptor().element_count() / width, width, epsilon))
         return fail(tensor_op_errc::backend_failure);
 
-    return { };
+    return {};
 }
 } // namespace chibillm

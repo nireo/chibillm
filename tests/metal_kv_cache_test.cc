@@ -98,4 +98,3 @@ TEST_CASE("metal kv cache flattens coordinates in layout order and rejects inval
     CHECK(cache->element_offset(0, 0, 0, 2, 0).error() == kv_cache_errc::kv_head_out_of_range);
     CHECK(cache->element_offset(0, 0, 0, 0, 8).error() == kv_cache_errc::head_feature_out_of_range);
 }
-
