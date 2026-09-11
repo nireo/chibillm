@@ -12,10 +12,12 @@ namespace chibillm {
 struct cli_options {
     static constexpr std::size_t kv_block_size = 16;
 
-    std::filesystem::path model_directory { "qwen_model" };
+    std::filesystem::path model_directory { "qwen3_5_model" };
     std::size_t context_length { 32768 };
     std::size_t max_tokens { 8192 };
     bool serve { false };
+    bool stream { true };
+    bool progress { true };
     bool help { false };
 };
 

@@ -158,6 +158,7 @@ test_args = [
 
 foreach spec : [
   {'name': 'unit', 'sources': ['tests/seq_test.cc', 'tests/block_manager_test.cc'], 'library': chibillm_core},
+  {'name': 'repl', 'sources': ['tests/repl_test.cc', 'src/repl.cc', 'src/cli_options.cc'], 'library': chibillm_core},
   {'name': 'scheduler', 'sources': ['tests/scheduler_test.cc'], 'library': chibillm_core},
   {'name': 'model batch', 'sources': ['tests/model_batch_test.cc'], 'library': chibillm_core},
   {'name': 'inference engine', 'sources': ['tests/inference_engine_test.cc', 'tests/fake_model_runner.cc'], 'library': chibillm_core},

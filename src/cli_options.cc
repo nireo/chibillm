@@ -13,6 +13,8 @@ print_usage(std::ostream& output)
               "  --context-length N  Prompt + output capacity (default: 32768; multiple of 16)\n"
               "  --max-tokens N      Reply limit / server default (default: 8192)\n"
               "  --serve             Start the HTTP server on 127.0.0.1:8000\n"
+              "  --no-stream         Print REPL replies only when complete\n"
+              "  --progress=auto|off  REPL prefill progress on terminals (default: auto)\n"
               "  --help              Show this help\n";
 }
 
@@ -25,6 +27,10 @@ parse_cli_options(int argc, char** argv)
         const std::string_view arg(argv[i]);
         if (arg == "--help" || arg == "-h") {
             settings.help = true;
+        } else if (arg == "--no-stream") {
+            settings.stream = false;
+        } else if (arg == "--progress=auto" || arg == "--progress=off") {
+            settings.progress = arg == "--progress=auto";
         } else if (arg == "--serve") {
             settings.serve = true;
         } else if (arg == "--context-length" || arg == "--max-tokens") {

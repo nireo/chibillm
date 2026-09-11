@@ -112,7 +112,7 @@ run_application(const cli_options& settings, const std::filesystem::path& shader
                       .kv_block_count = kv_block_count,
                       .kv_block_size = kv_block_size,
                       .eos_token = (*runner)->info().eos_token },
-                    max_tokens);
+                    max_tokens, settings.stream, settings.progress);
 }
 
 } // namespace chibillm
