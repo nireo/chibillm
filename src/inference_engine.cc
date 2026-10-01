@@ -12,7 +12,7 @@ inference_engine::make(scheduler_config config, model_runner& runner)
     auto state = runner.make_state(config);
     if (!state)
         return fail(inference_engine_errc::scheduler_creation_failed);
-    auto scheduler_result = scheduler::make(config, std::move(*state));
+    auto scheduler_result = scheduler::make(config, runner.info().eos_token, std::move(*state));
     if (!scheduler_result) {
         return fail(inference_engine_errc::scheduler_creation_failed);
     }

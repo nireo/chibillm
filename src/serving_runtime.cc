@@ -16,15 +16,7 @@ public:
     static result<std::unique_ptr<implementation>, inference_engine_errc>
     make(model_runner& runner, const serving_config& config)
     {
-        auto engine = inference_engine::make(
-            {
-                .max_sequences = config.max_sequences,
-                .max_batch_tokens = config.max_batch_tokens,
-                .kv_block_count = config.kv_block_count,
-                .kv_block_size = config.kv_block_size,
-                .eos_token = runner.info().eos_token,
-            },
-            runner);
+        auto engine = inference_engine::make(config.scheduler, runner);
         if (!engine) {
             return fail(inference_engine_errc::scheduler_creation_failed);
         }
@@ -203,7 +195,7 @@ private:
     void
     admit_requests()
     {
-        while (active_.size() < config_.max_sequences && !pending_.empty()) {
+        while (active_.size() < config_.scheduler.max_sequences && !pending_.empty()) {
             auto request = std::move(pending_.front());
             pending_.pop_front();
             auto sequence = seq::make(request.state->id, std::move(request.prompt),

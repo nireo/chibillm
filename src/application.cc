@@ -28,17 +28,11 @@ load_text(const std::filesystem::path& path)
 }
 
 int
-run_server(model_runner& runner, std::size_t kv_block_count, std::size_t max_tokens)
+run_server(model_runner& runner, scheduler_config config, std::size_t max_tokens)
 {
     auto server = openai_server::make(runner,
                                       {
-                                          .host = "127.0.0.1",
-                                          .port = 8000,
-                                          .max_sequences = 4,
-                                          .max_pending_requests = 64,
-                                          .max_batch_tokens = 128,
-                                          .kv_block_count = kv_block_count,
-                                          .kv_block_size = cli_options::kv_block_size,
+                                          .runtime = { .scheduler = config },
                                           .default_max_completion_tokens = max_tokens,
                                       });
     if (!server) {
@@ -96,6 +90,11 @@ run_application(const cli_options& settings, const std::filesystem::path& shader
         return 1;
     }
     const auto kv_block_count = (context_length + kv_block_size - 1) / kv_block_size;
+    const scheduler_config config {
+        .max_sequences = settings.serve ? 4u : 1u,
+        .kv_block_count = kv_block_count,
+        .kv_block_size = kv_block_size,
+    };
     const auto max_tokens = std::min(settings.max_tokens, context_length - 1);
     const auto load_time =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - load_started).count();
@@ -112,15 +111,9 @@ run_application(const cli_options& settings, const std::filesystem::path& shader
         << max_tokens
         << " tok\n";
     if (settings.serve)
-        return run_server(**runner, kv_block_count, max_tokens);
+        return run_server(**runner, config, max_tokens);
 
-    return run_repl(**runner,
-                    { .max_sequences = 1,
-                      .max_batch_tokens = 128,
-                      .kv_block_count = kv_block_count,
-                      .kv_block_size = kv_block_size,
-                      .eos_token = (*runner)->info().eos_token },
-                    settings.max_tokens, settings.stream, settings.progress,
+    return run_repl(**runner, config, settings.max_tokens, settings.stream, settings.progress,
                     metrics_file.is_open() ? &metrics_file : nullptr);
 }
 

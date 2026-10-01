@@ -47,32 +47,30 @@ using namespace mpp::tensor_ops;
 // Apple10/M5 executes the matmul operation on each GPU core's neural accelerator.
 kernel void
 linear_bf16_tensorops(device float* input [[buffer(0)]],
-                      device bfloat* weight [[buffer(1)]],
-                      device float* output [[buffer(2)]],
-                      constant uint& rows [[buffer(3)]],
-                      constant uint& input_features [[buffer(4)]],
-                      constant uint& output_features [[buffer(5)]],
-                      uint2 threadgroup_position [[threadgroup_position_in_grid]])
+    device bfloat* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    constant uint& input_features [[buffer(4)]],
+    constant uint& output_features [[buffer(5)]],
+    uint2 threadgroup_position [[threadgroup_position_in_grid]])
 {
     constexpr int tile_size = 64;
     const int output_origin = int(threadgroup_position.x) * tile_size;
     const int row_origin = int(threadgroup_position.y) * tile_size;
 
     auto input_tensor = tensor(input, dextents<int, 2>(int(input_features), int(rows)));
-    auto weight_tensor =
-        tensor(weight, dextents<int, 2>(int(input_features), int(output_features)));
+    auto weight_tensor = tensor(weight, dextents<int, 2>(int(input_features), int(output_features)));
     auto output_tensor = tensor(output, dextents<int, 2>(int(output_features), int(rows)));
 
     // Weight storage is [output, input], hence transpose_right=true.
-    constexpr auto descriptor =
-        matmul2d_descriptor(tile_size, tile_size, dynamic_length_v<int>, false, true, false);
+    constexpr auto descriptor = matmul2d_descriptor(tile_size, tile_size, dynamic_length_v<int>, false, true, false);
     matmul2d<descriptor, execution_simdgroups<4>> operation;
 
     auto input_slice = input_tensor.slice(0, row_origin);
     auto weight_slice = weight_tensor.slice(0, output_origin);
     auto output_slice = output_tensor.slice(output_origin, row_origin);
     auto product = operation.get_destination_cooperative_tensor<decltype(input_slice),
-                                                                decltype(weight_slice), float>();
+        decltype(weight_slice), float>();
     operation.run(input_slice, weight_slice, product);
     product.store(output_slice);
 }
@@ -80,20 +78,20 @@ linear_bf16_tensorops(device float* input [[buffer(0)]],
 
 static inline float
 linear_bf16_decode_dot(device const float* input,
-                       device const bf16_storage* weight,
-                       uint input_features,
-                       uint weight_row,
-                       uint lane,
-                       uint simd_width)
+    device const bf16_storage* weight,
+    uint input_features,
+    uint weight_row,
+    uint lane,
+    uint simd_width)
 {
     float accumulator = 0.0F;
     const ulong weight_base = ulong(weight_row) * ulong(input_features);
     for (uint k = lane * 4; k + 3 < input_features; k += 4 * simd_width) {
         const float4 input_values = { input[k], input[k + 1], input[k + 2], input[k + 3] };
         const bf16x4_storage packed_values = { weight[weight_base + ulong(k)],
-                                               weight[weight_base + ulong(k + 1)],
-                                               weight[weight_base + ulong(k + 2)],
-                                               weight[weight_base + ulong(k + 3)] };
+            weight[weight_base + ulong(k + 1)],
+            weight[weight_base + ulong(k + 2)],
+            weight[weight_base + ulong(k + 3)] };
         const float4 weight_values = load_bf16x4(packed_values);
         accumulator += dot(input_values, weight_values);
     }
@@ -107,24 +105,23 @@ linear_bf16_decode_dot(device const float* input,
 
 kernel void
 linear_add_bf16_decode(device const float* input [[buffer(0)]],
-                       device const bf16_storage* weight [[buffer(1)]],
-                       device const float* residual [[buffer(2)]],
-                       device float* output [[buffer(3)]],
-                       constant uint& input_features [[buffer(4)]],
-                       constant uint& output_features [[buffer(5)]],
-                       constant uint& outputs_per_threadgroup [[buffer(6)]],
-                       constant uint& simd_width [[buffer(7)]],
-                       uint lane [[thread_index_in_simdgroup]],
-                       uint simdgroup [[simdgroup_index_in_threadgroup]],
-                       uint3 threadgroup_position [[threadgroup_position_in_grid]])
+    device const bf16_storage* weight [[buffer(1)]],
+    device const float* residual [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& input_features [[buffer(4)]],
+    constant uint& output_features [[buffer(5)]],
+    constant uint& outputs_per_threadgroup [[buffer(6)]],
+    constant uint& simd_width [[buffer(7)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]])
 {
     const uint output_feature = threadgroup_position.x * outputs_per_threadgroup + simdgroup;
     if (output_feature >= output_features) {
         return;
     }
 
-    const float accumulator =
-        linear_bf16_decode_dot(input, weight, input_features, output_feature, lane, simd_width);
+    const float accumulator = linear_bf16_decode_dot(input, weight, input_features, output_feature, lane, simd_width);
     if (lane == 0) {
         output[output_feature] = residual[output_feature] + accumulator;
     }
@@ -132,16 +129,16 @@ linear_add_bf16_decode(device const float* input [[buffer(0)]],
 
 kernel void
 linear_split_bf16(device const float* input [[buffer(0)]],
-                  device const bf16_storage* weight [[buffer(1)]],
-                  device float* output_a [[buffer(2)]],
-                  device float* output_b [[buffer(3)]],
-                  device float* output_c [[buffer(4)]],
-                  constant uint& rows [[buffer(5)]],
-                  constant uint& input_features [[buffer(6)]],
-                  constant uint& width_a [[buffer(7)]],
-                  constant uint& width_b [[buffer(8)]],
-                  constant uint& width_c [[buffer(9)]],
-                  uint2 position [[thread_position_in_grid]])
+    device const bf16_storage* weight [[buffer(1)]],
+    device float* output_a [[buffer(2)]],
+    device float* output_b [[buffer(3)]],
+    device float* output_c [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& input_features [[buffer(6)]],
+    constant uint& width_a [[buffer(7)]],
+    constant uint& width_b [[buffer(8)]],
+    constant uint& width_c [[buffer(9)]],
+    uint2 position [[thread_position_in_grid]])
 {
     const uint total_width = width_a + width_b + width_c;
     if (position.x >= total_width || position.y >= rows) {
@@ -181,19 +178,19 @@ linear_split_bf16(device const float* input [[buffer(0)]],
 
 kernel void
 linear_split_bf16_decode(device const float* input [[buffer(0)]],
-                         device const bf16_storage* weight [[buffer(1)]],
-                         device float* output_a [[buffer(2)]],
-                         device float* output_b [[buffer(3)]],
-                         device float* output_c [[buffer(4)]],
-                         constant uint& input_features [[buffer(5)]],
-                         constant uint& width_a [[buffer(6)]],
-                         constant uint& width_b [[buffer(7)]],
-                         constant uint& width_c [[buffer(8)]],
-                         constant uint& outputs_per_threadgroup [[buffer(9)]],
-                         constant uint& simd_width [[buffer(10)]],
-                         uint lane [[thread_index_in_simdgroup]],
-                         uint simdgroup [[simdgroup_index_in_threadgroup]],
-                         uint3 threadgroup_position [[threadgroup_position_in_grid]])
+    device const bf16_storage* weight [[buffer(1)]],
+    device float* output_a [[buffer(2)]],
+    device float* output_b [[buffer(3)]],
+    device float* output_c [[buffer(4)]],
+    constant uint& input_features [[buffer(5)]],
+    constant uint& width_a [[buffer(6)]],
+    constant uint& width_b [[buffer(7)]],
+    constant uint& width_c [[buffer(8)]],
+    constant uint& outputs_per_threadgroup [[buffer(9)]],
+    constant uint& simd_width [[buffer(10)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]])
 {
     const uint weight_row = threadgroup_position.x * outputs_per_threadgroup + simdgroup;
     const uint total_width = width_a + width_b + width_c;
@@ -201,8 +198,7 @@ linear_split_bf16_decode(device const float* input [[buffer(0)]],
         return;
     }
 
-    const float accumulator =
-        linear_bf16_decode_dot(input, weight, input_features, weight_row, lane, simd_width);
+    const float accumulator = linear_bf16_decode_dot(input, weight, input_features, weight_row, lane, simd_width);
     if (lane != 0) {
         return;
     }
@@ -217,11 +213,11 @@ linear_split_bf16_decode(device const float* input [[buffer(0)]],
 
 kernel void
 embedding_bf16(device const int* token_ids [[buffer(0)]],
-               device const bf16_storage* weight [[buffer(1)]],
-               device float* output [[buffer(2)]],
-               constant uint& token_count [[buffer(3)]],
-               constant uint& hidden_size [[buffer(4)]],
-               uint2 position [[thread_position_in_grid]])
+    device const bf16_storage* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& token_count [[buffer(3)]],
+    constant uint& hidden_size [[buffer(4)]],
+    uint2 position [[thread_position_in_grid]])
 {
     if (position.x >= hidden_size || position.y >= token_count) {
         return;
@@ -241,18 +237,18 @@ embedding_bf16(device const int* token_ids [[buffer(0)]],
 
 kernel void
 rms_norm_bf16(device const float* input [[buffer(0)]],
-              device const bf16_storage* weight [[buffer(1)]],
-              device float* output [[buffer(2)]],
-              constant uint& row_count [[buffer(3)]],
-              constant uint& hidden_size [[buffer(4)]],
-              constant float& epsilon [[buffer(5)]],
-              constant float& weight_offset [[buffer(6)]],
-              uint thread_index [[thread_index_in_threadgroup]],
-              uint lane [[thread_index_in_simdgroup]],
-              uint simdgroup [[simdgroup_index_in_threadgroup]],
-              uint simd_width [[threads_per_simdgroup]],
-              uint3 threadgroup_position [[threadgroup_position_in_grid]],
-              uint3 threads_per_threadgroup [[threads_per_threadgroup]])
+    device const bf16_storage* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& row_count [[buffer(3)]],
+    constant uint& hidden_size [[buffer(4)]],
+    constant float& epsilon [[buffer(5)]],
+    constant float& weight_offset [[buffer(6)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint simd_width [[threads_per_simdgroup]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    uint3 threads_per_threadgroup [[threads_per_threadgroup]])
 {
     const uint row = threadgroup_position.x;
     if (row >= row_count) {
@@ -304,36 +300,34 @@ struct argmax_pair {
 
 kernel void
 gather_rows_f32(device const float* input [[buffer(0)]],
-                device const uint* row_indices [[buffer(1)]],
-                device float* output [[buffer(2)]],
-                constant uint& hidden_size [[buffer(3)]],
-                uint2 position [[thread_position_in_grid]])
+    device const uint* row_indices [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& hidden_size [[buffer(3)]],
+    uint2 position [[thread_position_in_grid]])
 {
     if (position.x < hidden_size) {
-        output[ulong(position.y) * hidden_size + position.x] =
-            input[ulong(row_indices[position.y]) * hidden_size + position.x];
+        output[ulong(position.y) * hidden_size + position.x] = input[ulong(row_indices[position.y]) * hidden_size + position.x];
     }
 }
 
 kernel void
 linear_bf16_partial_argmax(device const float* input [[buffer(0)]],
-                           device const bf16_storage* weight [[buffer(1)]],
-                           device argmax_pair* partials [[buffer(2)]],
-                           constant uint& hidden_size [[buffer(3)]],
-                           constant uint& vocabulary_size [[buffer(4)]],
-                           constant uint& partial_count [[buffer(5)]],
-                           constant uint& outputs_per_simdgroup [[buffer(6)]],
-                           constant uint& simd_width [[buffer(7)]],
-                           uint thread_index [[thread_index_in_threadgroup]],
-                           uint lane [[thread_index_in_simdgroup]],
-                           uint simdgroup [[simdgroup_index_in_threadgroup]],
-                           uint3 threadgroup_position [[threadgroup_position_in_grid]],
-                           uint simdgroups_per_threadgroup [[simdgroups_per_threadgroup]])
+    device const bf16_storage* weight [[buffer(1)]],
+    device argmax_pair* partials [[buffer(2)]],
+    constant uint& hidden_size [[buffer(3)]],
+    constant uint& vocabulary_size [[buffer(4)]],
+    constant uint& partial_count [[buffer(5)]],
+    constant uint& outputs_per_simdgroup [[buffer(6)]],
+    constant uint& simd_width [[buffer(7)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    uint simdgroups_per_threadgroup [[simdgroups_per_threadgroup]])
 {
     const uint row = threadgroup_position.y;
     const uint outputs_per_threadgroup = simdgroups_per_threadgroup * outputs_per_simdgroup;
-    const uint first_output =
-        threadgroup_position.x * outputs_per_threadgroup + simdgroup * outputs_per_simdgroup;
+    const uint first_output = threadgroup_position.x * outputs_per_threadgroup + simdgroup * outputs_per_simdgroup;
     float best_score = -INFINITY;
     uint best_index = 0xffffffffu;
 
@@ -343,7 +337,7 @@ linear_bf16_partial_argmax(device const float* input [[buffer(0)]],
         if (output_feature < vocabulary_size) {
             const ulong input_base = ulong(row) * ulong(hidden_size);
             accumulator = linear_bf16_decode_dot(input + input_base, weight, hidden_size,
-                                                 output_feature, lane, simd_width);
+                output_feature, lane, simd_width);
             if (lane == 0
                 && (accumulator > best_score
                     || (accumulator == best_score && output_feature < best_index))) {
@@ -370,23 +364,23 @@ linear_bf16_partial_argmax(device const float* input [[buffer(0)]],
             }
         }
         partials[ulong(row) * ulong(partial_count) + threadgroup_position.x] = { simd_scores[0],
-                                                                                 simd_indices[0] };
+            simd_indices[0] };
     }
 }
 
 kernel void
 reduce_argmax(device const argmax_pair* partials [[buffer(0)]],
-              device uint* token_ids [[buffer(1)]],
-              constant uint& partial_count [[buffer(2)]],
-              uint thread_index [[thread_index_in_threadgroup]],
-              uint3 threadgroup_position [[threadgroup_position_in_grid]],
-              uint3 threads_per_threadgroup [[threads_per_threadgroup]])
+    device uint* token_ids [[buffer(1)]],
+    constant uint& partial_count [[buffer(2)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]],
+    uint3 threads_per_threadgroup [[threads_per_threadgroup]])
 {
     const uint row = threadgroup_position.x;
     float best_score = -INFINITY;
     uint best_index = 0xffffffffu;
     for (uint partial = thread_index; partial < partial_count;
-         partial += threads_per_threadgroup.x) {
+        partial += threads_per_threadgroup.x) {
         const argmax_pair candidate = partials[ulong(row) * ulong(partial_count) + partial];
         if (candidate.score > best_score
             || (candidate.score == best_score && candidate.index < best_index)) {
@@ -417,11 +411,11 @@ reduce_argmax(device const argmax_pair* partials [[buffer(0)]],
 
 kernel void
 silu_mul_f32(device const float* gate [[buffer(0)]],
-             device const float* up [[buffer(1)]],
-             device float* output [[buffer(2)]],
-             constant uint& element_count [[buffer(3)]],
-             constant uint& sigmoid_only [[buffer(4)]],
-             uint position [[thread_position_in_grid]])
+    device const float* up [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& element_count [[buffer(3)]],
+    constant uint& sigmoid_only [[buffer(4)]],
+    uint position [[thread_position_in_grid]])
 {
     if (position >= element_count) {
         return;
@@ -435,10 +429,10 @@ silu_mul_f32(device const float* gate [[buffer(0)]],
 
 kernel void
 add_f32(device const float* lhs [[buffer(0)]],
-        device const float* rhs [[buffer(1)]],
-        device float* output [[buffer(2)]],
-        constant uint& element_count [[buffer(3)]],
-        uint position [[thread_position_in_grid]])
+    device const float* rhs [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& element_count [[buffer(3)]],
+    uint position [[thread_position_in_grid]])
 {
     if (position >= element_count) {
         return;
@@ -449,11 +443,11 @@ add_f32(device const float* lhs [[buffer(0)]],
 
 kernel void
 split_heads_f32(device const float* input [[buffer(0)]],
-                device float* first [[buffer(1)]],
-                device float* second [[buffer(2)]],
-                constant uint& width [[buffer(3)]],
-                constant uint& head_dimension [[buffer(4)]],
-                uint2 position [[thread_position_in_grid]])
+    device float* first [[buffer(1)]],
+    device float* second [[buffer(2)]],
+    constant uint& width [[buffer(3)]],
+    constant uint& head_dimension [[buffer(4)]],
+    uint2 position [[thread_position_in_grid]])
 {
     const ulong column = position.x;
     const ulong source = ulong(position.y) * width * 2
@@ -466,14 +460,14 @@ split_heads_f32(device const float* input [[buffer(0)]],
 
 kernel void
 rope_f32(device const float* input [[buffer(0)]],
-         device const uint* positions [[buffer(1)]],
-         device float* output [[buffer(2)]],
-         constant uint& row_count [[buffer(3)]],
-         constant uint& head_count [[buffer(4)]],
-         constant uint& head_dimension [[buffer(5)]],
-         device const float* inverse_frequencies [[buffer(6)]],
-         constant uint& rotary_dimension [[buffer(7)]],
-         uint2 grid_position [[thread_position_in_grid]])
+    device const uint* positions [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& row_count [[buffer(3)]],
+    constant uint& head_count [[buffer(4)]],
+    constant uint& head_dimension [[buffer(5)]],
+    device const float* inverse_frequencies [[buffer(6)]],
+    constant uint& rotary_dimension [[buffer(7)]],
+    uint2 grid_position [[thread_position_in_grid]])
 {
     const uint half_dimension = head_dimension / 2;
     const uint pair_columns = head_count * half_dimension;
@@ -484,8 +478,7 @@ rope_f32(device const float* input [[buffer(0)]],
     const uint row = grid_position.y;
     const uint head = grid_position.x / half_dimension;
     const uint pair = grid_position.x % half_dimension;
-    const ulong head_offset =
-        (ulong(row) * ulong(head_count) + ulong(head)) * ulong(head_dimension);
+    const ulong head_offset = (ulong(row) * ulong(head_count) + ulong(head)) * ulong(head_dimension);
     const uint half_rotary = rotary_dimension / 2;
     if (pair >= half_rotary) {
         const ulong tail = head_offset + rotary_dimension + 2 * (pair - half_rotary);
@@ -509,15 +502,15 @@ rope_f32(device const float* input [[buffer(0)]],
 
 kernel void
 store_kv_f32(device const float* keys [[buffer(0)]],
-             device const float* values [[buffer(1)]],
-             device const uint* slot_mapping [[buffer(2)]],
-             device float* key_cache [[buffer(3)]],
-             device float* value_cache [[buffer(4)]],
-             constant uint& row_count [[buffer(5)]],
-             constant uint& feature_count [[buffer(6)]],
-             constant uint& layer [[buffer(7)]],
-             constant uint& slot_count [[buffer(8)]],
-             uint2 position [[thread_position_in_grid]])
+    device const float* values [[buffer(1)]],
+    device const uint* slot_mapping [[buffer(2)]],
+    device float* key_cache [[buffer(3)]],
+    device float* value_cache [[buffer(4)]],
+    constant uint& row_count [[buffer(5)]],
+    constant uint& feature_count [[buffer(6)]],
+    constant uint& layer [[buffer(7)]],
+    constant uint& slot_count [[buffer(8)]],
+    uint2 position [[thread_position_in_grid]])
 {
     if (position.x >= feature_count || position.y >= row_count) {
         return;
@@ -532,8 +525,7 @@ store_kv_f32(device const float* keys [[buffer(0)]],
     const ulong feature = position.x;
 
     const ulong input_index = row * ulong(feature_count) + feature;
-    const ulong cache_index =
-        (ulong(layer) * ulong(slot_count) + ulong(slot)) * ulong(feature_count) + feature;
+    const ulong cache_index = (ulong(layer) * ulong(slot_count) + ulong(slot)) * ulong(feature_count) + feature;
 
     key_cache[cache_index] = keys[input_index];
     value_cache[cache_index] = values[input_index];
@@ -541,28 +533,28 @@ store_kv_f32(device const float* keys [[buffer(0)]],
 
 kernel void
 paged_attention_f32(device const float* queries [[buffer(0)]],
-                    device const uint* positions [[buffer(1)]],
-                    device const uint* block_table [[buffer(2)]],
-                    device const uint* block_table_offsets [[buffer(3)]],
-                    device const uint* block_table_lengths [[buffer(4)]],
-                    device const float* key_cache [[buffer(5)]],
-                    device const float* value_cache [[buffer(6)]],
-                    device float* output [[buffer(7)]],
-                    constant uint& row_count [[buffer(8)]],
-                    constant uint& query_head_count [[buffer(9)]],
-                    constant uint& kv_head_count [[buffer(10)]],
-                    constant uint& head_dimension [[buffer(11)]],
-                    constant uint& block_size [[buffer(12)]],
-                    constant uint& slot_count [[buffer(13)]],
-                    constant uint& layer [[buffer(14)]],
-                    constant uint& block_table_entry_count [[buffer(15)]],
-                    constant uint& simdgroup_count [[buffer(16)]],
-                    threadgroup float* score_scratch [[threadgroup(0)]],
-                    threadgroup float* softmax_state [[threadgroup(1)]],
-                    uint thread_index [[thread_index_in_threadgroup]],
-                    uint lane [[thread_index_in_simdgroup]],
-                    uint simdgroup [[simdgroup_index_in_threadgroup]],
-                    uint3 threadgroup_position [[threadgroup_position_in_grid]])
+    device const uint* positions [[buffer(1)]],
+    device const uint* block_table [[buffer(2)]],
+    device const uint* block_table_offsets [[buffer(3)]],
+    device const uint* block_table_lengths [[buffer(4)]],
+    device const float* key_cache [[buffer(5)]],
+    device const float* value_cache [[buffer(6)]],
+    device float* output [[buffer(7)]],
+    constant uint& row_count [[buffer(8)]],
+    constant uint& query_head_count [[buffer(9)]],
+    constant uint& kv_head_count [[buffer(10)]],
+    constant uint& head_dimension [[buffer(11)]],
+    constant uint& block_size [[buffer(12)]],
+    constant uint& slot_count [[buffer(13)]],
+    constant uint& layer [[buffer(14)]],
+    constant uint& block_table_entry_count [[buffer(15)]],
+    constant uint& simdgroup_count [[buffer(16)]],
+    threadgroup float* score_scratch [[threadgroup(0)]],
+    threadgroup float* softmax_state [[threadgroup(1)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]])
 {
     // one threadgroup owns one [query row, query head]. Each thread owns one
     // feature of that head and eventually writes the matching output feature.
@@ -587,8 +579,7 @@ paged_attention_f32(device const float* queries [[buffer(0)]],
     // grouped-query attention lets several query heads share one cached KV head.
     const uint kv_group_size = query_head_count / kv_head_count;
     const uint kv_head = query_head / kv_group_size;
-    const ulong query_base =
-        (ulong(row) * ulong(query_head_count) + ulong(query_head)) * ulong(head_dimension);
+    const ulong query_base = (ulong(row) * ulong(query_head_count) + ulong(query_head)) * ulong(head_dimension);
     const float query_feature = queries[query_base + ulong(thread_index)];
 
     // shared online-softmax state: running max, denominator, old-state rescale,
@@ -614,9 +605,8 @@ paged_attention_f32(device const float* queries [[buffer(0)]],
         const uint slot = physical_block * block_size + token_offset;
         // flatten [layer][slot][KV head][feature], all threads share the base;
         // thread_index selects the feature owned by this thread.
-        const ulong cache_base =
-            ((ulong(layer) * ulong(slot_count) + ulong(slot)) * ulong(kv_head_count)
-             + ulong(kv_head))
+        const ulong cache_base = ((ulong(layer) * ulong(slot_count) + ulong(slot)) * ulong(kv_head_count)
+                                     + ulong(kv_head))
             * ulong(head_dimension);
         const ulong cache_index = cache_base + ulong(thread_index);
 
@@ -650,8 +640,7 @@ paged_attention_f32(device const float* queries [[buffer(0)]],
         // publish the new rescale and token weight to every feature thread.
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        value_accumulator =
-            value_accumulator * softmax_state[2] + value_cache[cache_index] * softmax_state[3];
+        value_accumulator = value_accumulator * softmax_state[2] + value_cache[cache_index] * softmax_state[3];
         // no thread may overwrite shared state for the next token until every
         // feature has consumed the current rescale and weight.
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -672,30 +661,30 @@ paged_attention_f32(device const float* queries [[buffer(0)]],
 // recurrence avoids ever materializing the complete attention matrix.
 kernel void
 paged_flash_attention_prefill_f32(device const float* queries [[buffer(0)]],
-                                  device const uint* positions [[buffer(1)]],
-                                  device const uint* block_table [[buffer(2)]],
-                                  device const uint* block_table_offsets [[buffer(3)]],
-                                  device const uint* block_table_lengths [[buffer(4)]],
-                                  device const float* key_cache [[buffer(5)]],
-                                  device const float* value_cache [[buffer(6)]],
-                                  device const uint* query_tile_starts [[buffer(7)]],
-                                  device const uint* query_tile_lengths [[buffer(8)]],
-                                  device float* output [[buffer(9)]],
-                                  constant uint& row_count [[buffer(10)]],
-                                  constant uint& query_head_count [[buffer(11)]],
-                                  constant uint& kv_head_count [[buffer(12)]],
-                                  constant uint& head_dimension [[buffer(13)]],
-                                  constant uint& block_size [[buffer(14)]],
-                                  constant uint& slot_count [[buffer(15)]],
-                                  constant uint& layer [[buffer(16)]],
-                                  constant uint& block_table_entry_count [[buffer(17)]],
-                                  constant uint& query_tile_count [[buffer(18)]],
-                                  constant uint& simd_width [[buffer(19)]],
-                                  threadgroup float* scores [[threadgroup(0)]],
-                                  threadgroup float* accumulator_rescales [[threadgroup(1)]],
-                                  threadgroup float* normalizers [[threadgroup(2)]],
-                                  uint lane [[thread_index_in_simdgroup]],
-                                  uint3 threadgroup_position [[threadgroup_position_in_grid]])
+    device const uint* positions [[buffer(1)]],
+    device const uint* block_table [[buffer(2)]],
+    device const uint* block_table_offsets [[buffer(3)]],
+    device const uint* block_table_lengths [[buffer(4)]],
+    device const float* key_cache [[buffer(5)]],
+    device const float* value_cache [[buffer(6)]],
+    device const uint* query_tile_starts [[buffer(7)]],
+    device const uint* query_tile_lengths [[buffer(8)]],
+    device float* output [[buffer(9)]],
+    constant uint& row_count [[buffer(10)]],
+    constant uint& query_head_count [[buffer(11)]],
+    constant uint& kv_head_count [[buffer(12)]],
+    constant uint& head_dimension [[buffer(13)]],
+    constant uint& block_size [[buffer(14)]],
+    constant uint& slot_count [[buffer(15)]],
+    constant uint& layer [[buffer(16)]],
+    constant uint& block_table_entry_count [[buffer(17)]],
+    constant uint& query_tile_count [[buffer(18)]],
+    constant uint& simd_width [[buffer(19)]],
+    threadgroup float* scores [[threadgroup(0)]],
+    threadgroup float* accumulator_rescales [[threadgroup(1)]],
+    threadgroup float* normalizers [[threadgroup(2)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]])
 {
     constexpr uint query_tile_size = 8;
     constexpr uint key_tile_size = 16;
@@ -728,8 +717,7 @@ paged_flash_attention_prefill_f32(device const float* queries [[buffer(0)]],
         const bool active = query < tile_rows;
         const uint row = active ? row_start + query : row_start;
         query_positions[query] = active ? positions[row] : 0;
-        query_bases[query] =
-            (ulong(row) * ulong(query_head_count) + ulong(query_head)) * ulong(head_dimension);
+        query_bases[query] = (ulong(row) * ulong(query_head_count) + ulong(query_head)) * ulong(head_dimension);
         for (uint component = 0; component < features_per_lane; ++component) {
             const uint feature = lane + component * simd_width;
             query_features[query][component] = active && feature < head_dimension
@@ -758,7 +746,7 @@ paged_flash_attention_prefill_f32(device const float* queries [[buffer(0)]],
     }
 
     for (uint key_tile_begin = 0; key_tile_begin <= final_position;
-         key_tile_begin += key_tile_size) {
+        key_tile_begin += key_tile_size) {
         const uint tile_keys = min(key_tile_size, final_position + 1 - key_tile_begin);
 
         // Compute the BQ x BK score tile. A lane owns up to four head
@@ -769,16 +757,14 @@ paged_flash_attention_prefill_f32(device const float* queries [[buffer(0)]],
             const uint token_offset = token_position % block_size;
             const uint physical_block = block_table[table_offset + logical_block];
             const uint slot = physical_block * block_size + token_offset;
-            const ulong cache_base =
-                ((ulong(layer) * ulong(slot_count) + ulong(slot)) * ulong(kv_head_count)
-                 + ulong(kv_head))
+            const ulong cache_base = ((ulong(layer) * ulong(slot_count) + ulong(slot)) * ulong(kv_head_count)
+                                         + ulong(kv_head))
                 * ulong(head_dimension);
 
             float key_features[features_per_lane];
             for (uint component = 0; component < features_per_lane; ++component) {
                 const uint feature = lane + component * simd_width;
-                key_features[component] =
-                    feature < head_dimension ? key_cache[cache_base + ulong(feature)] : 0.0F;
+                key_features[component] = feature < head_dimension ? key_cache[cache_base + ulong(feature)] : 0.0F;
             }
 
             for (uint query = 0; query < tile_rows; ++query) {
@@ -788,8 +774,7 @@ paged_flash_attention_prefill_f32(device const float* queries [[buffer(0)]],
                 }
                 const float score = simd_sum(partial_score) * attention_scale;
                 if (lane == 0) {
-                    scores[query * key_tile_size + key] =
-                        token_position <= query_positions[query] ? score : -INFINITY;
+                    scores[query * key_tile_size + key] = token_position <= query_positions[query] ? score : -INFINITY;
                 }
             }
         }
@@ -835,15 +820,13 @@ paged_flash_attention_prefill_f32(device const float* queries [[buffer(0)]],
                 const uint token_offset = token_position % block_size;
                 const uint physical_block = block_table[table_offset + logical_block];
                 const uint slot = physical_block * block_size + token_offset;
-                const ulong cache_index =
-                    (((ulong(layer) * ulong(slot_count) + ulong(slot)) * ulong(kv_head_count)
-                      + ulong(kv_head))
-                     * ulong(head_dimension))
+                const ulong cache_index = (((ulong(layer) * ulong(slot_count) + ulong(slot)) * ulong(kv_head_count)
+                                               + ulong(kv_head))
+                                              * ulong(head_dimension))
                     + ulong(feature);
                 const float value = value_cache[cache_index];
                 for (uint query = 0; query < tile_rows; ++query) {
-                    output_accumulators[query][component] +=
-                        scores[query * key_tile_size + key] * value;
+                    output_accumulators[query][component] += scores[query * key_tile_size + key] * value;
                 }
             }
         }
@@ -863,8 +846,7 @@ paged_flash_attention_prefill_f32(device const float* queries [[buffer(0)]],
         for (uint component = 0; component < features_per_lane; ++component) {
             const uint feature = lane + component * simd_width;
             if (feature < head_dimension) {
-                output[query_bases[query] + ulong(feature)] =
-                    output_accumulators[query][component] / normalizers[query];
+                output[query_bases[query] + ulong(feature)] = output_accumulators[query][component] / normalizers[query];
             }
         }
     }
@@ -872,30 +854,30 @@ paged_flash_attention_prefill_f32(device const float* queries [[buffer(0)]],
 
 kernel void
 paged_attention_partial_f32(device const float* queries [[buffer(0)]],
-                            device const uint* positions [[buffer(1)]],
-                            device const uint* block_table [[buffer(2)]],
-                            device const uint* block_table_offsets [[buffer(3)]],
-                            device const uint* block_table_lengths [[buffer(4)]],
-                            device const float* key_cache [[buffer(5)]],
-                            device const float* value_cache [[buffer(6)]],
-                            device float* partials [[buffer(7)]],
-                            constant uint& row_count [[buffer(8)]],
-                            constant uint& query_head_count [[buffer(9)]],
-                            constant uint& kv_head_count [[buffer(10)]],
-                            constant uint& head_dimension [[buffer(11)]],
-                            constant uint& block_size [[buffer(12)]],
-                            constant uint& slot_count [[buffer(13)]],
-                            constant uint& layer [[buffer(14)]],
-                            constant uint& block_table_entry_count [[buffer(15)]],
-                            constant uint& simdgroup_count [[buffer(16)]],
-                            constant uint& chunk_size [[buffer(17)]],
-                            constant uint& chunk_count [[buffer(18)]],
-                            threadgroup float* score_scratch [[threadgroup(0)]],
-                            threadgroup float* softmax_state [[threadgroup(1)]],
-                            uint thread_index [[thread_index_in_threadgroup]],
-                            uint lane [[thread_index_in_simdgroup]],
-                            uint simdgroup [[simdgroup_index_in_threadgroup]],
-                            uint3 threadgroup_position [[threadgroup_position_in_grid]])
+    device const uint* positions [[buffer(1)]],
+    device const uint* block_table [[buffer(2)]],
+    device const uint* block_table_offsets [[buffer(3)]],
+    device const uint* block_table_lengths [[buffer(4)]],
+    device const float* key_cache [[buffer(5)]],
+    device const float* value_cache [[buffer(6)]],
+    device float* partials [[buffer(7)]],
+    constant uint& row_count [[buffer(8)]],
+    constant uint& query_head_count [[buffer(9)]],
+    constant uint& kv_head_count [[buffer(10)]],
+    constant uint& head_dimension [[buffer(11)]],
+    constant uint& block_size [[buffer(12)]],
+    constant uint& slot_count [[buffer(13)]],
+    constant uint& layer [[buffer(14)]],
+    constant uint& block_table_entry_count [[buffer(15)]],
+    constant uint& simdgroup_count [[buffer(16)]],
+    constant uint& chunk_size [[buffer(17)]],
+    constant uint& chunk_count [[buffer(18)]],
+    threadgroup float* score_scratch [[threadgroup(0)]],
+    threadgroup float* softmax_state [[threadgroup(1)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]])
 {
     const uint query_head = threadgroup_position.x % query_head_count;
     const uint chunk = threadgroup_position.x / query_head_count;
@@ -916,9 +898,8 @@ paged_attention_partial_f32(device const float* queries [[buffer(0)]],
 
     const uint chunk_begin = chunk * chunk_size;
     const uint chunk_end = min(query_position + 1, chunk_begin + chunk_size);
-    const ulong partial_base =
-        ((ulong(row) * ulong(query_head_count) + ulong(query_head)) * ulong(chunk_count)
-         + ulong(chunk))
+    const ulong partial_base = ((ulong(row) * ulong(query_head_count) + ulong(query_head)) * ulong(chunk_count)
+                                   + ulong(chunk))
         * ulong(head_dimension + 2);
     if (chunk_begin >= chunk_end) {
         if (thread_index == 0) {
@@ -931,8 +912,7 @@ paged_attention_partial_f32(device const float* queries [[buffer(0)]],
 
     const uint kv_group_size = query_head_count / kv_head_count;
     const uint kv_head = query_head / kv_group_size;
-    const ulong query_base =
-        (ulong(row) * ulong(query_head_count) + ulong(query_head)) * ulong(head_dimension);
+    const ulong query_base = (ulong(row) * ulong(query_head_count) + ulong(query_head)) * ulong(head_dimension);
     const float query_feature = queries[query_base + ulong(thread_index)];
 
     if (thread_index == 0) {
@@ -950,9 +930,8 @@ paged_attention_partial_f32(device const float* queries [[buffer(0)]],
         const uint token_offset = token_position % block_size;
         const uint physical_block = block_table[table_offset + logical_block];
         const uint slot = physical_block * block_size + token_offset;
-        const ulong cache_base =
-            ((ulong(layer) * ulong(slot_count) + ulong(slot)) * ulong(kv_head_count)
-             + ulong(kv_head))
+        const ulong cache_base = ((ulong(layer) * ulong(slot_count) + ulong(slot)) * ulong(kv_head_count)
+                                     + ulong(kv_head))
             * ulong(head_dimension);
         const ulong cache_index = cache_base + ulong(thread_index);
 
@@ -979,8 +958,7 @@ paged_attention_partial_f32(device const float* queries [[buffer(0)]],
             softmax_state[3] = value_weight;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        value_accumulator =
-            value_accumulator * softmax_state[2] + value_cache[cache_index] * softmax_state[3];
+        value_accumulator = value_accumulator * softmax_state[2] + value_cache[cache_index] * softmax_state[3];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -993,15 +971,15 @@ paged_attention_partial_f32(device const float* queries [[buffer(0)]],
 
 kernel void
 paged_attention_reduce_f32(device const float* partials [[buffer(0)]],
-                           device float* output [[buffer(1)]],
-                           constant uint& row_count [[buffer(2)]],
-                           constant uint& query_head_count [[buffer(3)]],
-                           constant uint& head_dimension [[buffer(4)]],
-                           constant uint& chunk_count [[buffer(5)]],
-                           threadgroup float* chunk_scales [[threadgroup(0)]],
-                           threadgroup float* softmax_state [[threadgroup(1)]],
-                           uint thread_index [[thread_index_in_threadgroup]],
-                           uint3 threadgroup_position [[threadgroup_position_in_grid]])
+    device float* output [[buffer(1)]],
+    constant uint& row_count [[buffer(2)]],
+    constant uint& query_head_count [[buffer(3)]],
+    constant uint& head_dimension [[buffer(4)]],
+    constant uint& chunk_count [[buffer(5)]],
+    threadgroup float* chunk_scales [[threadgroup(0)]],
+    threadgroup float* softmax_state [[threadgroup(1)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_position [[threadgroup_position_in_grid]])
 {
     const uint query_head = threadgroup_position.x;
     const uint row = threadgroup_position.y;
@@ -1035,8 +1013,7 @@ paged_attention_reduce_f32(device const float* partials [[buffer(0)]],
         const ulong base = head_base + ulong(chunk) * ulong(head_dimension + 2);
         accumulator += partials[base + 2 + ulong(thread_index)] * chunk_scales[chunk];
     }
-    const ulong output_index =
-        (ulong(row) * ulong(query_head_count) + ulong(query_head)) * ulong(head_dimension)
+    const ulong output_index = (ulong(row) * ulong(query_head_count) + ulong(query_head)) * ulong(head_dimension)
         + ulong(thread_index);
     output[output_index] = accumulator / softmax_state[0];
 }
@@ -1052,11 +1029,11 @@ deltanet_sigmoid(float x)
 
 kernel void
 causal_conv1d_silu(device const float* input [[buffer(0)]],
-                   device const bf16_storage* weight [[buffer(1)]],
-                   device float* history [[buffer(2)]],
-                   device float* output [[buffer(3)]],
-                   constant uint* geometry [[buffer(4)]],
-                   uint channel [[thread_position_in_grid]])
+    device const bf16_storage* weight [[buffer(1)]],
+    device float* history [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint* geometry [[buffer(4)]],
+    uint channel [[thread_position_in_grid]])
 {
     const uint rows = geometry[0], channels = geometry[1], kernel_size = geometry[2];
     if (channel >= channels)
@@ -1079,15 +1056,15 @@ causal_conv1d_silu(device const float* input [[buffer(0)]],
 
 kernel void
 gated_delta_rule(device const float* qkv [[buffer(0)]],
-                 device const float* a [[buffer(1)]],
-                 device const float* b [[buffer(2)]],
-                 device const float* A_log [[buffer(3)]],
-                 device const bf16_storage* dt_bias [[buffer(4)]],
-                 device float* state [[buffer(5)]],
-                 device float* output [[buffer(6)]],
-                 constant uint* geometry [[buffer(7)]],
-                 constant float& epsilon [[buffer(8)]],
-                 uint column [[thread_position_in_grid]])
+    device const float* a [[buffer(1)]],
+    device const float* b [[buffer(2)]],
+    device const float* A_log [[buffer(3)]],
+    device const bf16_storage* dt_bias [[buffer(4)]],
+    device float* state [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    constant uint* geometry [[buffer(7)]],
+    constant float& epsilon [[buffer(8)]],
+    uint column [[thread_position_in_grid]])
 {
     const uint rows = geometry[0], key_heads = geometry[1], value_heads = geometry[2];
     const uint key_dim = geometry[3], value_dim = geometry[4];
@@ -1150,15 +1127,15 @@ constant uint delta_block = 32;
 
 kernel void
 delta_prepare(device const float* qkv [[buffer(0)]],
-              device const float* a [[buffer(1)]],
-              device const float* b [[buffer(2)]],
-              device const float* logs [[buffer(3)]],
-              device const bf16_storage* bias [[buffer(4)]],
-              device float* qk [[buffer(9)]],
-              device float* gates [[buffer(10)]],
-              constant uint* g [[buffer(7)]],
-              constant float& epsilon [[buffer(8)]],
-              uint2 id [[thread_position_in_grid]])
+    device const float* a [[buffer(1)]],
+    device const float* b [[buffer(2)]],
+    device const float* logs [[buffer(3)]],
+    device const bf16_storage* bias [[buffer(4)]],
+    device float* qk [[buffer(9)]],
+    device float* gates [[buffer(10)]],
+    constant uint* g [[buffer(7)]],
+    constant float& epsilon [[buffer(8)]],
+    uint2 id [[thread_position_in_grid]])
 {
     uint t = id.x, h = id.y;
     uint n = g[0], kh = g[1], vh = g[2], kd = g[3], vd = g[4];
@@ -1176,8 +1153,7 @@ delta_prepare(device const float* qkv [[buffer(0)]],
         float qscale = rsqrt(qs) * rsqrt(float(kd)), kscale = rsqrt(ks);
         for (uint k = 0; k < kd; ++k) {
             qk[ulong(t) * 2 * kw + h * kd + k] = qkv[ulong(t) * packed + h * kd + k] * qscale;
-            qk[ulong(t) * 2 * kw + kw + h * kd + k] =
-                qkv[ulong(t) * packed + kw + h * kd + k] * kscale;
+            qk[ulong(t) * 2 * kw + kw + h * kd + k] = qkv[ulong(t) * packed + kw + h * kd + k] * kscale;
         }
     }
     float x = a[ulong(t) * vh + h] + load_bf16(bias[h]);
@@ -1190,10 +1166,10 @@ delta_prepare(device const float* qkv [[buffer(0)]],
 
 kernel void
 delta_products(device const float* qk [[buffer(9)]],
-               device float* gates [[buffer(10)]],
-               device float* products [[buffer(11)]],
-               constant uint* g [[buffer(7)]],
-               uint3 id [[thread_position_in_grid]])
+    device float* gates [[buffer(10)]],
+    device float* products [[buffer(11)]],
+    constant uint* g [[buffer(7)]],
+    uint3 id [[thread_position_in_grid]])
 {
     uint i = id.x, j = id.y, h = id.z;
     uint n = g[0], kh = g[1], vh = g[2], kd = g[3];
@@ -1225,12 +1201,12 @@ delta_products(device const float* qk [[buffer(9)]],
 // Parallel matrix products K S_0 and Q S_0; state remains read-only here.
 kernel void
 delta_project(device const float* qkv [[buffer(0)]],
-              device const float* state [[buffer(5)]],
-              device const float* qk [[buffer(9)]],
-              device const float* gates [[buffer(10)]],
-              device float* work [[buffer(12)]],
-              constant uint* g [[buffer(7)]],
-              uint2 id [[thread_position_in_grid]])
+    device const float* state [[buffer(5)]],
+    device const float* qk [[buffer(9)]],
+    device const float* gates [[buffer(10)]],
+    device float* work [[buffer(12)]],
+    constant uint* g [[buffer(7)]],
+    uint2 id [[thread_position_in_grid]])
 {
     uint c = id.x, t = id.y;
     uint n = g[0], kh = g[1], vh = g[2], kd = g[3], vd = g[4];
@@ -1254,9 +1230,9 @@ delta_project(device const float* qkv [[buffer(0)]],
 // for each value column. All key-dimension products are outside this scan.
 kernel void
 delta_solve(device const float* products [[buffer(11)]],
-            device float* work [[buffer(12)]],
-            constant uint* g [[buffer(7)]],
-            uint c [[thread_position_in_grid]])
+    device float* work [[buffer(12)]],
+    constant uint* g [[buffer(7)]],
+    uint c [[thread_position_in_grid]])
 {
     uint n = g[0], vh = g[2], vd = g[4];
     if (c >= vh * vd)
@@ -1277,13 +1253,13 @@ delta_solve(device const float* products [[buffer(11)]],
 // saved Q S_0, so it never races the state writes in this dispatch.
 kernel void
 delta_finish(device float* state [[buffer(5)]],
-             device float* output [[buffer(6)]],
-             device const float* qk [[buffer(9)]],
-             device const float* gates [[buffer(10)]],
-             device const float* products [[buffer(11)]],
-             device const float* work [[buffer(12)]],
-             constant uint* g [[buffer(7)]],
-             uint2 id [[thread_position_in_grid]])
+    device float* output [[buffer(6)]],
+    device const float* qk [[buffer(9)]],
+    device const float* gates [[buffer(10)]],
+    device const float* products [[buffer(11)]],
+    device const float* work [[buffer(12)]],
+    constant uint* g [[buffer(7)]],
+    uint2 id [[thread_position_in_grid]])
 {
     uint c = id.x, i = id.y;
     uint n = g[0], kh = g[1], vh = g[2], kd = g[3], vd = g[4];
@@ -1310,12 +1286,12 @@ delta_finish(device float* state [[buffer(5)]],
 
 kernel void
 rms_norm_gated(device const float* input [[buffer(0)]],
-               device const float* gate [[buffer(1)]],
-               device const float* weight [[buffer(2)]],
-               device float* output [[buffer(3)]],
-               constant uint* geometry [[buffer(4)]],
-               constant float& epsilon [[buffer(5)]],
-               uint group [[thread_position_in_grid]])
+    device const float* gate [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint* geometry [[buffer(4)]],
+    constant float& epsilon [[buffer(5)]],
+    uint group [[thread_position_in_grid]])
 {
     const uint groups = geometry[0], width = geometry[1];
     if (group >= groups)

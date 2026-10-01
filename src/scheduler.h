@@ -28,7 +28,6 @@ struct scheduler_config {
     std::size_t max_batch_tokens { 128 };
     std::size_t kv_block_count { 256 };
     std::size_t kv_block_size { 16 };
-    token_id eos_token { 0 };
 };
 
 struct sequence_update {
@@ -77,7 +76,7 @@ enum class scheduler_errc : std::uint8_t {
 class scheduler {
 public:
     [[nodiscard]] static result<scheduler, scheduler_errc>
-    make(scheduler_config config, std::unique_ptr<model_state> state = {});
+    make(scheduler_config config, token_id eos_token, std::unique_ptr<model_state> state = {});
 
     scheduler(const scheduler&) = delete;
     scheduler& operator=(const scheduler&) = delete;
@@ -129,7 +128,7 @@ public:
 
 private:
     seq* mutable_sequence(seq_id id) noexcept;
-    scheduler(scheduler_config config, std::unique_ptr<model_state> state);
+    scheduler(scheduler_config config, token_id eos_token, std::unique_ptr<model_state> state);
 
     static bool remove_from_queue(std::deque<seq_id>& queue, seq_id id) noexcept;
 
@@ -139,6 +138,7 @@ private:
     void assert_invariants() const noexcept;
 
     scheduler_config config_;
+    token_id eos_token_;
     std::unique_ptr<model_state> state_;
 
     // the map owns sequences; queues store ids.

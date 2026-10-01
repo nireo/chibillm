@@ -7,11 +7,8 @@
 
 namespace chibillm {
 struct serving_config {
-    std::size_t max_sequences { 4 };
+    scheduler_config scheduler { .kv_block_count = 64 };
     std::size_t max_pending_requests { 64 };
-    std::size_t max_batch_tokens { 128 };
-    std::size_t kv_block_count { 64 };
-    std::size_t kv_block_size { 16 };
 };
 enum class generation_errc {
     invalid_input,

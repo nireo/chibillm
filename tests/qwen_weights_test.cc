@@ -559,7 +559,6 @@ TEST_CASE("Qwen model runner executes a flattened multi-sequence batch")
             .max_batch_tokens = 4,
             .kv_block_count = 3,
             .kv_block_size = 2,
-            .eos_token = config.eos_token_id,
         },
         *runner);
     auto first = chibillm::seq::make(10, { 1, 2, 3 }, { .max_new_tokens = 2, .ignore_eos = false });
@@ -636,12 +635,9 @@ TEST_CASE("Qwen3.5 factory loads a sole shard and generates with tied zero-cente
     CHECK(runner.execute({}, **state).error() == chibillm::model_runner_errc::empty_batch);
     CHECK(runner.encode_chat({}).error() == chibillm::model_runner_errc::invalid_chat);
 
-    auto engine = chibillm::inference_engine::make({ .max_sequences = 2,
-                                                     .max_batch_tokens = 2,
-                                                     .kv_block_count = 8,
-                                                     .kv_block_size = 2,
-                                                     .eos_token = config.eos_token_id },
-                                                   runner);
+    auto engine = chibillm::inference_engine::make(
+        { .max_sequences = 2, .max_batch_tokens = 2, .kv_block_count = 8, .kv_block_size = 2 },
+        runner);
     REQUIRE(engine.has_value());
     for (int repeat = 0; repeat < 2; ++repeat) {
         auto first = chibillm::seq::make(10, { 1, 2, 3, 1, 2 }, { .max_new_tokens = 3 });
@@ -693,8 +689,7 @@ TEST_CASE("Qwen3.5 official checkpoint generates consistently across batching an
         auto engine = chibillm::inference_engine::make({ .max_sequences = 2,
                                                          .max_batch_tokens = budget,
                                                          .kv_block_count = 16,
-                                                         .kv_block_size = 16,
-                                                         .eos_token = runner.info().eos_token },
+                                                         .kv_block_size = 16 },
                                                        runner);
         REQUIRE(engine.has_value());
         const auto add = [&](chibillm::seq_id id, const std::vector<chibillm::token_id>& prompt) {

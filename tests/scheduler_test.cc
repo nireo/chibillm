@@ -34,7 +34,6 @@ test_config()
         .max_batch_tokens = 8,
         .kv_block_count = 8,
         .kv_block_size = 2,
-        .eos_token = 99,
     };
 }
 
@@ -45,29 +44,29 @@ TEST_CASE("scheduler construction validates limits and exposes cache geometry")
     auto config = test_config();
 
     config.max_sequences = 0;
-    auto zero_sequences = scheduler::make(config);
+    auto zero_sequences = scheduler::make(config, 99);
     REQUIRE_FALSE(zero_sequences.has_value());
     CHECK(zero_sequences.error() == scheduler_errc::invalid_max_sequences);
 
     config = test_config();
     config.max_batch_tokens = 0;
-    auto zero_tokens = scheduler::make(config);
+    auto zero_tokens = scheduler::make(config, 99);
     REQUIRE_FALSE(zero_tokens.has_value());
     CHECK(zero_tokens.error() == scheduler_errc::invalid_max_batch_tokens);
 
     config = test_config();
     config.kv_block_count = 0;
-    auto zero_blocks = scheduler::make(config);
+    auto zero_blocks = scheduler::make(config, 99);
     REQUIRE_FALSE(zero_blocks.has_value());
     CHECK(zero_blocks.error() == scheduler_errc::invalid_kv_block_count);
 
     config = test_config();
     config.kv_block_size = 0;
-    auto zero_block_size = scheduler::make(config);
+    auto zero_block_size = scheduler::make(config, 99);
     REQUIRE_FALSE(zero_block_size.has_value());
     CHECK(zero_block_size.error() == scheduler_errc::invalid_kv_block_size);
 
-    auto result = scheduler::make(test_config());
+    auto result = scheduler::make(test_config(), 99);
     REQUIRE(result.has_value());
     CHECK(result->sequence_count() == 0);
     CHECK(result->waiting_count() == 0);
@@ -79,7 +78,7 @@ TEST_CASE("scheduler construction validates limits and exposes cache geometry")
 
 TEST_CASE("completion without an active batch is rejected")
 {
-    auto scheduler_result = scheduler::make(test_config());
+    auto scheduler_result = scheduler::make(test_config(), 99);
     REQUIRE(scheduler_result.has_value());
 
     const scheduled_batch phantom {
@@ -97,7 +96,7 @@ TEST_CASE("completion without an active batch is rejected")
 
 TEST_CASE("add admits one pristine waiting sequence and rejects a duplicate ID")
 {
-    auto scheduler_result = scheduler::make(test_config());
+    auto scheduler_result = scheduler::make(test_config(), 99);
     auto first = seq::make(10, { 1, 2 }, generation_params {});
     REQUIRE(scheduler_result.has_value());
     REQUIRE(first.has_value());
@@ -122,7 +121,7 @@ TEST_CASE("prefill can be chunked and only the final chunk appends a sample")
 {
     auto config = test_config();
     config.max_batch_tokens = 2;
-    auto scheduler_result = scheduler::make(config);
+    auto scheduler_result = scheduler::make(config, 99);
     auto sequence = seq::make(1, { 10, 20, 30 }, generation_params {});
     REQUIRE(scheduler_result.has_value());
     REQUIRE(sequence.has_value());
@@ -167,7 +166,7 @@ TEST_CASE("prefill can be chunked and only the final chunk appends a sample")
 
 TEST_CASE("decode commits the old sample and creates the next one-token cache gap")
 {
-    auto scheduler_result = scheduler::make(test_config());
+    auto scheduler_result = scheduler::make(test_config(), 99);
     auto sequence = seq::make(1, { 10, 20 }, generation_params {});
     REQUIRE(scheduler_result.has_value());
     REQUIRE(sequence.has_value());
@@ -204,7 +203,7 @@ TEST_CASE("sequences finish on EOS or length limit and release cache blocks")
 {
     auto check_finish = [](generation_params params, token_id sample,
                            finish_reason expected_reason) {
-        auto scheduler_result = scheduler::make(test_config());
+        auto scheduler_result = scheduler::make(test_config(), 99);
         auto sequence = seq::make(1, { 10, 20 }, params);
         REQUIRE(scheduler_result.has_value());
         REQUIRE(sequence.has_value());
@@ -230,7 +229,7 @@ TEST_CASE("sequences finish on EOS or length limit and release cache blocks")
 
 TEST_CASE("cancel releases a running sequence and allows it to be retired")
 {
-    auto scheduler_result = scheduler::make(test_config());
+    auto scheduler_result = scheduler::make(test_config(), 99);
     auto sequence = seq::make(1, { 10, 20 }, generation_params {});
     REQUIRE(scheduler_result.has_value());
     REQUIRE(sequence.has_value());
@@ -257,7 +256,7 @@ TEST_CASE("cancel releases a running sequence and allows it to be retired")
 
 TEST_CASE("completion validation leaves an in-flight reservation untouched")
 {
-    auto scheduler_result = scheduler::make(test_config());
+    auto scheduler_result = scheduler::make(test_config(), 99);
     auto sequence = seq::make(1, { 10 }, generation_params {});
     REQUIRE(scheduler_result.has_value());
     REQUIRE(sequence.has_value());
@@ -279,7 +278,7 @@ TEST_CASE("completion validation leaves an in-flight reservation untouched")
 
 TEST_CASE("abort validates active batch and restores reservations")
 {
-    auto scheduler_result = scheduler::make(test_config());
+    auto scheduler_result = scheduler::make(test_config(), 99);
     auto sequence = seq::make(1, { 10, 20, 30 }, generation_params {});
     REQUIRE(scheduler_result.has_value());
     REQUIRE(sequence.has_value());
@@ -316,7 +315,7 @@ TEST_CASE("abort validates active batch and restores reservations")
 
 TEST_CASE("waiting prefill work is chosen before existing decode work")
 {
-    auto scheduler_result = scheduler::make(test_config());
+    auto scheduler_result = scheduler::make(test_config(), 99);
     auto first = seq::make(1, { 10 }, generation_params {});
     REQUIRE(scheduler_result.has_value());
     REQUIRE(first.has_value());
@@ -343,7 +342,7 @@ TEST_CASE("cache exhaustion reports an error without partially scheduling")
 {
     auto config = test_config();
     config.kv_block_count = 1;
-    auto scheduler_result = scheduler::make(config);
+    auto scheduler_result = scheduler::make(config, 99);
     auto sequence = seq::make(1, { 10, 20, 30 }, generation_params {});
     REQUIRE(scheduler_result.has_value());
     REQUIRE(sequence.has_value());

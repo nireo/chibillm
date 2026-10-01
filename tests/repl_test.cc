@@ -107,13 +107,10 @@ run(repl_runner& runner,
     std::size_t budget = 8,
     std::ostream* metrics = nullptr)
 {
-    return chibillm::run_repl(runner,
-                              { .max_sequences = 1,
-                                .max_batch_tokens = 2,
-                                .kv_block_count = 8,
-                                .kv_block_size = 2,
-                                .eos_token = 99 },
-                              budget, stream, false, metrics);
+    return chibillm::run_repl(
+        runner,
+        { .max_sequences = 1, .max_batch_tokens = 2, .kv_block_count = 8, .kv_block_size = 2 },
+        budget, stream, false, metrics);
 }
 
 } // namespace

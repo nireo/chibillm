@@ -268,20 +268,15 @@ result<std::unique_ptr<openai_server>, server_errc>
 openai_server::make(model_runner& runner, server_config config)
 {
     if (config.host.empty()
-        || config.max_sequences == 0
-        || config.max_pending_requests == 0
-        || config.max_batch_tokens == 0
-        || config.kv_block_count == 0
-        || config.kv_block_size == 0
+        || config.runtime.scheduler.max_sequences == 0
+        || config.runtime.max_pending_requests == 0
+        || config.runtime.scheduler.max_batch_tokens == 0
+        || config.runtime.scheduler.kv_block_count == 0
+        || config.runtime.scheduler.kv_block_size == 0
         || config.default_max_completion_tokens == 0) {
         return fail(server_errc::invalid_config);
     }
-    auto runtime = serving_runtime::make(runner,
-                                         { .max_sequences = config.max_sequences,
-                                           .max_pending_requests = config.max_pending_requests,
-                                           .max_batch_tokens = config.max_batch_tokens,
-                                           .kv_block_count = config.kv_block_count,
-                                           .kv_block_size = config.kv_block_size });
+    auto runtime = serving_runtime::make(runner, config.runtime);
     if (!runtime) {
         return fail(server_errc::engine_creation_failed);
     }

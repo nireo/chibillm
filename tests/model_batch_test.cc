@@ -29,7 +29,6 @@ test_config()
         .max_batch_tokens = 8,
         .kv_block_count = 8,
         .kv_block_size = 2,
-        .eos_token = 99,
     };
 }
 
@@ -39,7 +38,7 @@ TEST_CASE("model batch builds chunked prefill and subsequent decode batches")
 {
     auto config = test_config();
     config.max_batch_tokens = 2;
-    auto engine = scheduler::make(config);
+    auto engine = scheduler::make(config, 99);
     auto sequence = seq::make(1, { 10, 20, 30 }, generation_params {});
     REQUIRE(engine.has_value());
     REQUIRE(sequence.has_value());
@@ -104,7 +103,7 @@ TEST_CASE("ragged prefill is flattened in scheduled order")
     auto config = test_config();
     config.max_sequences = 2;
     config.max_batch_tokens = 3;
-    auto engine = scheduler::make(config);
+    auto engine = scheduler::make(config, 99);
     auto first = seq::make(1, { 10, 11 }, generation_params {});
     auto second = seq::make(2, { 20, 21 }, generation_params {});
     REQUIRE(engine.has_value());
@@ -139,7 +138,7 @@ TEST_CASE("ragged prefill is flattened in scheduled order")
 
 TEST_CASE("model batch rejects invalid scheduled batches")
 {
-    auto engine = scheduler::make(test_config());
+    auto engine = scheduler::make(test_config(), 99);
     REQUIRE(engine.has_value());
 
     SUBCASE("empty batch")

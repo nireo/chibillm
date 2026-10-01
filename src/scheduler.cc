@@ -26,7 +26,7 @@ scheduled_batch::token_count() const noexcept
 }
 
 result<scheduler, scheduler_errc>
-scheduler::make(scheduler_config config, std::unique_ptr<model_state> state)
+scheduler::make(scheduler_config config, token_id eos_token, std::unique_ptr<model_state> state)
 {
     if (config.max_sequences == 0) {
         return fail(scheduler_errc::invalid_max_sequences);
@@ -46,11 +46,14 @@ scheduler::make(scheduler_config config, std::unique_ptr<model_state> state)
             return fail(scheduler_errc::block_manager_failure);
         state = std::make_unique<block_manager>(std::move(*manager));
     }
-    return scheduler { config, std::move(state) };
+    return scheduler { config, eos_token, std::move(state) };
 }
 
-scheduler::scheduler(scheduler_config config, std::unique_ptr<model_state> state)
+scheduler::scheduler(scheduler_config config,
+                     token_id eos_token,
+                     std::unique_ptr<model_state> state)
     : config_(config)
+    , eos_token_(eos_token)
     , state_(std::move(state))
 {
     assert_invariants();
@@ -269,7 +272,7 @@ scheduler::complete(batch_id id, std::span<const token_id> sampled_tokens)
             return fail(scheduler_errc::sequence_failure);
         }
 
-        const auto stop_reason = sequence->evaluate_stop(config_.eos_token);
+        const auto stop_reason = sequence->evaluate_stop(eos_token_);
         if (stop_reason != finish_reason::none) {
             auto finished = sequence->finish(stop_reason);
             if (!finished) {

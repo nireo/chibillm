@@ -122,11 +122,15 @@ TEST_CASE("OpenAI server batches concurrent requests and returns compatible chat
                                                 {
                                                     .host = "127.0.0.1",
                                                     .port = 0,
-                                                    .max_sequences = 2,
-                                                    .max_pending_requests = 8,
-                                                    .max_batch_tokens = 8,
-                                                    .kv_block_count = 8,
-                                                    .kv_block_size = 2,
+                                                    .runtime = {
+                                                        .scheduler = {
+                                                            .max_sequences = 2,
+                                                            .max_batch_tokens = 8,
+                                                            .kv_block_count = 8,
+                                                            .kv_block_size = 2,
+                                                        },
+                                                        .max_pending_requests = 8,
+                                                    },
                                                     .default_max_completion_tokens = 2,
                                                 });
     REQUIRE(server.has_value());

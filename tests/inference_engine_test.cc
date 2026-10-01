@@ -31,7 +31,6 @@ test_config()
         .max_batch_tokens = 2,
         .kv_block_count = 8,
         .kv_block_size = 2,
-        .eos_token = 99,
     };
 }
 
@@ -127,6 +126,24 @@ TEST_CASE("engine runs chunked prefill and decode until the length limit")
     CHECK(finished->completion_tokens()[0] == 42);
     CHECK(finished->completion_tokens()[1] == 42);
     CHECK(finished->completion_tokens()[2] == 42);
+}
+
+TEST_CASE("engine takes the EOS token from the model")
+{
+    fake_model_runner runner { -1 };
+    auto engine = inference_engine::make(test_config(), runner);
+    auto sequence = seq::make(1, { 10 }, { .max_new_tokens = 3 });
+    REQUIRE(engine.has_value());
+    REQUIRE(sequence.has_value());
+    REQUIRE(engine->add(std::move(*sequence)).has_value());
+
+    auto updates = engine->step();
+    REQUIRE(updates.has_value());
+    REQUIRE(updates->size() == 1);
+    CHECK(updates->front().token == runner.info().eos_token);
+    CHECK(updates->front().reason == finish_reason::eos);
+    CHECK(engine->is_finished());
+    CHECK(engine->find_sequence(1)->completion_token_count() == 1);
 }
 
 TEST_CASE("runner failures abort the scheduler reservation")

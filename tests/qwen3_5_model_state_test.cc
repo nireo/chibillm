@@ -285,12 +285,10 @@ TEST_CASE(
     auto* state = storage.get();
     fill(state->cache().keys(), 0);
     fill(state->cache().values(), 0);
-    scheduler_config config { .max_sequences = 2,
-                              .max_batch_tokens = 2,
-                              .kv_block_count = 8,
-                              .kv_block_size = 2,
-                              .eos_token = 99 };
-    auto engine = scheduler::make(config, std::move(storage));
+    scheduler_config config {
+        .max_sequences = 2, .max_batch_tokens = 2, .kv_block_count = 8, .kv_block_size = 2
+    };
+    auto engine = scheduler::make(config, 99, std::move(storage));
     REQUIRE(engine);
     auto sequence = seq::make(1, { 1, 2, 3 }, { .max_new_tokens = 2 });
     REQUIRE(sequence);

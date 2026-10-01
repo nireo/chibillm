@@ -5,19 +5,15 @@
 #include <memory>
 #include <string>
 
-#include "model_runner.h"
 #include "result.h"
+#include "serving_runtime.h"
 
 namespace chibillm {
 
 struct server_config {
     std::string host { "127.0.0.1" };
     std::uint16_t port { 8000 };
-    std::size_t max_sequences { 4 };
-    std::size_t max_pending_requests { 64 };
-    std::size_t max_batch_tokens { 128 };
-    std::size_t kv_block_count { 64 };
-    std::size_t kv_block_size { 16 };
+    serving_config runtime;
     std::size_t default_max_completion_tokens { 256 };
 };
 
