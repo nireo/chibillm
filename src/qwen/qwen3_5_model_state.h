@@ -21,19 +21,19 @@ struct qwen3_5_linear_state {
 // before begin/commit/abort/release accesses CPU-visible storage.
 class qwen3_5_model_state final : public model_state {
 public:
-    [[nodiscard]] static result<std::unique_ptr<qwen3_5_model_state>, state_errc>
+    [[nodiscard]] static result<std::unique_ptr<qwen3_5_model_state>, state_error>
     make(const metal_context& context,
          const qwen3_5_config& config,
          std::size_t block_count,
          std::size_t block_size);
 
-    result<void, state_errc> reserve(seq_id id, std::size_t tokens) override;
+    result<void, state_error> reserve(seq_id id, std::size_t tokens) override;
     // Release requires no active batch. Unknown IDs are harmless.
     void release(seq_id id) noexcept override;
     std::size_t block_size() const noexcept override;
     sequence_resources resources(seq_id id) const noexcept override;
 
-    result<void, state_errc> begin_batch(const model_batch& batch) override;
+    result<void, state_error> begin_batch(const model_batch& batch) override;
     void commit_batch() noexcept override;
     void abort_batch() noexcept override;
 

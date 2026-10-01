@@ -15,7 +15,7 @@ namespace chibillm {
 
 // Encodes row gather, final norm, vocabulary projection, and argmax into the
 // current Metal command buffer. Only the small token-ID tensor is returned.
-[[nodiscard]] result<metal_tensor, tensor_op_errc>
+[[nodiscard]] result<metal_tensor, tensor_op_error>
 encode_greedy(const metal_context& context,
               const metal_tensor& norm_weight,
               const metal_tensor& vocabulary_weight,

@@ -15,6 +15,7 @@ using chibillm::inference_engine_errc;
 using chibillm::model_batch;
 using chibillm::model_runner;
 using chibillm::model_runner_errc;
+using chibillm::model_runner_error;
 using chibillm::result;
 using chibillm::scheduler_config;
 using chibillm::seq;
@@ -36,7 +37,7 @@ test_config()
 
 class stub_model_runner final : public model_runner {
 public:
-    explicit stub_model_runner(result<std::vector<token_id>, model_runner_errc> response)
+    explicit stub_model_runner(result<std::vector<token_id>, model_runner_error> response)
         : response_(std::move(response))
     {}
 
@@ -51,26 +52,26 @@ public:
         return value;
     }
 
-    result<std::vector<token_id>, model_runner_errc>
+    result<std::vector<token_id>, model_runner_error>
     encode_chat(std::span<const chibillm::chat_message>) override
     {
         return chibillm::fail(model_runner_errc::backend_failure);
     }
 
-    result<std::string, model_runner_errc>
+    result<std::string, model_runner_error>
     decode(std::span<const token_id>) const override
     {
         return chibillm::fail(model_runner_errc::backend_failure);
     }
 
-    result<std::vector<token_id>, model_runner_errc>
+    result<std::vector<token_id>, model_runner_error>
     execute(const model_batch&, chibillm::model_state&) override
     {
         return response_;
     }
 
 private:
-    result<std::vector<token_id>, model_runner_errc> response_;
+    result<std::vector<token_id>, model_runner_error> response_;
 };
 
 } // namespace
@@ -148,8 +149,8 @@ TEST_CASE("engine takes the EOS token from the model")
 
 TEST_CASE("runner failures abort the scheduler reservation")
 {
-    auto check_failure = [](result<std::vector<token_id>, model_runner_errc> response,
-                            inference_engine_errc expected) {
+    auto check_failure = [](result<std::vector<token_id>, model_runner_error> response,
+                            inference_engine_errc expected, std::string_view detail) {
         stub_model_runner runner(std::move(response));
         auto engine = inference_engine::make(test_config(), runner);
         auto sequence = seq::make(1, { 10 }, generation_params {});
@@ -160,6 +161,7 @@ TEST_CASE("runner failures abort the scheduler reservation")
         auto stepped = engine->step();
         REQUIRE_FALSE(stepped.has_value());
         CHECK(stepped.error() == expected);
+        CHECK(chibillm::describe_error(stepped.error()).find(detail) != std::string::npos);
         CHECK_FALSE(engine->has_in_flight_batch());
 
         const auto* unchanged = engine->find_sequence(1);
@@ -169,9 +171,31 @@ TEST_CASE("runner failures abort the scheduler reservation")
         CHECK(unchanged->status() == seq_status::waiting);
     };
 
-    check_failure(chibillm::fail(model_runner_errc::backend_failure),
-                  inference_engine_errc::model_execution_failed);
-    check_failure(std::vector<token_id> {}, inference_engine_errc::runner_result_count_mismatch);
+    check_failure(
+        chibillm::fail(model_runner_errc::backend_failure, "GPU command failed", "layer 2"),
+        inference_engine_errc::model_execution_failed, "layer 2: GPU command failed");
+    check_failure(std::vector<token_id> {}, inference_engine_errc::runner_result_count_mismatch,
+                  "expected 1 samples, received 0");
+}
+
+TEST_CASE("engine creation and lifecycle errors retain their causes")
+{
+    fake_model_runner runner { 42 };
+    auto config = test_config();
+    config.kv_block_count = 0;
+    auto invalid = inference_engine::make(config, runner);
+    REQUIRE_FALSE(invalid);
+    CHECK(invalid.error() == inference_engine_errc::scheduler_creation_failed);
+    CHECK(chibillm::describe_error(invalid.error()).find("block_manager.invalid_block_count")
+          != std::string::npos);
+
+    auto engine = inference_engine::make(test_config(), runner);
+    REQUIRE(engine);
+    auto removed = engine->remove(123);
+    REQUIRE_FALSE(removed);
+    CHECK(removed.error() == inference_engine_errc::sequence_remove_failed);
+    CHECK(chibillm::describe_error(removed.error()).find("scheduler.unknown_sequence")
+          != std::string::npos);
 }
 
 TEST_CASE(
@@ -184,7 +208,7 @@ TEST_CASE(
         int commits = 0;
         int releases = 0;
 
-        result<void, chibillm::state_errc>
+        result<void, chibillm::state_error>
         reserve(chibillm::seq_id, std::size_t) override
         {
             return {};
@@ -196,7 +220,7 @@ TEST_CASE(
             ++releases;
         }
 
-        result<void, chibillm::state_errc>
+        result<void, chibillm::state_error>
         begin_batch(const model_batch&) override
         {
             snapshot = value;
@@ -229,7 +253,7 @@ TEST_CASE(
             return info;
         }
 
-        result<std::unique_ptr<chibillm::model_state>, model_runner_errc>
+        result<std::unique_ptr<chibillm::model_state>, model_runner_error>
         make_state(scheduler_config) const override
         {
             auto result = std::make_unique<recurrent_state>();
@@ -237,19 +261,19 @@ TEST_CASE(
             return result;
         }
 
-        result<std::vector<token_id>, model_runner_errc>
+        result<std::vector<token_id>, model_runner_error>
         encode_chat(std::span<const chibillm::chat_message>) override
         {
             return std::vector<token_id> { 1 };
         }
 
-        result<std::string, model_runner_errc>
+        result<std::string, model_runner_error>
         decode(std::span<const token_id>) const override
         {
             return "x";
         }
 
-        result<std::vector<token_id>, model_runner_errc>
+        result<std::vector<token_id>, model_runner_error>
         execute(const model_batch& batch, chibillm::model_state& storage) override
         {
             CHECK(batch.kv_block_size == 0);

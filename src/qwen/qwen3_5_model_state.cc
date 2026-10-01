@@ -10,15 +10,15 @@
 
 namespace chibillm {
 namespace {
-result<tensor_descriptor, state_errc>
+result<tensor_descriptor, state_error>
 f32_descriptor(std::vector<std::size_t> dimensions)
 {
     auto shape = tensor_shape::make(std::move(dimensions));
     if (!shape)
-        return fail(state_errc::invalid_reservation);
+        return fail(state_errc::invalid_reservation, shape.error(), "state shape");
     auto descriptor = tensor_descriptor::make(dtype::f32, std::move(*shape));
     if (!descriptor)
-        return fail(state_errc::invalid_reservation);
+        return fail(state_errc::invalid_reservation, descriptor.error(), "state descriptor");
     return std::move(*descriptor);
 }
 
@@ -30,7 +30,7 @@ zero(metal_tensor& tensor)
 }
 } // namespace
 
-result<std::unique_ptr<qwen3_5_model_state>, state_errc>
+result<std::unique_ptr<qwen3_5_model_state>, state_error>
 qwen3_5_model_state::make(const metal_context& context,
                           const qwen3_5_config& config,
                           std::size_t block_count,
@@ -78,12 +78,14 @@ try {
         f32_descriptor({ config.linear_value_head_count, config.linear_key_head_dimension,
                          config.linear_value_head_dimension });
 
-    if (!convolution || !recurrent)
-        return fail(state_errc::invalid_reservation);
+    if (!convolution)
+        return fail(at_stage(convolution.error(), "convolution state"));
+    if (!recurrent)
+        return fail(at_stage(recurrent.error(), "recurrent state"));
 
     auto pages = block_manager::make(block_count, block_size);
     if (!pages)
-        return fail(state_errc::invalid_reservation);
+        return fail(state_errc::invalid_reservation, pages.error(), "block allocator");
 
     auto cache = metal_kv_cache::make(
         context,
@@ -92,13 +94,14 @@ try {
     if (!cache)
         return fail(cache.error() == kv_cache_errc::allocation_failed
                         ? state_errc::backend_failure
-                        : state_errc::invalid_reservation);
+                        : state_errc::invalid_reservation,
+                    cache.error(), "KV cache");
 
     return std::unique_ptr<qwen3_5_model_state>(
         new qwen3_5_model_state(context, config, std::move(*pages), std::move(*cache),
                                 std::move(*convolution), std::move(*recurrent)));
 } catch (const std::bad_alloc&) {
-    return fail(state_errc::backend_failure);
+    return fail(state_errc::allocation_failed);
 }
 
 qwen3_5_model_state::qwen3_5_model_state(const metal_context& context,
@@ -125,7 +128,7 @@ qwen3_5_model_state::qwen3_5_model_state(const metal_context& context,
     }
 }
 
-result<void, state_errc>
+result<void, state_error>
 qwen3_5_model_state::reserve(seq_id id, std::size_t tokens)
 {
     if (batch_open_ || !tokens || tokens > config_.max_position_embeddings)
@@ -148,8 +151,11 @@ qwen3_5_model_state::reserve(seq_id id, std::size_t tokens)
             for (std::size_t layer = 0; layer < linear_count_; ++layer) {
                 auto convolution = metal_tensor::make(context_, convolution_descriptor_);
                 auto recurrent = metal_tensor::make(context_, recurrent_descriptor_);
-                if (!convolution || !recurrent)
-                    return fail(state_errc::backend_failure);
+                if (!convolution)
+                    return fail(state_errc::backend_failure, convolution.error(),
+                                "convolution state");
+                if (!recurrent)
+                    return fail(state_errc::backend_failure, recurrent.error(), "recurrent state");
 
                 zero(*convolution);
                 zero(*recurrent);
@@ -175,7 +181,7 @@ qwen3_5_model_state::reserve(seq_id id, std::size_t tokens)
             pages_.release(id);
         }
 
-        return fail(state_errc::backend_failure);
+        return fail(state_errc::allocation_failed);
     }
 }
 
@@ -202,14 +208,15 @@ qwen3_5_model_state::resources(seq_id id) const noexcept
     return pages_.resources(id);
 }
 
-result<void, state_errc>
+result<void, state_error>
 qwen3_5_model_state::begin_batch(const model_batch& batch)
 try {
     if (batch_open_ || (batch.phase != batch_phase::prefill && batch.phase != batch_phase::decode))
         return fail(state_errc::invalid_reservation);
-    if (!prepare_paged_batch(batch, config_.max_position_embeddings, cache_.block_count(),
-                             block_size()))
-        return fail(state_errc::invalid_reservation);
+    auto prepared = prepare_paged_batch(batch, config_.max_position_embeddings,
+                                        cache_.block_count(), block_size());
+    if (!prepared)
+        return fail(state_errc::invalid_reservation, prepared.error(), "prepare batch");
     std::unordered_set<seq_id> seen;
     // Validate all sequences before copying state. Recurrent updates must append
     // exactly at the committed position; replaying a prefix would corrupt memory.
@@ -251,7 +258,7 @@ try {
     batch_open_ = true;
     return {};
 } catch (const std::bad_alloc&) {
-    return fail(state_errc::backend_failure);
+    return fail(state_errc::allocation_failed);
 }
 
 void

@@ -5,7 +5,6 @@
 #include "text.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <limits>
 #include <string>
 #include <utility>
@@ -25,16 +24,17 @@ public:
         : tokenizer_(tokenizer)
     {}
 
-    result<std::string, model_runner_errc>
+    result<std::string, model_runner_error>
     push(token_id token, bool final) override
     {
         auto bytes = tokenizer_.decode(std::span(&token, 1));
         if (!bytes)
-            return fail(model_runner_errc::tokenizer_failure);
+            return fail(model_runner_errc::tokenizer_failure, bytes.error(), "token decode");
         pending_ += *bytes;
         const auto prefix = complete_utf8_prefix(pending_);
         if (!prefix || (final && *prefix != pending_.size()))
-            return fail(model_runner_errc::tokenizer_failure);
+            return fail(model_runner_errc::tokenizer_failure, "invalid or incomplete UTF-8",
+                        "text decode");
         auto delta = pending_.substr(0, *prefix);
         pending_.erase(0, *prefix);
         return delta;
@@ -45,17 +45,9 @@ private:
     std::string pending_;
 };
 
-template <typename Error>
-void
-log_load_failure(const char* stage, Error error)
-{
-    std::fprintf(stderr, "[model-load] %s failed (error=%u)\n", stage,
-                 static_cast<unsigned>(error));
-}
-
 } // namespace
 
-result<qwen_model_runner, qwen_model_runner_errc>
+result<qwen_model_runner, qwen_model_runner_error>
 qwen_model_runner::make(const std::filesystem::path& model_directory,
                         std::string_view shader_source,
                         std::size_t kv_block_count,
@@ -69,24 +61,19 @@ qwen_model_runner::make(const std::filesystem::path& model_directory,
     }
     auto config = load_qwen3_config(model_directory / "config.json");
     if (!config) {
-        log_load_failure("config", config.error());
-        return fail(qwen_model_runner_errc::config_load_failed);
+        return fail(qwen_model_runner_errc::config_load_failed, config.error(), "config");
     }
     auto tokenizer = qwen_tokenizer::load(model_directory);
     if (!tokenizer) {
-        log_load_failure("tokenizer", tokenizer.error());
-        return fail(qwen_model_runner_errc::tokenizer_load_failed);
+        return fail(qwen_model_runner_errc::tokenizer_load_failed, tokenizer.error(), "tokenizer");
     }
     auto file = safetensors_file::open(model_directory / "model.safetensors");
     if (!file) {
-        log_load_failure("safetensors", file.error());
-        return fail(qwen_model_runner_errc::weights_open_failed);
+        return fail(qwen_model_runner_errc::weights_open_failed, file.error(), "safetensors");
     }
     auto context = metal_context::make(shader_source);
     if (!context) {
-        std::fprintf(stderr, "[model-load] Metal context failed: %s\n",
-                     context.error().message.c_str());
-        return fail(qwen_model_runner_errc::metal_context_creation_failed);
+        return fail(qwen_model_runner_errc::metal_context_creation_failed, context.error());
     }
     kv_cache_config cache_config {
         .layer_count = config->layer_count,
@@ -97,8 +84,7 @@ qwen_model_runner::make(const std::filesystem::path& model_directory,
     };
     auto weights = load_qwen_weights(*context, *file, *config);
     if (!weights) {
-        log_load_failure("weights", weights.error());
-        return fail(qwen_model_runner_errc::weights_load_failed);
+        return fail(qwen_model_runner_errc::weights_load_failed, weights.error(), "weights");
     }
 
     const auto context_tokens =
@@ -126,7 +112,7 @@ qwen_model_runner::qwen_model_runner(metal_context context,
     , info_(std::move(info))
 {}
 
-result<std::unique_ptr<model_state>, model_runner_errc>
+result<std::unique_ptr<model_state>, model_runner_error>
 qwen_model_runner::make_state(scheduler_config config) const
 {
     if (config.kv_block_size != cache_config_.block_size
@@ -137,7 +123,7 @@ qwen_model_runner::make_state(scheduler_config config) const
     geometry.block_count = config.kv_block_count;
     auto state = metal_model_state::make(context_, geometry);
     if (!state)
-        return fail(model_runner_errc::backend_failure);
+        return fail(model_runner_errc::backend_failure, state.error(), "create model state");
     return std::move(*state);
 }
 
@@ -159,7 +145,7 @@ qwen_model_runner::info() const noexcept
     return info_;
 }
 
-result<std::vector<token_id>, model_runner_errc>
+result<std::vector<token_id>, model_runner_error>
 qwen_model_runner::encode_chat(std::span<const chat_message> messages)
 {
     auto prompt = format_qwen_chat(messages);
@@ -167,22 +153,22 @@ qwen_model_runner::encode_chat(std::span<const chat_message> messages)
         return fail(prompt.error());
     auto tokens = tokenizer_.encode(*prompt);
     if (!tokens) {
-        return fail(model_runner_errc::tokenizer_failure);
+        return fail(model_runner_errc::tokenizer_failure, tokens.error(), "chat encode");
     }
     return std::move(*tokens);
 }
 
-result<std::string, model_runner_errc>
+result<std::string, model_runner_error>
 qwen_model_runner::decode(std::span<const token_id> tokens) const
 {
     auto text = tokenizer_.decode(tokens);
     if (!text) {
-        return fail(model_runner_errc::tokenizer_failure);
+        return fail(model_runner_errc::tokenizer_failure, text.error(), "text decode");
     }
     return std::move(*text);
 }
 
-result<std::vector<token_id>, model_runner_errc>
+result<std::vector<token_id>, model_runner_error>
 qwen_model_runner::execute(const model_batch& batch, model_state& state)
 {
     auto* paged_state = dynamic_cast<metal_model_state*>(&state);
@@ -194,7 +180,8 @@ qwen_model_runner::execute(const model_batch& batch, model_state& state)
     if (!metadata) {
         return fail(metadata.error() == model_batch_errc::empty_batch
                         ? model_runner_errc::empty_batch
-                        : model_runner_errc::inconsistent_batch);
+                        : model_runner_errc::inconsistent_batch,
+                    metadata.error(), "prepare batch");
     }
 
     // every kernel of the forward pass is encoded into one command buffer and
@@ -202,11 +189,11 @@ qwen_model_runner::execute(const model_batch& batch, model_state& state)
     compute_pass pass(context_);
     auto pass_started = pass.begin();
     if (!pass_started) {
-        return fail(model_runner_errc::backend_failure);
+        return fail(model_runner_errc::backend_failure, pass_started.error(), "begin compute pass");
     }
     auto hidden_states = embed_tokens(context_, weights_.token_embedding, batch.tokens);
     if (!hidden_states) {
-        return fail(model_runner_errc::backend_failure);
+        return fail(model_runner_errc::backend_failure, hidden_states.error(), "embedding");
     }
     auto final_hidden = run_qwen_layers(context_, config_, weights_, std::move(*hidden_states),
                                         {
@@ -218,29 +205,32 @@ qwen_model_runner::execute(const model_batch& batch, model_state& state)
                                         },
                                         cache);
     if (!final_hidden) {
-        return fail(model_runner_errc::backend_failure);
+        return fail(model_runner_errc::backend_failure, final_hidden.error(), "layers");
     }
     if (metadata->logits_indices.empty()) {
-        if (!pass.finish())
-            return fail(model_runner_errc::backend_failure);
+        auto finished = pass.finish();
+        if (!finished)
+            return fail(model_runner_errc::backend_failure, finished.error(),
+                        "finish compute pass");
         return std::vector<token_id> {};
     }
     auto encoded_tokens =
         encode_greedy(context_, weights_.final_norm, weights_.output, config_.rms_epsilon,
                       *final_hidden, metadata->logits_indices);
     if (!encoded_tokens) {
-        return fail(model_runner_errc::backend_failure);
+        return fail(model_runner_errc::backend_failure, encoded_tokens.error(), "greedy output");
     }
     auto pass_finished = pass.finish();
     if (!pass_finished) {
-        return fail(model_runner_errc::backend_failure);
+        return fail(model_runner_errc::backend_failure, pass_finished.error(),
+                    "finish compute pass");
     }
 
     // The pass writes only one int32 per sequence for the CPU to read.
     return read_greedy(*encoded_tokens);
 }
 
-result<qwen3_5_model_runner, qwen_model_runner_errc>
+result<qwen3_5_model_runner, qwen_model_runner_error>
 qwen3_5_model_runner::make(const std::filesystem::path& model_directory,
                            std::string_view shader_source,
                            std::size_t kv_block_count,
@@ -253,29 +243,23 @@ qwen3_5_model_runner::make(const std::filesystem::path& model_directory,
         return fail(qwen_model_runner_errc::cache_creation_failed);
     auto config = load_qwen3_5_config(model_directory / "config.json");
     if (!config) {
-        log_load_failure("config", config.error());
-        return fail(qwen_model_runner_errc::config_load_failed);
+        return fail(qwen_model_runner_errc::config_load_failed, config.error(), "config");
     }
     auto tokenizer = qwen_tokenizer::load(model_directory);
     if (!tokenizer) {
-        log_load_failure("tokenizer", tokenizer.error());
-        return fail(qwen_model_runner_errc::tokenizer_load_failed);
+        return fail(qwen_model_runner_errc::tokenizer_load_failed, tokenizer.error(), "tokenizer");
     }
     auto file = safetensors_file::open_model(model_directory);
     if (!file) {
-        log_load_failure("safetensors", file.error());
-        return fail(qwen_model_runner_errc::weights_open_failed);
+        return fail(qwen_model_runner_errc::weights_open_failed, file.error(), "safetensors");
     }
     auto context = metal_context::make(shader_source);
     if (!context) {
-        std::fprintf(stderr, "[model-load] Metal context failed: %s\n",
-                     context.error().message.c_str());
-        return fail(qwen_model_runner_errc::metal_context_creation_failed);
+        return fail(qwen_model_runner_errc::metal_context_creation_failed, context.error());
     }
     auto weights = load_qwen3_5_weights(*context, *file, *config);
     if (!weights) {
-        log_load_failure("weights", weights.error());
-        return fail(qwen_model_runner_errc::weights_load_failed);
+        return fail(qwen_model_runner_errc::weights_load_failed, weights.error(), "weights");
     }
     model_info info {
         .id = std::move(model_id),
@@ -304,14 +288,14 @@ qwen3_5_model_runner::qwen3_5_model_runner(metal_context context,
     , info_(std::move(info))
 {}
 
-result<std::unique_ptr<model_state>, model_runner_errc>
+result<std::unique_ptr<model_state>, model_runner_error>
 qwen3_5_model_runner::make_state(scheduler_config config) const
 {
     if (config.kv_block_size != block_size_ || config.kv_block_count > block_count_)
         return fail(model_runner_errc::inconsistent_batch);
     auto state = qwen3_5_model_state::make(context_, config_, config.kv_block_count, block_size_);
     if (!state)
-        return fail(model_runner_errc::backend_failure);
+        return fail(model_runner_errc::backend_failure, state.error(), "create model state");
     return std::move(*state);
 }
 
@@ -327,7 +311,7 @@ qwen3_5_model_runner::info() const noexcept
     return info_;
 }
 
-result<std::vector<token_id>, model_runner_errc>
+result<std::vector<token_id>, model_runner_error>
 qwen3_5_model_runner::encode_chat(std::span<const chat_message> messages)
 {
     auto prompt = format_qwen_chat(messages);
@@ -335,20 +319,20 @@ qwen3_5_model_runner::encode_chat(std::span<const chat_message> messages)
         return fail(prompt.error());
     auto tokens = tokenizer_.encode(*prompt);
     if (!tokens)
-        return fail(model_runner_errc::tokenizer_failure);
+        return fail(model_runner_errc::tokenizer_failure, tokens.error(), "chat encode");
     return std::move(*tokens);
 }
 
-result<std::string, model_runner_errc>
+result<std::string, model_runner_error>
 qwen3_5_model_runner::decode(std::span<const token_id> tokens) const
 {
     auto text = tokenizer_.decode(tokens);
     if (!text)
-        return fail(model_runner_errc::tokenizer_failure);
+        return fail(model_runner_errc::tokenizer_failure, text.error(), "text decode");
     return std::move(*text);
 }
 
-result<std::vector<token_id>, model_runner_errc>
+result<std::vector<token_id>, model_runner_error>
 qwen3_5_model_runner::execute(const model_batch& batch, model_state& state)
 {
     auto* hybrid = dynamic_cast<qwen3_5_model_state*>(&state);
@@ -359,31 +343,38 @@ qwen3_5_model_runner::execute(const model_batch& batch, model_state& state)
     if (!metadata)
         return fail(metadata.error() == model_batch_errc::empty_batch
                         ? model_runner_errc::empty_batch
-                        : model_runner_errc::inconsistent_batch);
+                        : model_runner_errc::inconsistent_batch,
+                    metadata.error(), "prepare batch");
 
     // The engine has already begun the state transaction. On any early return,
     // the pass destructor drains encoded writes before the engine aborts it.
     compute_pass pass(context_);
-    if (!pass.begin())
-        return fail(model_runner_errc::backend_failure);
+    auto started = pass.begin();
+    if (!started)
+        return fail(model_runner_errc::backend_failure, started.error(), "begin compute pass");
     auto hidden = embed_tokens(context_, weights_.token_embedding, batch.tokens);
     if (!hidden)
-        return fail(model_runner_errc::backend_failure);
+        return fail(model_runner_errc::backend_failure, hidden.error(), "embedding");
     auto output =
         run_qwen3_5_layers(context_, config_, weights_, std::move(*hidden), batch, *hybrid);
     if (!output)
-        return fail(model_runner_errc::backend_failure);
+        return fail(model_runner_errc::backend_failure, output.error(), "layers");
     if (metadata->logits_indices.empty()) {
-        if (!pass.finish())
-            return fail(model_runner_errc::backend_failure);
+        auto finished = pass.finish();
+        if (!finished)
+            return fail(model_runner_errc::backend_failure, finished.error(),
+                        "finish compute pass");
         return std::vector<token_id> {};
     }
     // Qwen3.5 ties the vocabulary projection to the embedding and uses a
     // zero-centered final RMSNorm, just like its decoder-layer norms.
     auto encoded = encode_greedy(context_, weights_.final_norm, weights_.token_embedding,
                                  config_.rms_epsilon, *output, metadata->logits_indices, true);
-    if (!encoded || !pass.finish())
-        return fail(model_runner_errc::backend_failure);
+    if (!encoded)
+        return fail(model_runner_errc::backend_failure, encoded.error(), "greedy output");
+    auto finished = pass.finish();
+    if (!finished)
+        return fail(model_runner_errc::backend_failure, finished.error(), "finish compute pass");
     return read_greedy(*encoded);
 }
 

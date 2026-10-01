@@ -1,5 +1,7 @@
 #pragma once
 
+#include "error.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +27,19 @@ enum class qwen_tokenizer_errc : std::uint8_t {
     token_not_found,
     token_id_out_of_range,
 };
+
+[[nodiscard]] inline std::string_view
+error_name(qwen_tokenizer_errc code) noexcept
+{
+    static constexpr std::array names {
+        "qwen_tokenizer.file_read_failed",      "qwen_tokenizer.invalid_json",
+        "qwen_tokenizer.invalid_vocabulary",    "qwen_tokenizer.invalid_merge",
+        "qwen_tokenizer.invalid_utf8",          "qwen_tokenizer.token_not_found",
+        "qwen_tokenizer.token_id_out_of_range",
+    };
+    const auto index = static_cast<std::size_t>(code);
+    return index < names.size() ? names[index] : "qwen_tokenizer.unknown_error";
+}
 
 class qwen_tokenizer {
 public:

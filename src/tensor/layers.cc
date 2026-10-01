@@ -2,7 +2,7 @@
 #include "tensor/tensor_ops.h"
 
 namespace chibillm {
-result<metal_tensor, tensor_op_errc>
+result<metal_tensor, tensor_op_error>
 normalized_swiglu(const metal_context& context,
                   const metal_tensor& norm,
                   const metal_tensor& gateup,

@@ -4,7 +4,7 @@
 #include <vector>
 
 namespace chibillm {
-result<attention_metadata_tensors, tensor_op_errc>
+result<attention_metadata_tensors, tensor_op_error>
 upload_attention_metadata(const metal_context& context, attention_metadata metadata)
 {
     auto positions = upload_u32(context, metadata.positions);
@@ -28,7 +28,7 @@ upload_attention_metadata(const metal_context& context, attention_metadata metad
 }
 
 namespace {
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 validate_shapes(const metal_tensor& queries,
                 const metal_tensor& positions,
                 const metal_tensor& block_table_offsets,
@@ -96,7 +96,7 @@ validate_shapes(const metal_tensor& queries,
 }
 } // namespace
 
-result<prepared_attention_batch, tensor_op_errc>
+result<prepared_attention_batch, tensor_op_error>
 prepared_attention_batch::make(const metal_context& context,
                                const metal_tensor& positions,
                                const metal_tensor& block_table,
@@ -181,8 +181,10 @@ prepared_attention_batch::make(const metal_context& context,
         const auto tile_bytes = query_tile_starts.size() * sizeof(std::uint32_t);
         auto starts = context.make_shared_buffer(tile_bytes);
         auto lengths = context.make_shared_buffer(tile_bytes);
-        if (!starts || !lengths)
-            return fail(tensor_op_errc::backend_failure);
+        if (!starts)
+            return fail(tensor_op_errc::backend_failure, starts.error(), "attention tile starts");
+        if (!lengths)
+            return fail(tensor_op_errc::backend_failure, lengths.error(), "attention tile lengths");
         std::memcpy(starts->bytes().data(), query_tile_starts.data(), tile_bytes);
         std::memcpy(lengths->bytes().data(), query_tile_lengths.data(), tile_bytes);
         result.tile_starts_ = std::move(*starts);
@@ -192,7 +194,7 @@ prepared_attention_batch::make(const metal_context& context,
     return result;
 }
 
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 paged_attention(const metal_context& context,
                 const metal_tensor& queries,
                 const prepared_attention_batch& metadata,
@@ -223,7 +225,7 @@ paged_attention(const metal_context& context,
             output.buffer(), rows, query_head_count, cache.kv_head_count(), head_dimension,
             cache.block_size(), slot_count, layer, table_entry_count, metadata.tile_count_);
         if (!dispatched) {
-            return fail(tensor_op_errc::backend_failure);
+            return fail(tensor_op_errc::backend_failure, dispatched.error());
         }
     } else {
         const auto dispatched = metal_kernels(context).dispatch_paged_attention_f32(
@@ -232,14 +234,14 @@ paged_attention(const metal_context& context,
             cache.values().buffer(), output.buffer(), rows, query_head_count, cache.kv_head_count(),
             head_dimension, cache.block_size(), slot_count, layer, table_entry_count);
         if (!dispatched) {
-            return fail(tensor_op_errc::backend_failure);
+            return fail(tensor_op_errc::backend_failure, dispatched.error());
         }
     }
 
     return {};
 }
 
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 paged_attention(const metal_context& context,
                 const metal_tensor& queries,
                 const metal_tensor& positions,

@@ -264,7 +264,7 @@ struct openai_server::implementation {
     std::uint16_t bound_port {};
 };
 
-result<std::unique_ptr<openai_server>, server_errc>
+result<std::unique_ptr<openai_server>, server_error>
 openai_server::make(model_runner& runner, server_config config)
 {
     if (config.host.empty()
@@ -278,7 +278,7 @@ openai_server::make(model_runner& runner, server_config config)
     }
     auto runtime = serving_runtime::make(runner, config.runtime);
     if (!runtime) {
-        return fail(server_errc::engine_creation_failed);
+        return fail(server_errc::engine_creation_failed, runtime.error());
     }
     auto impl = std::make_unique<implementation>(runner, std::move(config), std::move(*runtime));
 
@@ -414,7 +414,8 @@ openai_server::make(model_runner& runner, server_config config)
         port = impl->config.port;
     }
     if (port <= 0) {
-        return fail(server_errc::bind_failed);
+        return fail(server_errc::bind_failed,
+                    impl->config.host + ":" + std::to_string(impl->config.port));
     }
     impl->bound_port = static_cast<std::uint16_t>(port);
     return std::unique_ptr<openai_server>(new openai_server(std::move(impl)));
@@ -435,7 +436,7 @@ openai_server::port() const noexcept
     return implementation_->bound_port;
 }
 
-result<void, server_errc>
+result<void, server_error>
 openai_server::run()
 {
     if (!implementation_->http.listen_after_bind()) {

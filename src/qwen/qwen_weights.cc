@@ -86,7 +86,7 @@ mixer_layout(const qwen3_5_config& config, std::size_t layer)
 }
 } // namespace
 
-result<void, weight_errc>
+result<void, weight_error>
 validate_qwen_weights(const safetensors_file& file, const qwen3_config& config)
 {
     constexpr std::size_t per_layer = 11;
@@ -107,7 +107,7 @@ validate_qwen_weights(const safetensors_file& file, const qwen3_config& config)
     return {};
 }
 
-result<qwen_weights, weight_errc>
+result<qwen_weights, weight_error>
 load_qwen_weights(const metal_context& context,
                   const safetensors_file& file,
                   const qwen3_config& config)
@@ -142,7 +142,7 @@ load_qwen_weights(const metal_context& context,
                           std::move(layers) };
 }
 
-result<void, weight_errc>
+result<void, weight_error>
 validate_qwen3_5_weights(const safetensors_file& file, const qwen3_5_config& config)
 {
     if (config.layer_types.size() != config.layer_count
@@ -160,7 +160,7 @@ validate_qwen3_5_weights(const safetensors_file& file, const qwen3_5_config& con
     return {};
 }
 
-result<qwen3_5_weights, weight_errc>
+result<qwen3_5_weights, weight_error>
 load_qwen3_5_weights(const metal_context& context,
                      const safetensors_file& file,
                      const qwen3_5_config& config)

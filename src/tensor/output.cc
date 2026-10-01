@@ -11,7 +11,7 @@
 
 namespace chibillm {
 
-result<metal_tensor, tensor_op_errc>
+result<metal_tensor, tensor_op_error>
 encode_greedy(const metal_context& context,
               const metal_tensor& norm_weight,
               const metal_tensor& vocabulary_weight,
@@ -85,7 +85,7 @@ encode_greedy(const metal_context& context,
         token_ids->buffer(), logits_indices.size(), hidden_size, vocabulary_size, partial_count,
         epsilon, zero_centered);
     if (!operation) {
-        return fail(tensor_op_errc::backend_failure);
+        return fail(tensor_op_errc::backend_failure, operation.error(), "greedy projection");
     }
     return std::move(*token_ids);
 }

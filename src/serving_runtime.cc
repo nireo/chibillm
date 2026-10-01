@@ -13,12 +13,12 @@ struct prepared_request {
 
 struct serving_runtime::implementation {
 public:
-    static result<std::unique_ptr<implementation>, inference_engine_errc>
+    static result<std::unique_ptr<implementation>, inference_engine_error>
     make(model_runner& runner, const serving_config& config)
     {
         auto engine = inference_engine::make(config.scheduler, runner);
         if (!engine) {
-            return fail(inference_engine_errc::scheduler_creation_failed);
+            return fail(engine.error());
         }
         return std::unique_ptr<implementation>(
             new implementation(runner, config, std::move(*engine)));
@@ -120,8 +120,10 @@ private:
             if (!prompt) {
                 finish_error(submission.state,
                              { .kind = generation_errc::invalid_input,
-                               .message = "The messages could not be encoded.",
-                               .param = "messages" });
+                               .message = "The messages could not be encoded: "
+                                   + describe_error(prompt.error()),
+                               .param = "messages",
+                               .code = std::string(error_name(prompt.error().code)) });
                 continue;
             }
             if (prompt->size() >= runner_.info().max_context_tokens
@@ -137,9 +139,17 @@ private:
                 continue;
             }
 
+            auto decoder = runner_.make_decoder();
+            if (!decoder) {
+                finish_error(
+                    submission.state,
+                    { .kind = generation_errc::execution_failure,
+                      .message = "Decoder setup failed: decoder creation returned null." });
+                continue;
+            }
             {
                 std::lock_guard lock(submission.state->mutex);
-                submission.state->decoder = runner_.make_decoder();
+                submission.state->decoder = std::move(decoder);
                 submission.state->prompt_tokens = prompt->size();
                 submission.state->status = request_status::ready;
             }
@@ -167,17 +177,28 @@ private:
                 continue;
             }
             const auto id = active->first;
-            if (!engine_.cancel(id) || !engine_.remove(id)) {
+            auto released = release_sequence(id);
+            if (!released) {
                 finish_error(active->second,
                              {
                                  .kind = generation_errc::execution_failure,
-                                 .message = "The request could not be cancelled.",
+                                 .message = "The request could not be cancelled: "
+                                     + describe_error(released.error()),
                              });
             } else {
                 finish_cancelled(active->second);
             }
             active = active_.erase(active);
         }
+    }
+
+    result<void, inference_engine_error>
+    release_sequence(seq_id id)
+    {
+        auto cancelled = engine_.cancel(id);
+        if (!cancelled)
+            return fail(cancelled.error());
+        return engine_.remove(id);
     }
 
     void
@@ -203,11 +224,20 @@ private:
                                           .max_new_tokens = request.max_completion_tokens,
                                           .ignore_eos = false,
                                       });
-            if (!sequence || !engine_.add(std::move(*sequence))) {
+            if (!sequence) {
+                finish_error(
+                    request.state,
+                    { .kind = generation_errc::execution_failure,
+                      .message = "Sequence creation failed: " + describe_error(sequence.error()) });
+                continue;
+            }
+            auto added = engine_.add(std::move(*sequence));
+            if (!added) {
                 finish_error(request.state,
                              {
                                  .kind = generation_errc::execution_failure,
-                                 .message = "The request could not be admitted.",
+                                 .message = "The request could not be admitted: "
+                                     + describe_error(added.error()),
                              });
                 continue;
             }
@@ -226,11 +256,26 @@ private:
         const bool finished = update.reason != finish_reason::none;
         auto delta = state->decoder->push(update.token, finished);
         if (!delta) {
-            [[maybe_unused]] const auto cancelled = engine_.cancel(update.id);
+            auto message =
+                "The generated text could not be decoded: " + describe_error(delta.error());
+            auto released = release_sequence(update.id);
+            if (!released)
+                message += "; cleanup failed: " + describe_error(released.error());
             finish_error(state,
                          { .kind = generation_errc::execution_failure,
-                           .message = "The generated text could not be decoded." });
+                           .message = std::move(message),
+                           .code = std::string(error_name(delta.error().code)) });
             return true;
+        }
+        if (finished) {
+            auto removed = engine_.remove(update.id);
+            if (!removed) {
+                finish_error(
+                    state,
+                    { .kind = generation_errc::execution_failure,
+                      .message = "Sequence cleanup failed: " + describe_error(removed.error()) });
+                return true;
+            }
         }
         {
             std::lock_guard lock(state->mutex);
@@ -252,36 +297,40 @@ private:
     {
         auto updates = engine_.step();
         if (!updates) {
-            fail_all("Model execution failed.");
+            fail_all("Model execution failed: " + describe_error(updates.error()),
+                     std::string(error_name(updates.error().code)));
             return;
         }
         for (const auto& update : *updates) {
             if (!append_update(update)) {
                 continue;
             }
-            [[maybe_unused]] const auto removed = engine_.remove(update.id);
             active_.erase(update.id);
         }
     }
 
     void
-    fail_all(std::string message)
+    fail_all(std::string message, std::string code = {})
     {
         for (auto& request : pending_) {
             finish_error(request.state,
                          {
                              .kind = generation_errc::execution_failure,
                              .message = message,
+                             .code = code,
                          });
         }
         pending_.clear();
         for (auto& [id, state] : active_) {
-            [[maybe_unused]] const auto cancelled = engine_.cancel(id);
-            [[maybe_unused]] const auto removed = engine_.remove(id);
+            auto request_message = message;
+            auto released = release_sequence(id);
+            if (!released)
+                request_message += "; cleanup failed: " + describe_error(released.error());
             finish_error(state,
                          {
                              .kind = generation_errc::execution_failure,
-                             .message = message,
+                             .message = std::move(request_message),
+                             .code = code,
                          });
         }
         active_.clear();
@@ -324,7 +373,7 @@ private:
     std::jthread worker_;
 };
 
-result<std::unique_ptr<serving_runtime>, inference_engine_errc>
+result<std::unique_ptr<serving_runtime>, inference_engine_error>
 serving_runtime::make(model_runner& runner, serving_config config)
 {
     auto impl = implementation::make(runner, config);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "error.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -26,10 +28,27 @@ enum class qwen_model_runner_errc : std::uint8_t {
     cache_creation_failed,
 };
 
+[[nodiscard]] inline std::string_view
+error_name(qwen_model_runner_errc code) noexcept
+{
+    static constexpr std::array names {
+        "qwen_model_runner.config_load_failed",
+        "qwen_model_runner.tokenizer_load_failed",
+        "qwen_model_runner.metal_context_creation_failed",
+        "qwen_model_runner.weights_open_failed",
+        "qwen_model_runner.weights_load_failed",
+        "qwen_model_runner.cache_creation_failed",
+    };
+    const auto index = static_cast<std::size_t>(code);
+    return index < names.size() ? names[index] : "qwen_model_runner.unknown_error";
+}
+
+using qwen_model_runner_error = error<qwen_model_runner_errc>;
+
 // Connects scheduler batches to one resident Qwen model and its persistent KV cache.
 class qwen_model_runner final : public model_runner {
 public:
-    [[nodiscard]] static result<qwen_model_runner, qwen_model_runner_errc>
+    [[nodiscard]] static result<qwen_model_runner, qwen_model_runner_error>
     make(const std::filesystem::path& model_directory,
          std::string_view shader_source,
          std::size_t kv_block_count,
@@ -42,19 +61,19 @@ public:
     qwen_model_runner& operator=(qwen_model_runner&&) noexcept = default;
 
     std::unique_ptr<text_decoder> make_decoder() const override;
-    result<std::unique_ptr<model_state>, model_runner_errc>
+    result<std::unique_ptr<model_state>, model_runner_error>
     make_state(scheduler_config config) const override;
 
     [[nodiscard]] const qwen3_config& config() const noexcept;
     [[nodiscard]] const model_info& info() const noexcept override;
 
-    [[nodiscard]] result<std::vector<token_id>, model_runner_errc>
+    [[nodiscard]] result<std::vector<token_id>, model_runner_error>
     encode_chat(std::span<const chat_message> messages) override;
 
-    [[nodiscard]] result<std::string, model_runner_errc>
+    [[nodiscard]] result<std::string, model_runner_error>
     decode(std::span<const token_id> tokens) const override;
 
-    [[nodiscard]] result<std::vector<token_id>, model_runner_errc>
+    [[nodiscard]] result<std::vector<token_id>, model_runner_error>
     execute(const model_batch& batch, model_state& state) override;
 
 private:
@@ -77,7 +96,7 @@ private:
 // execute drains its compute pass before returning, including on failure.
 class qwen3_5_model_runner final : public model_runner {
 public:
-    [[nodiscard]] static result<qwen3_5_model_runner, qwen_model_runner_errc>
+    [[nodiscard]] static result<qwen3_5_model_runner, qwen_model_runner_error>
     make(const std::filesystem::path& model_directory,
          std::string_view shader_source,
          std::size_t kv_block_count,
@@ -90,14 +109,14 @@ public:
     qwen3_5_model_runner& operator=(qwen3_5_model_runner&&) noexcept = default;
 
     std::unique_ptr<text_decoder> make_decoder() const override;
-    result<std::unique_ptr<model_state>, model_runner_errc>
+    result<std::unique_ptr<model_state>, model_runner_error>
     make_state(scheduler_config config) const override;
     const model_info& info() const noexcept override;
-    result<std::vector<token_id>, model_runner_errc>
+    result<std::vector<token_id>, model_runner_error>
     encode_chat(std::span<const chat_message> messages) override;
-    result<std::string, model_runner_errc> decode(std::span<const token_id> tokens) const override;
-    result<std::vector<token_id>, model_runner_errc> execute(const model_batch& batch,
-                                                             model_state& state) override;
+    result<std::string, model_runner_error> decode(std::span<const token_id> tokens) const override;
+    result<std::vector<token_id>, model_runner_error> execute(const model_batch& batch,
+                                                              model_state& state) override;
 
 private:
     qwen3_5_model_runner(metal_context context,

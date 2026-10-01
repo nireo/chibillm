@@ -11,8 +11,8 @@
 
 namespace chibillm {
 
-[[nodiscard]] result<metal_tensor, tensor_op_errc> embed_tokens(const metal_context& context,
-                                                                const metal_tensor& weight,
-                                                                std::span<const token_id> tokens);
+[[nodiscard]] result<metal_tensor, tensor_op_error> embed_tokens(const metal_context& context,
+                                                                 const metal_tensor& weight,
+                                                                 std::span<const token_id> tokens);
 
 } // namespace chibillm

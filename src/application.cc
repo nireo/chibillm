@@ -36,12 +36,13 @@ run_server(model_runner& runner, scheduler_config config, std::size_t max_tokens
                                           .default_max_completion_tokens = max_tokens,
                                       });
     if (!server) {
-        std::cerr << "failed to start the HTTP server\n";
+        std::cerr << "failed to start the HTTP server: " << describe_error(server.error()) << '\n';
         return 1;
     }
     std::cerr << "listening on http://127.0.0.1:" << (*server)->port() << "/v1\n";
-    if (!(*server)->run()) {
-        std::cerr << "HTTP server failed\n";
+    auto served = (*server)->run();
+    if (!served) {
+        std::cerr << "HTTP server failed: " << describe_error(served.error()) << '\n';
         return 1;
     }
     return 0;
@@ -81,6 +82,8 @@ run_application(const cli_options& settings, const std::filesystem::path& shader
                     ? "unsupported model architecture in "
                     : "failed to load model from ")
             << model_directory
+            << ": "
+            << describe_error(runner.error())
             << '\n';
         return 1;
     }

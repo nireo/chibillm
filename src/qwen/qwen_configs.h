@@ -1,5 +1,7 @@
 #pragma once
 
+#include "error.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -20,6 +22,19 @@ enum class qwen_config_errc : std::uint8_t {
     unsupported_configuration,
     invalid_geometry,
 };
+
+[[nodiscard]] inline std::string_view
+error_name(qwen_config_errc code) noexcept
+{
+    static constexpr std::array names {
+        "qwen_config.file_read_failed",       "qwen_config.invalid_json",
+        "qwen_config.missing_field",          "qwen_config.invalid_field",
+        "qwen_config.unsupported_model_type", "qwen_config.unsupported_configuration",
+        "qwen_config.invalid_geometry",
+    };
+    const auto index = static_cast<std::size_t>(code);
+    return index < names.size() ? names[index] : "qwen_config.unknown_error";
+}
 
 struct qwen3_config {
     std::size_t vocabulary_size;

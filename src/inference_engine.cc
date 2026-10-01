@@ -6,15 +6,16 @@
 
 namespace chibillm {
 
-result<inference_engine, inference_engine_errc>
+result<inference_engine, inference_engine_error>
 inference_engine::make(scheduler_config config, model_runner& runner)
 {
     auto state = runner.make_state(config);
     if (!state)
-        return fail(inference_engine_errc::scheduler_creation_failed);
+        return fail(inference_engine_errc::scheduler_creation_failed, state.error(),
+                    "create model state");
     auto scheduler_result = scheduler::make(config, runner.info().eos_token, std::move(*state));
     if (!scheduler_result) {
-        return fail(inference_engine_errc::scheduler_creation_failed);
+        return fail(inference_engine_errc::scheduler_creation_failed, scheduler_result.error());
     }
 
     return inference_engine { std::move(*scheduler_result), runner };
@@ -43,76 +44,94 @@ inference_engine::find_sequence(seq_id id) const noexcept
     return scheduler_.find_sequence(id);
 }
 
-result<void, inference_engine_errc>
+result<void, inference_engine_error>
 inference_engine::add(seq sequence)
 {
     auto added = scheduler_.add(std::move(sequence));
     if (!added) {
-        return fail(inference_engine_errc::sequence_add_failed);
+        return fail(inference_engine_errc::sequence_add_failed, added.error());
     }
 
     return {};
 }
 
-result<std::vector<sequence_update>, inference_engine_errc>
+result<std::vector<sequence_update>, inference_engine_error>
 inference_engine::step()
 {
     auto scheduled = scheduler_.schedule();
     if (!scheduled) {
-        return fail(inference_engine_errc::scheduling_failed);
+        return fail(inference_engine_errc::scheduling_failed, scheduled.error());
     }
 
     auto batch = build_model_batch(*scheduled, scheduler_);
     if (!batch) {
-        return fail_after_abort(*scheduled, inference_engine_errc::model_batch_build_failed);
+        return fail_after_abort(
+            *scheduled,
+            { inference_engine_errc::model_batch_build_failed, describe_error(batch.error()) });
     }
 
-    if (!scheduler_.begin_execution(*batch)) {
-        return fail_after_abort(*scheduled, inference_engine_errc::model_execution_failed);
+    auto begun = scheduler_.begin_execution(*batch);
+    if (!begun) {
+        return fail_after_abort(*scheduled,
+                                { inference_engine_errc::model_execution_failed,
+                                  "begin batch: " + describe_error(begun.error()) });
     }
     auto sampled_tokens = runner_->execute(*batch, scheduler_.state());
     if (!sampled_tokens) {
-        return fail_after_abort(*scheduled, inference_engine_errc::model_execution_failed);
+        return fail_after_abort(*scheduled,
+                                { inference_engine_errc::model_execution_failed,
+                                  describe_error(sampled_tokens.error()) });
     }
 
     if (sampled_tokens->size() != batch->sample_count()) {
-        return fail_after_abort(*scheduled, inference_engine_errc::runner_result_count_mismatch);
+        return fail_after_abort(*scheduled,
+                                { inference_engine_errc::runner_result_count_mismatch,
+                                  "expected "
+                                      + std::to_string(batch->sample_count())
+                                      + " samples, received "
+                                      + std::to_string(sampled_tokens->size()) });
     }
 
     auto completed = scheduler_.complete(scheduled->id, *sampled_tokens);
     if (!completed) {
-        return fail_after_abort(*scheduled, inference_engine_errc::batch_completion_failed);
+        return fail_after_abort(
+            *scheduled,
+            { inference_engine_errc::batch_completion_failed, describe_error(completed.error()) });
     }
     return std::move(*completed);
 }
 
-result<void, inference_engine_errc>
+result<void, inference_engine_error>
 inference_engine::cancel(seq_id id)
 {
-    if (!scheduler_.cancel(id)) {
-        return fail(inference_engine_errc::sequence_cancel_failed);
+    auto cancelled = scheduler_.cancel(id);
+    if (!cancelled) {
+        return fail(inference_engine_errc::sequence_cancel_failed, cancelled.error());
     }
     return {};
 }
 
-result<void, inference_engine_errc>
+result<void, inference_engine_error>
 inference_engine::remove(seq_id id)
 {
-    if (!scheduler_.remove(id)) {
-        return fail(inference_engine_errc::sequence_remove_failed);
+    auto removed = scheduler_.remove(id);
+    if (!removed) {
+        return fail(inference_engine_errc::sequence_remove_failed, removed.error());
     }
     return {};
 }
 
-std::unexpected<inference_engine_errc>
-inference_engine::fail_after_abort(const scheduled_batch& batch, inference_engine_errc error)
+std::unexpected<inference_engine_error>
+inference_engine::fail_after_abort(const scheduled_batch& batch, inference_engine_error error)
 {
     auto aborted = scheduler_.abort(batch.id);
     if (!aborted) {
-        return fail(inference_engine_errc::batch_abort_failed);
+        return fail(inference_engine_error {
+            inference_engine_errc::batch_abort_failed,
+            describe_error(aborted.error()) + "; original failure: " + describe_error(error) });
     }
 
-    return fail(error);
+    return fail(std::move(error));
 }
 
 } // namespace chibillm

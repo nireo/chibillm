@@ -11,18 +11,19 @@
 
 namespace chibillm {
 
-result<metal_tensor, tensor_op_errc>
+result<metal_tensor, tensor_op_error>
 allocate_tensor(const metal_context& context, dtype type, std::vector<std::size_t> dimensions)
 {
     auto tensor = metal_tensor::make(context, type, std::move(dimensions));
     if (!tensor)
         return fail(tensor.error() == metal_tensor_errc::invalid_descriptor
                         ? tensor_op_errc::tensor_creation_failed
-                        : tensor_op_errc::allocation_failed);
+                        : tensor_op_errc::allocation_failed,
+                    tensor.error());
     return std::move(*tensor);
 }
 
-result<metal_tensor, tensor_op_errc>
+result<metal_tensor, tensor_op_error>
 upload_u32(const metal_context& context, std::span<const std::uint32_t> values)
 {
     auto tensor = allocate_tensor(context, dtype::u32, { values.size() });
@@ -32,7 +33,7 @@ upload_u32(const metal_context& context, std::span<const std::uint32_t> values)
     return std::move(*tensor);
 }
 
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 linear_add(const metal_context& context,
            const metal_tensor& input,
            const metal_tensor& weight,
@@ -81,7 +82,7 @@ linear_add(const metal_context& context,
         const auto dispatched = metal_kernels(context).dispatch_linear_split_bf16(
             input.buffer(), weight.buffer(), output_buffers, rows, input_features, widths);
         if (!dispatched) {
-            return fail(tensor_op_errc::backend_failure);
+            return fail(tensor_op_errc::backend_failure, dispatched.error());
         }
         return add(context, residual, output, output);
     }
@@ -90,12 +91,12 @@ linear_add(const metal_context& context,
         input.buffer(), weight.buffer(), residual.buffer(), output.buffer(), input_features,
         output_features);
     if (!dispatched) {
-        return fail(tensor_op_errc::backend_failure);
+        return fail(tensor_op_errc::backend_failure, dispatched.error());
     }
     return {};
 }
 
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 linear_split(const metal_context& context,
              const metal_tensor& input,
              const metal_tensor& packed_weight,
@@ -150,13 +151,13 @@ linear_split(const metal_context& context,
     const auto dispatched = metal_kernels(context).dispatch_linear_split_bf16(
         input.buffer(), packed_weight.buffer(), output_buffers, rows, input_features, widths);
     if (!dispatched) {
-        return fail(tensor_op_errc::backend_failure);
+        return fail(tensor_op_errc::backend_failure, dispatched.error());
     }
 
     return {};
 }
 
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 embedding_lookup(const metal_context& context,
                  const metal_tensor& token_ids,
                  const metal_tensor& weight,
@@ -198,13 +199,13 @@ embedding_lookup(const metal_context& context,
     const auto dispatched = metal_kernels(context).dispatch_embedding_bf16(
         token_ids.buffer(), weight.buffer(), output.buffer(), token_count, hidden_size);
     if (!dispatched) {
-        return fail(tensor_op_errc::backend_failure);
+        return fail(tensor_op_errc::backend_failure, dispatched.error());
     }
 
     return {};
 }
 
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 rms_norm(const metal_context& context,
          const metal_tensor& input,
          const metal_tensor& weight,
@@ -247,14 +248,14 @@ rms_norm(const metal_context& context,
         input.buffer(), weight.buffer(), output.buffer(), rows * groups_per_row, group_size,
         epsilon, zero_centered);
     if (!dispatched) {
-        return fail(tensor_op_errc::backend_failure);
+        return fail(tensor_op_errc::backend_failure, dispatched.error());
     }
 
     return {};
 }
 
 namespace {
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 gate_mul(const metal_context& context,
          const metal_tensor& gate,
          const metal_tensor& up,
@@ -291,7 +292,7 @@ gate_mul(const metal_context& context,
     const auto dispatched = metal_kernels(context).dispatch_silu_mul_f32(
         gate.buffer(), up.buffer(), output.buffer(), gate_shape.element_count(), sigmoid_only);
     if (!dispatched) {
-        return fail(tensor_op_errc::backend_failure);
+        return fail(tensor_op_errc::backend_failure, dispatched.error());
     }
 
     return {};
@@ -299,7 +300,7 @@ gate_mul(const metal_context& context,
 
 } // namespace
 
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 silu_mul(const metal_context& context,
          const metal_tensor& gate,
          const metal_tensor& up,
@@ -308,7 +309,7 @@ silu_mul(const metal_context& context,
     return gate_mul(context, gate, up, output, false);
 }
 
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 sigmoid_mul(const metal_context& context,
             const metal_tensor& gate,
             const metal_tensor& input,
@@ -317,7 +318,7 @@ sigmoid_mul(const metal_context& context,
     return gate_mul(context, gate, input, output, true);
 }
 
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 add(const metal_context& context,
     const metal_tensor& lhs,
     const metal_tensor& rhs,
@@ -353,13 +354,13 @@ add(const metal_context& context,
     const auto dispatched = metal_kernels(context).dispatch_add_f32(
         lhs.buffer(), rhs.buffer(), output.buffer(), lhs_shape.element_count());
     if (!dispatched) {
-        return fail(tensor_op_errc::backend_failure);
+        return fail(tensor_op_errc::backend_failure, dispatched.error());
     }
 
     return {};
 }
 
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 split_heads(const metal_context& context,
             const metal_tensor& input,
             std::size_t head_count,
@@ -395,15 +396,16 @@ split_heads(const metal_context& context,
         || input.buffer().bytes().data() == second.buffer().bytes().data())
         return fail(tensor_op_errc::unsupported_aliasing);
 
-    if (!metal_kernels(context).dispatch_split_heads_f32(input.buffer(), first.buffer(),
-                                                         second.buffer(), dims[0], head_count,
-                                                         dims[1] / head_count / 2))
-        return fail(tensor_op_errc::backend_failure);
+    auto dispatched = metal_kernels(context).dispatch_split_heads_f32(
+        input.buffer(), first.buffer(), second.buffer(), dims[0], head_count,
+        dims[1] / head_count / 2);
+    if (!dispatched)
+        return fail(tensor_op_errc::backend_failure, dispatched.error());
 
     return {};
 }
 
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 rope(const metal_context& context,
      const metal_tensor& input,
      const metal_tensor& positions,
@@ -461,13 +463,13 @@ rope(const metal_context& context,
         input.buffer(), positions.buffer(), output.buffer(), rows, head_count, head_dimension,
         theta, rotary_dimension);
     if (!dispatched) {
-        return fail(tensor_op_errc::backend_failure);
+        return fail(tensor_op_errc::backend_failure, dispatched.error());
     }
 
     return {};
 }
 
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 store_kv(const metal_context& context,
          const metal_tensor& keys,
          const metal_tensor& values,
@@ -521,7 +523,7 @@ store_kv(const metal_context& context,
         keys.buffer(), values.buffer(), slot_mapping.buffer(), cache.keys().buffer(),
         cache.values().buffer(), rows, feature_count, layer, slot_count);
     if (!dispatched) {
-        return fail(tensor_op_errc::backend_failure);
+        return fail(tensor_op_errc::backend_failure, dispatched.error());
     }
 
     return {};

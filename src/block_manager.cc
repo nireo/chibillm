@@ -29,7 +29,7 @@ block_manager::resources(seq_id id) const noexcept
     return found == tables_.end() ? sequence_resources {} : sequence_resources { found->second };
 }
 
-result<void, state_errc>
+result<void, state_error>
 block_manager::reserve(seq_id id, std::size_t tokens)
 {
     if (!tokens)

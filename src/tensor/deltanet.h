@@ -22,7 +22,7 @@ struct deltanet_chunk {
 //
 // input/output: f32 [tokens, channels], weight: bf16 [channels, 1, kernel].
 // history: f32 [channels, kernel], oldest to newest raw (pre-SiLU) inputs.
-[[nodiscard]] result<void, tensor_op_errc>
+[[nodiscard]] result<void, tensor_op_error>
 causal_conv1d_silu(const metal_context& context,
                    const metal_tensor& input,
                    const metal_tensor& weight,
@@ -43,7 +43,7 @@ causal_conv1d_silu(const metal_context& context,
 // output: f32 [tokens, value_heads * value_dim]. Prefill of at least 32 tokens
 // uses chunkwise matrix products and a triangular solve with bounded scratch.
 // Short scans (including decode) use the original sequential reference kernel.
-[[nodiscard]] result<void, tensor_op_errc>
+[[nodiscard]] result<void, tensor_op_error>
 gated_delta_rule(const metal_context& context,
                  const metal_tensor& qkv,
                  const metal_tensor& a,
@@ -59,11 +59,11 @@ gated_delta_rule(const metal_context& context,
 // input/gate/output: f32 [tokens, heads * value_dim], weight: f32 [value_dim].
 // Each head is normalized independently, then scaled by weight and SiLU(gate).
 // This norm uses weight directly, NOT the zero-centered (1 + weight) variant.
-[[nodiscard]] result<void, tensor_op_errc> rms_norm_gated(const metal_context& context,
-                                                          const metal_tensor& input,
-                                                          const metal_tensor& gate,
-                                                          const metal_tensor& weight,
-                                                          float epsilon,
-                                                          metal_tensor& output);
+[[nodiscard]] result<void, tensor_op_error> rms_norm_gated(const metal_context& context,
+                                                           const metal_tensor& input,
+                                                           const metal_tensor& gate,
+                                                           const metal_tensor& weight,
+                                                           float epsilon,
+                                                           metal_tensor& output);
 
 } // namespace chibillm

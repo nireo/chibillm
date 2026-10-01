@@ -12,7 +12,7 @@
 namespace chibillm {
 namespace {
 
-result<qwen_qkv, tensor_op_errc>
+result<qwen_qkv, tensor_op_error>
 apply_rope(const metal_context& context,
            const qwen3_config& config,
            qwen_qkv qkv,
@@ -30,7 +30,7 @@ apply_rope(const metal_context& context,
     return qwen_qkv { std::move(*query), std::move(*key), std::move(qkv.value) };
 }
 
-result<metal_tensor, tensor_op_errc>
+result<metal_tensor, tensor_op_error>
 run_attention(const metal_context& context,
               const qwen3_config& config,
               const qwen_layer_weights& weights,
@@ -58,7 +58,7 @@ run_attention(const metal_context& context,
 
 } // namespace
 
-result<qwen_qkv, tensor_op_errc>
+result<qwen_qkv, tensor_op_error>
 project_qwen_qkv(const metal_context& context,
                  const qwen3_config& config,
                  const qwen_layer_weights& weights,
@@ -90,7 +90,7 @@ project_qwen_qkv(const metal_context& context,
     return qwen_qkv { std::move(*query), std::move(*key), std::move(*value) };
 }
 
-result<qwen_qkv, tensor_op_errc>
+result<qwen_qkv, tensor_op_error>
 normalize_qwen_qk(const metal_context& context,
                   const qwen3_config& config,
                   const qwen_layer_weights& weights,
@@ -114,7 +114,7 @@ normalize_qwen_qk(const metal_context& context,
     return qwen_qkv { std::move(*query), std::move(*key), std::move(qkv.value) };
 }
 
-result<metal_tensor, tensor_op_errc>
+result<metal_tensor, tensor_op_error>
 run_qwen_layers(const metal_context& context,
                 const qwen3_config& config,
                 const qwen_weights& weights,
@@ -139,30 +139,30 @@ run_qwen_layers(const metal_context& context,
         const auto& layer_weights = weights.layers[layer];
         auto qkv = project_qwen_qkv(context, config, layer_weights, hidden_states);
         if (!qkv)
-            return fail(qkv.error());
+            return fail(at_stage(qkv.error(), "layer " + std::to_string(layer)));
         qkv = normalize_qwen_qk(context, config, layer_weights, std::move(*qkv));
         if (!qkv)
-            return fail(qkv.error());
+            return fail(at_stage(qkv.error(), "layer " + std::to_string(layer)));
         qkv = apply_rope(context, config, std::move(*qkv), prepared->positions());
         if (!qkv)
-            return fail(qkv.error());
+            return fail(at_stage(qkv.error(), "layer " + std::to_string(layer)));
 
         auto attention = run_attention(context, config, layer_weights, layer, hidden_states,
                                        std::move(*qkv), uploaded->slots, *prepared, cache);
         if (!attention)
-            return fail(attention.error());
+            return fail(at_stage(attention.error(), "layer " + std::to_string(layer)));
         auto output = normalized_swiglu(context, layer_weights.post_attention_norm,
                                         layer_weights.gateup_packed, layer_weights.mlp_down,
                                         config.rms_epsilon, *attention);
         if (!output)
-            return fail(output.error());
+            return fail(at_stage(output.error(), "layer " + std::to_string(layer)));
         hidden_states = std::move(*output);
     }
 
     return std::move(hidden_states);
 }
 
-result<metal_tensor, tensor_op_errc>
+result<metal_tensor, tensor_op_error>
 run_qwen3_5_full_attention(const metal_context& context,
                            const qwen3_5_config& config,
                            const qwen3_5_layer_weights& weights,
@@ -189,28 +189,28 @@ run_qwen3_5_full_attention(const metal_context& context,
     const auto rows = shape.dimensions()[0];
     auto normalized = allocate_tensor(context, dtype::f32, { rows, config.hidden_size });
     if (!normalized)
-        return fail(normalized.error());
+        return fail(at_stage(normalized.error(), "cache layer " + std::to_string(cache_layer)));
     CL_TRY(rms_norm(context, hidden_states, weights.input_norm, config.rms_epsilon, *normalized,
                     true));
 
     auto query_gate = allocate_tensor(context, dtype::f32, { rows, 2 * config.query_width() });
     if (!query_gate)
-        return fail(query_gate.error());
+        return fail(at_stage(query_gate.error(), "cache layer " + std::to_string(cache_layer)));
     auto key = allocate_tensor(context, dtype::f32, { rows, config.kv_width() });
     if (!key)
-        return fail(key.error());
+        return fail(at_stage(key.error(), "cache layer " + std::to_string(cache_layer)));
     auto value = allocate_tensor(context, dtype::f32, { rows, config.kv_width() });
     if (!value)
-        return fail(value.error());
+        return fail(at_stage(value.error(), "cache layer " + std::to_string(cache_layer)));
     CL_TRY(linear_split(context, *normalized, attention->qkv_packed,
                         { &*query_gate, &*key, &*value }));
 
     auto query = allocate_tensor(context, dtype::f32, { rows, config.query_width() });
     if (!query)
-        return fail(query.error());
+        return fail(at_stage(query.error(), "cache layer " + std::to_string(cache_layer)));
     auto gate = allocate_tensor(context, dtype::f32, { rows, config.query_width() });
     if (!gate)
-        return fail(gate.error());
+        return fail(at_stage(gate.error(), "cache layer " + std::to_string(cache_layer)));
     CL_TRY(split_heads(context, *query_gate, config.query_head_count, *query, *gate));
 
     // Each norm and rotation supports in-place operation on independent heads.
@@ -224,14 +224,14 @@ run_qwen3_5_full_attention(const metal_context& context,
 
     auto attended = allocate_tensor(context, dtype::f32, { rows, config.query_width() });
     if (!attended)
-        return fail(attended.error());
+        return fail(at_stage(attended.error(), "cache layer " + std::to_string(cache_layer)));
     CL_TRY(paged_attention(context, *query, prepared, cache_layer, config.query_head_count, cache,
                            *attended));
     CL_TRY(sigmoid_mul(context, *gate, *attended, *attended));
 
     auto output = allocate_tensor(context, dtype::f32, { rows, config.hidden_size });
     if (!output)
-        return fail(output.error());
+        return fail(at_stage(output.error(), "cache layer " + std::to_string(cache_layer)));
     CL_TRY(linear_add(context, *attended, attention->output, hidden_states, *output));
 
     return std::move(*output);

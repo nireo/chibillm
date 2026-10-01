@@ -1,7 +1,7 @@
 #include "qwen/qwen_chat.h"
 
 namespace chibillm {
-result<std::string, model_runner_errc>
+result<std::string, model_runner_error>
 format_qwen_chat(std::span<const chat_message> messages, bool thinking)
 {
     if (messages.empty()) {

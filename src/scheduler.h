@@ -1,5 +1,7 @@
 #pragma once
 
+#include "error.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -72,10 +74,29 @@ enum class scheduler_errc : std::uint8_t {
     sequence_failure,
 };
 
+[[nodiscard]] inline std::string_view
+error_name(scheduler_errc code) noexcept
+{
+    static constexpr std::array names {
+        "scheduler.invalid_max_sequences",    "scheduler.invalid_max_batch_tokens",
+        "scheduler.invalid_kv_block_count",   "scheduler.invalid_kv_block_size",
+        "scheduler.duplicate_sequence_id",    "scheduler.invalid_sequence_state",
+        "scheduler.unknown_sequence",         "scheduler.batch_in_flight",
+        "scheduler.no_batch_in_flight",       "scheduler.batch_id_mismatch",
+        "scheduler.result_count_mismatch",    "scheduler.no_runnable_sequences",
+        "scheduler.cache_capacity_exhausted", "scheduler.block_manager_failure",
+        "scheduler.sequence_failure",
+    };
+    const auto index = static_cast<std::size_t>(code);
+    return index < names.size() ? names[index] : "scheduler.unknown_error";
+}
+
+using scheduler_error = error<scheduler_errc>;
+
 // owns sequences and coordinates model work with cache ownership.
 class scheduler {
 public:
-    [[nodiscard]] static result<scheduler, scheduler_errc>
+    [[nodiscard]] static result<scheduler, scheduler_error>
     make(scheduler_config config, token_id eos_token, std::unique_ptr<model_state> state = {});
 
     scheduler(const scheduler&) = delete;
@@ -108,23 +129,23 @@ public:
     }
 
     // accepts a pristine waiting sequence.
-    [[nodiscard]] result<void, scheduler_errc> add(seq sequence);
+    [[nodiscard]] result<void, scheduler_error> add(seq sequence);
 
     // returns one prefill or decode reservation.
-    [[nodiscard]] result<scheduled_batch, scheduler_errc> schedule();
+    [[nodiscard]] result<scheduled_batch, scheduler_error> schedule();
 
-    result<void, scheduler_errc> begin_execution(const model_batch& batch);
+    result<void, scheduler_error> begin_execution(const model_batch& batch);
 
     // commits model work and applies samples only for completed prefill and decode items.
-    [[nodiscard]] result<std::vector<sequence_update>, scheduler_errc>
+    [[nodiscard]] result<std::vector<sequence_update>, scheduler_error>
     complete(batch_id id, std::span<const token_id> sampled_tokens);
 
     // cancels an in-flight reservation without releasing cache capacity.
-    [[nodiscard]] result<void, scheduler_errc> abort(batch_id id);
+    [[nodiscard]] result<void, scheduler_error> abort(batch_id id);
 
     // Request lifecycle operations are valid only between model batches.
-    [[nodiscard]] result<void, scheduler_errc> cancel(seq_id id);
-    [[nodiscard]] result<void, scheduler_errc> remove(seq_id id);
+    [[nodiscard]] result<void, scheduler_error> cancel(seq_id id);
+    [[nodiscard]] result<void, scheduler_error> remove(seq_id id);
 
 private:
     seq* mutable_sequence(seq_id id) noexcept;

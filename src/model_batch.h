@@ -1,5 +1,7 @@
 #pragma once
 
+#include "error.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -53,6 +55,24 @@ enum class model_batch_errc : std::uint8_t {
     token_range_out_of_bounds,
     position_out_of_range,
 };
+
+[[nodiscard]] inline std::string_view
+error_name(model_batch_errc code) noexcept
+{
+    static constexpr std::array names {
+        "model_batch.empty_batch",
+        "model_batch.inconsistent_batch",
+        "model_batch.zero_token_count",
+        "model_batch.duplicate_sequence_id",
+        "model_batch.unknown_sequence",
+        "model_batch.invalid_sequence_state",
+        "model_batch.scheduled_token_count_mismatch",
+        "model_batch.token_range_out_of_bounds",
+        "model_batch.position_out_of_range",
+    };
+    const auto index = static_cast<std::size_t>(code);
+    return index < names.size() ? names[index] : "model_batch.unknown_error";
+}
 
 struct paged_batch_metadata {
     std::vector<std::uint32_t> slots;

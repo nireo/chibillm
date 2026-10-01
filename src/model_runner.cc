@@ -4,12 +4,12 @@
 
 namespace chibillm {
 
-result<std::unique_ptr<model_state>, model_runner_errc>
+result<std::unique_ptr<model_state>, model_runner_error>
 model_runner::make_state(scheduler_config config) const
 {
     auto state = block_manager::make(config.kv_block_count, config.kv_block_size);
     if (!state)
-        return fail(model_runner_errc::backend_failure);
+        return fail(model_runner_errc::backend_failure, state.error(), "block allocator");
     return std::make_unique<block_manager>(std::move(*state));
 }
 

@@ -25,7 +25,7 @@ scheduled_batch::token_count() const noexcept
     return total;
 }
 
-result<scheduler, scheduler_errc>
+result<scheduler, scheduler_error>
 scheduler::make(scheduler_config config, token_id eos_token, std::unique_ptr<model_state> state)
 {
     if (config.max_sequences == 0) {
@@ -43,7 +43,7 @@ scheduler::make(scheduler_config config, token_id eos_token, std::unique_ptr<mod
             return fail(scheduler_errc::invalid_kv_block_size);
         auto manager = block_manager::make(config.kv_block_count, config.kv_block_size);
         if (!manager)
-            return fail(scheduler_errc::block_manager_failure);
+            return fail(scheduler_errc::block_manager_failure, manager.error());
         state = std::make_unique<block_manager>(std::move(*manager));
     }
     return scheduler { config, eos_token, std::move(state) };
@@ -109,7 +109,7 @@ scheduler::mutable_sequence(seq_id id) noexcept
     return found == sequences_.end() ? nullptr : &found->second;
 }
 
-result<void, scheduler_errc>
+result<void, scheduler_error>
 scheduler::add(seq sequence)
 {
     const auto id = sequence.id();
@@ -136,7 +136,7 @@ scheduler::add(seq sequence)
     return {};
 }
 
-result<scheduled_batch, scheduler_errc>
+result<scheduled_batch, scheduler_error>
 scheduler::schedule()
 {
     if (active_batch_.has_value()) {
@@ -149,9 +149,9 @@ scheduler::schedule()
         .items = {},
     };
 
-    bool blocked_by_cache = false;
+    std::optional<state_error> blocked_by_cache;
     const auto select = [&](const std::deque<seq_id>& queue,
-                            batch_phase phase) -> result<void, scheduler_errc> {
+                            batch_phase phase) -> result<void, scheduler_error> {
         batch.phase = phase;
         batch.items.reserve(std::min(queue.size(), config_.max_sequences));
         std::size_t used_tokens = 0;
@@ -167,14 +167,16 @@ scheduler::schedule()
             auto capacity = state_->reserve(id, sequence->token_count());
             if (!capacity) {
                 if (capacity.error() == state_errc::capacity_exhausted) {
-                    blocked_by_cache = true;
+                    blocked_by_cache = std::move(capacity.error());
                     continue;
                 }
-                return fail(scheduler_errc::block_manager_failure);
+                return fail(scheduler_errc::block_manager_failure, capacity.error(),
+                            "reserve sequence " + std::to_string(id));
             }
             const auto count = std::min(available, config_.max_batch_tokens - used_tokens);
-            if (!sequence->schedule_tokens(count))
-                return fail(scheduler_errc::sequence_failure);
+            auto reserved = sequence->schedule_tokens(count);
+            if (!reserved)
+                return fail(scheduler_errc::sequence_failure, reserved.error(), "reserve tokens");
             batch.items.push_back({ id, count, count == available });
             used_tokens += count;
         }
@@ -190,7 +192,7 @@ scheduler::schedule()
 
     if (batch.empty()) {
         if (blocked_by_cache) {
-            return fail(scheduler_errc::cache_capacity_exhausted);
+            return fail(scheduler_errc::cache_capacity_exhausted, *blocked_by_cache);
         }
         return fail(scheduler_errc::no_runnable_sequences);
     }
@@ -202,7 +204,7 @@ scheduler::schedule()
     return batch;
 }
 
-result<void, scheduler_errc>
+result<void, scheduler_error>
 scheduler::begin_execution(const model_batch& batch)
 {
     if (!active_batch_)
@@ -212,12 +214,14 @@ scheduler::begin_execution(const model_batch& batch)
     if (state_transaction_open_)
         return fail(scheduler_errc::batch_in_flight);
     state_transaction_open_ = true;
-    if (!state_->begin_batch(batch))
-        return fail(scheduler_errc::block_manager_failure);
+    auto begun = state_->begin_batch(batch);
+    if (!begun)
+        return fail(scheduler_errc::block_manager_failure, begun.error(),
+                    "begin model state transaction");
     return {};
 }
 
-result<std::vector<sequence_update>, scheduler_errc>
+result<std::vector<sequence_update>, scheduler_error>
 scheduler::complete(batch_id id, std::span<const token_id> sampled_tokens)
 {
     if (!active_batch_.has_value()) {
@@ -250,7 +254,7 @@ scheduler::complete(batch_id id, std::span<const token_id> sampled_tokens)
         auto committed = sequence->commit_scheduled_tokens();
         if (!committed) {
             assert(false && "prevalidated scheduled-token commit failed");
-            return fail(scheduler_errc::sequence_failure);
+            return fail(scheduler_errc::sequence_failure, committed.error());
         }
 
         if (!item.sample) {
@@ -261,7 +265,7 @@ scheduler::complete(batch_id id, std::span<const token_id> sampled_tokens)
             auto running = sequence->mark_running();
             if (!running) {
                 assert(false && "prevalidated transition to running failed");
-                return fail(scheduler_errc::sequence_failure);
+                return fail(scheduler_errc::sequence_failure, running.error());
             }
         }
 
@@ -269,7 +273,7 @@ scheduler::complete(batch_id id, std::span<const token_id> sampled_tokens)
         auto appended = sequence->append_token(sampled_tokens[sample_index++]);
         if (!appended) {
             assert(false && "prevalidated sampled-token append failed");
-            return fail(scheduler_errc::sequence_failure);
+            return fail(scheduler_errc::sequence_failure, appended.error());
         }
 
         const auto stop_reason = sequence->evaluate_stop(eos_token_);
@@ -277,7 +281,7 @@ scheduler::complete(batch_id id, std::span<const token_id> sampled_tokens)
             auto finished = sequence->finish(stop_reason);
             if (!finished) {
                 assert(false && "prevalidated sequence finish failed");
-                return fail(scheduler_errc::sequence_failure);
+                return fail(scheduler_errc::sequence_failure, finished.error());
             }
 
             auto& source_queue = active.phase == batch_phase::prefill ? waiting_ : running_;
@@ -303,7 +307,7 @@ scheduler::complete(batch_id id, std::span<const token_id> sampled_tokens)
     return updates;
 }
 
-result<void, scheduler_errc>
+result<void, scheduler_error>
 scheduler::abort(batch_id id)
 {
     if (!active_batch_.has_value()) {
@@ -326,7 +330,7 @@ scheduler::abort(batch_id id)
     return {};
 }
 
-result<void, scheduler_errc>
+result<void, scheduler_error>
 scheduler::cancel(seq_id id)
 {
     if (active_batch_.has_value()) {
@@ -347,7 +351,7 @@ scheduler::cancel(seq_id id)
     }
     auto finished = sequence->finish(finish_reason::cancelled);
     if (!finished) {
-        return fail(scheduler_errc::sequence_failure);
+        return fail(scheduler_errc::sequence_failure, finished.error());
     }
     state_->release(id);
 
@@ -355,7 +359,7 @@ scheduler::cancel(seq_id id)
     return {};
 }
 
-result<void, scheduler_errc>
+result<void, scheduler_error>
 scheduler::remove(seq_id id)
 {
     if (active_batch_.has_value()) {

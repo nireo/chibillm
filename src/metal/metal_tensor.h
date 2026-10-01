@@ -1,5 +1,7 @@
 #pragma once
 
+#include "error.h"
+
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -17,13 +19,26 @@ enum class metal_tensor_errc : std::uint8_t {
     allocation_failed,
 };
 
+[[nodiscard]] inline std::string_view
+error_name(metal_tensor_errc code) noexcept
+{
+    static constexpr std::array names {
+        "metal_tensor.invalid_descriptor",
+        "metal_tensor.allocation_failed",
+    };
+    const auto index = static_cast<std::size_t>(code);
+    return index < names.size() ? names[index] : "metal_tensor.unknown_error";
+}
+
+using metal_tensor_error = error<metal_tensor_errc>;
+
 // owns one complete tensor allocation in shared metal storage.
 class metal_tensor {
 public:
     [[nodiscard]] static result<metal_tensor, metal_error> make(const metal_context& context,
                                                                 tensor_descriptor descriptor);
 
-    [[nodiscard]] static result<metal_tensor, metal_tensor_errc>
+    [[nodiscard]] static result<metal_tensor, metal_tensor_error>
     make(const metal_context& context, dtype type, std::vector<std::size_t> dimensions);
 
     metal_tensor(const metal_tensor&) = delete;
@@ -61,20 +76,20 @@ metal_tensor::make(const metal_context& context, tensor_descriptor descriptor)
     };
 }
 
-inline result<metal_tensor, metal_tensor_errc>
+inline result<metal_tensor, metal_tensor_error>
 metal_tensor::make(const metal_context& context, dtype type, std::vector<std::size_t> dimensions)
 {
     auto shape = tensor_shape::make(std::move(dimensions));
     if (!shape) {
-        return fail(metal_tensor_errc::invalid_descriptor);
+        return fail(metal_tensor_errc::invalid_descriptor, shape.error());
     }
     auto descriptor = tensor_descriptor::make(type, std::move(*shape));
     if (!descriptor) {
-        return fail(metal_tensor_errc::invalid_descriptor);
+        return fail(metal_tensor_errc::invalid_descriptor, descriptor.error());
     }
     auto tensor = make(context, std::move(*descriptor));
     if (!tensor) {
-        return fail(metal_tensor_errc::allocation_failed);
+        return fail(metal_tensor_errc::allocation_failed, tensor.error());
     }
     return std::move(*tensor);
 }

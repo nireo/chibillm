@@ -52,7 +52,7 @@ public:
         : runner_(runner)
     {}
 
-    result<std::string, model_runner_errc>
+    result<std::string, model_runner_error>
     push(token_id token, bool final) override
     {
         tokens_.push_back(token);
@@ -61,7 +61,8 @@ public:
             return fail(text.error());
         const auto prefix = complete_utf8_prefix(*text);
         if (!prefix || (final && *prefix != text->size()) || !text->starts_with(emitted_)) {
-            return fail(model_runner_errc::tokenizer_failure);
+            return fail(model_runner_errc::tokenizer_failure,
+                        "invalid UTF-8 or decoded prefix changed", "incremental decode");
         }
         auto delta = text->substr(emitted_.size(), *prefix - emitted_.size());
         emitted_.append(delta);

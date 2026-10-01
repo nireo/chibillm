@@ -61,7 +61,7 @@ public:
         return metadata;
     }
 
-    chibillm::result<std::vector<chibillm::token_id>, chibillm::model_runner_errc>
+    chibillm::result<std::vector<chibillm::token_id>, chibillm::model_runner_error>
     encode_chat(std::span<const chibillm::chat_message> messages) override
     {
         histories.emplace_back(messages.begin(), messages.end());
@@ -69,7 +69,7 @@ public:
         return std::vector<chibillm::token_id>(prompt_size, 1);
     }
 
-    chibillm::result<std::string, chibillm::model_runner_errc>
+    chibillm::result<std::string, chibillm::model_runner_error>
     decode(std::span<const chibillm::token_id> tokens) const override
     {
         if (bad_decode)
@@ -84,14 +84,15 @@ public:
         return text;
     }
 
-    chibillm::result<std::vector<chibillm::token_id>, chibillm::model_runner_errc>
+    chibillm::result<std::vector<chibillm::token_id>, chibillm::model_runner_error>
     execute(const chibillm::model_batch& batch, chibillm::model_state&) override
     {
         ++calls;
         if (before_execute)
             before_execute(calls);
         if (calls == failure_call)
-            return chibillm::fail(chibillm::model_runner_errc::backend_failure);
+            return chibillm::fail(chibillm::model_runner_errc::backend_failure,
+                                  "GPU command failed", "layer 2");
         const auto prefill_calls = (prompt_size + 1) / 2;
         const chibillm::token_id token = immediate_eos ? 99
             : calls == prefill_calls                   ? 10
@@ -168,6 +169,9 @@ TEST_CASE("partial streaming failure releases state and rolls back history")
     CHECK(status == 0);
     CHECK(terminal.output.str().find("qwen> €\n") != std::string::npos);
     CHECK(terminal.errors.str().find("generation failed") != std::string::npos);
+    CHECK(terminal.errors.str().find("decode: inference_engine.model_execution_failed")
+          != std::string::npos);
+    CHECK(terminal.errors.str().find("layer 2: GPU command failed") != std::string::npos);
     REQUIRE(runner.histories.size() == 2);
     REQUIRE(runner.histories[1].size() == 1);
     CHECK(runner.histories[1][0].content == "retry");

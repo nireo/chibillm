@@ -71,17 +71,17 @@ struct qwen3_5_weights {
     std::vector<qwen3_5_layer_weights> layers;
 };
 
-[[nodiscard]] result<void, weight_errc> validate_qwen_weights(const safetensors_file& weights,
-                                                              const qwen3_config& config);
+[[nodiscard]] result<void, weight_error> validate_qwen_weights(const safetensors_file& weights,
+                                                               const qwen3_config& config);
 
-[[nodiscard]] result<qwen_weights, weight_errc> load_qwen_weights(const metal_context& context,
-                                                                  const safetensors_file& file,
-                                                                  const qwen3_config& config);
+[[nodiscard]] result<qwen_weights, weight_error> load_qwen_weights(const metal_context& context,
+                                                                   const safetensors_file& file,
+                                                                   const qwen3_config& config);
 
-[[nodiscard]] result<void, weight_errc> validate_qwen3_5_weights(const safetensors_file& weights,
-                                                                 const qwen3_5_config& config);
+[[nodiscard]] result<void, weight_error> validate_qwen3_5_weights(const safetensors_file& weights,
+                                                                  const qwen3_5_config& config);
 
-[[nodiscard]] result<qwen3_5_weights, weight_errc> load_qwen3_5_weights(
+[[nodiscard]] result<qwen3_5_weights, weight_error> load_qwen3_5_weights(
     const metal_context& context, const safetensors_file& file, const qwen3_5_config& config);
 
 } // namespace chibillm

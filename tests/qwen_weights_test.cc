@@ -620,6 +620,13 @@ TEST_CASE("Qwen3.5 factory loads a sole shard and generates with tied zero-cente
     }
     temporary_file weights((directory.path() / "model-00001-of-00001.safetensors").string(), header,
                            data);
+    auto invalid_shader =
+        chibillm::load_model(directory.path(), "invalid Metal shader", 8, 2, "tiny-hybrid");
+    REQUIRE_FALSE(invalid_shader.has_value());
+    CHECK(invalid_shader.error() == chibillm::model_load_errc::load_failed);
+    CHECK(chibillm::describe_error(invalid_shader.error())
+              .find("metal.shader_library_creation_failed")
+          != std::string::npos);
     auto loaded = chibillm::load_model(directory.path(), load_shader_source(), 8, 2, "tiny-hybrid");
     REQUIRE(loaded.has_value());
     auto& runner = **loaded;

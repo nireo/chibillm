@@ -7,7 +7,7 @@
 
 namespace chibillm {
 
-result<metal_kv_cache, kv_cache_errc>
+result<metal_kv_cache, kv_cache_error>
 metal_kv_cache::make(const metal_context& context, kv_cache_config config)
 {
     if (config.layer_count == 0) {
@@ -34,14 +34,16 @@ metal_kv_cache::make(const metal_context& context, kv_cache_config config)
     if (!keys) {
         return fail(keys.error() == metal_tensor_errc::invalid_descriptor
                         ? kv_cache_errc::layout_size_overflow
-                        : kv_cache_errc::allocation_failed);
+                        : kv_cache_errc::allocation_failed,
+                    keys.error(), "KV keys");
     }
 
     auto values = metal_tensor::make(context, dtype::f32, std::move(dimensions));
     if (!values) {
         return fail(values.error() == metal_tensor_errc::invalid_descriptor
                         ? kv_cache_errc::layout_size_overflow
-                        : kv_cache_errc::allocation_failed);
+                        : kv_cache_errc::allocation_failed,
+                    values.error(), "KV values");
     }
 
     return metal_kv_cache {
@@ -117,7 +119,7 @@ metal_kv_cache::element_count() const noexcept
     return keys_.descriptor().element_count();
 }
 
-result<std::size_t, kv_cache_errc>
+result<std::size_t, kv_cache_error>
 metal_kv_cache::element_offset(std::size_t layer,
                                std::size_t block,
                                std::size_t token_offset,

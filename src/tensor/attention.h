@@ -19,18 +19,18 @@ struct attention_metadata_tensors {
     metal_tensor table_lengths;
 };
 
-result<attention_metadata_tensors, tensor_op_errc>
+result<attention_metadata_tensors, tensor_op_error>
 upload_attention_metadata(const metal_context& context, attention_metadata metadata);
 
 // Metadata tensors must remain alive and unchanged while the prepared batch is used.
 class prepared_attention_batch {
 public:
-    static result<prepared_attention_batch, tensor_op_errc> make(const metal_context& context,
-                                                                 const metal_tensor& positions,
-                                                                 const metal_tensor& block_table,
-                                                                 const metal_tensor& offsets,
-                                                                 const metal_tensor& lengths,
-                                                                 const metal_kv_cache& cache);
+    static result<prepared_attention_batch, tensor_op_error> make(const metal_context& context,
+                                                                  const metal_tensor& positions,
+                                                                  const metal_tensor& block_table,
+                                                                  const metal_tensor& offsets,
+                                                                  const metal_tensor& lengths,
+                                                                  const metal_kv_cache& cache);
 
     const metal_tensor&
     positions() const
@@ -39,13 +39,13 @@ public:
     }
 
 private:
-    friend result<void, tensor_op_errc> paged_attention(const metal_context&,
-                                                        const metal_tensor&,
-                                                        const prepared_attention_batch&,
-                                                        std::size_t,
-                                                        std::size_t,
-                                                        const metal_kv_cache&,
-                                                        metal_tensor&);
+    friend result<void, tensor_op_error> paged_attention(const metal_context&,
+                                                         const metal_tensor&,
+                                                         const prepared_attention_batch&,
+                                                         std::size_t,
+                                                         std::size_t,
+                                                         const metal_kv_cache&,
+                                                         metal_tensor&);
 
     prepared_attention_batch(const metal_tensor& positions,
                              const metal_tensor& table,
@@ -69,11 +69,11 @@ private:
     std::size_t tile_count_ = 0;
 };
 
-result<void, tensor_op_errc> paged_attention(const metal_context& context,
-                                             const metal_tensor& queries,
-                                             const prepared_attention_batch& metadata,
-                                             std::size_t layer,
-                                             std::size_t query_head_count,
-                                             const metal_kv_cache& cache,
-                                             metal_tensor& output);
+result<void, tensor_op_error> paged_attention(const metal_context& context,
+                                              const metal_tensor& queries,
+                                              const prepared_attention_batch& metadata,
+                                              std::size_t layer,
+                                              std::size_t query_head_count,
+                                              const metal_kv_cache& cache,
+                                              metal_tensor& output);
 } // namespace chibillm

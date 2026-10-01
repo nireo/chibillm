@@ -11,26 +11,27 @@ weight_bundle::take(const std::string& name)
     return std::move(node.mapped());
 }
 
-result<void, weight_errc>
+result<void, weight_error>
 validate_weights(const safetensors_file& file, std::string_view prefix, const weight_layout& layout)
 {
     for (const auto& group : layout) {
         if (group.tensors.empty())
             return fail(weight_errc::invalid_configuration);
         for (const auto& spec : group.tensors) {
-            const auto* tensor = file.find(std::string(prefix) + spec.name);
+            const auto name = std::string(prefix) + spec.name;
+            const auto* tensor = file.find(name);
             if (!tensor)
-                return fail(weight_errc::missing_tensor);
+                return fail(weight_errc::missing_tensor, name);
             if (tensor->type != spec.type)
-                return fail(weight_errc::unsupported_dtype);
+                return fail(weight_errc::unsupported_dtype, name);
             if (tensor->shape != spec.shape)
-                return fail(weight_errc::tensor_shape_mismatch);
+                return fail(weight_errc::tensor_shape_mismatch, name);
         }
     }
     return {};
 }
 
-result<weight_bundle, weight_errc>
+result<weight_bundle, weight_error>
 read_weights(const metal_context& context,
              const safetensors_file& file,
              std::string_view prefix,
@@ -66,14 +67,16 @@ read_weights(const metal_context& context,
         if (!tensor)
             return fail(tensor.error() == metal_tensor_errc::invalid_descriptor
                             ? weight_errc::tensor_creation_failed
-                            : weight_errc::metal_allocation_failed);
+                            : weight_errc::metal_allocation_failed,
+                        tensor.error(), group.name);
         std::size_t offset = 0;
         auto bytes = tensor->buffer().bytes();
         for (const auto& spec : group.tensors) {
             const auto name = std::string(prefix) + spec.name;
             const auto size = static_cast<std::size_t>(file.find(name)->byte_count);
-            if (!file.read(name, bytes.subspan(offset, size)))
-                return fail(weight_errc::tensor_read_failed);
+            auto read = file.read(name, bytes.subspan(offset, size));
+            if (!read)
+                return fail(weight_errc::tensor_read_failed, read.error(), name);
             offset += size;
         }
         bundle.tensors_.emplace(group.name, std::move(*tensor));

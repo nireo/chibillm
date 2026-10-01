@@ -1,4 +1,6 @@
 #pragma once
+
+#include "error.h"
 #include "inference_engine.h"
 #include <atomic>
 #include <condition_variable>
@@ -55,8 +57,8 @@ struct request_state {
 
 class serving_runtime {
 public:
-    static result<std::unique_ptr<serving_runtime>, inference_engine_errc> make(model_runner&,
-                                                                                serving_config);
+    static result<std::unique_ptr<serving_runtime>, inference_engine_error> make(model_runner&,
+                                                                                 serving_config);
     ~serving_runtime();
     result<std::shared_ptr<request_state>, generation_error> submit(generation_request);
     void cancel(const std::shared_ptr<request_state>&) noexcept;

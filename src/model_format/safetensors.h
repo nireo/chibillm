@@ -1,5 +1,7 @@
 #pragma once
 
+#include "error.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -51,6 +53,21 @@ enum class safetensors_errc : std::uint8_t {
     destination_size_mismatch,
     ambiguous_checkpoint,
 };
+
+[[nodiscard]] inline std::string_view
+error_name(safetensors_errc code) noexcept
+{
+    static constexpr std::array names {
+        "safetensors.file_open_failed",        "safetensors.file_read_failed",
+        "safetensors.invalid_header_size",     "safetensors.invalid_header_json",
+        "safetensors.invalid_tensor_metadata", "safetensors.unsupported_dtype",
+        "safetensors.tensor_size_overflow",    "safetensors.invalid_data_layout",
+        "safetensors.tensor_not_found",        "safetensors.destination_size_mismatch",
+        "safetensors.ambiguous_checkpoint",
+    };
+    const auto index = static_cast<std::size_t>(code);
+    return index < names.size() ? names[index] : "safetensors.unknown_error";
+}
 
 class safetensors_file {
 public:

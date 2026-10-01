@@ -29,7 +29,7 @@ all_f32(std::initializer_list<const metal_tensor*> tensors)
 }
 } // namespace
 
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 causal_conv1d_silu(const metal_context& context,
                    const metal_tensor& input,
                    const metal_tensor& weight,
@@ -61,15 +61,16 @@ causal_conv1d_silu(const metal_context& context,
     if (aliases(history, { &input, &weight, &output }) || aliases(output, { &input, &weight }))
         return fail(tensor_op_errc::unsupported_aliasing);
 
-    if (!metal_kernels(context).dispatch_causal_conv1d_silu(
-            input.buffer(), weight.buffer(), history.buffer(), output.buffer(), scan.count, dims[1],
-            kernel, scan.offset))
-        return fail(tensor_op_errc::backend_failure);
+    auto dispatched = metal_kernels(context).dispatch_causal_conv1d_silu(
+        input.buffer(), weight.buffer(), history.buffer(), output.buffer(), scan.count, dims[1],
+        kernel, scan.offset);
+    if (!dispatched)
+        return fail(tensor_op_errc::backend_failure, dispatched.error());
 
     return {};
 }
 
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 gated_delta_rule(const metal_context& context,
                  const metal_tensor& qkv,
                  const metal_tensor& a,
@@ -126,16 +127,16 @@ gated_delta_rule(const metal_context& context,
         || aliases(output, { &qkv, &a, &b, &A_log, &dt_bias }))
         return fail(tensor_op_errc::unsupported_aliasing);
 
-    if (!metal_kernels(context).dispatch_gated_delta_rule(
-            qkv.buffer(), a.buffer(), b.buffer(), A_log.buffer(), dt_bias.buffer(), state.buffer(),
-            output.buffer(), scan.count, key_heads, heads, key_dim, value_dim, epsilon,
-            scan.offset))
-        return fail(tensor_op_errc::backend_failure);
+    auto dispatched = metal_kernels(context).dispatch_gated_delta_rule(
+        qkv.buffer(), a.buffer(), b.buffer(), A_log.buffer(), dt_bias.buffer(), state.buffer(),
+        output.buffer(), scan.count, key_heads, heads, key_dim, value_dim, epsilon, scan.offset);
+    if (!dispatched)
+        return fail(tensor_op_errc::backend_failure, dispatched.error());
 
     return {};
 }
 
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 rms_norm_gated(const metal_context& context,
                const metal_tensor& input,
                const metal_tensor& gate,
@@ -166,10 +167,11 @@ rms_norm_gated(const metal_context& context,
     if (aliases(output, { &input, &gate, &weight }))
         return fail(tensor_op_errc::unsupported_aliasing);
 
-    if (!metal_kernels(context).dispatch_rms_norm_gated(
-            input.buffer(), gate.buffer(), weight.buffer(), output.buffer(),
-            input.descriptor().element_count() / width, width, epsilon))
-        return fail(tensor_op_errc::backend_failure);
+    auto dispatched = metal_kernels(context).dispatch_rms_norm_gated(
+        input.buffer(), gate.buffer(), weight.buffer(), output.buffer(),
+        input.descriptor().element_count() / width, width, epsilon);
+    if (!dispatched)
+        return fail(tensor_op_errc::backend_failure, dispatched.error());
 
     return {};
 }

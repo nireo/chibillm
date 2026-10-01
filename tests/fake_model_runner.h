@@ -8,13 +8,13 @@ public:
 
     [[nodiscard]] const model_info& info() const noexcept override;
 
-    [[nodiscard]] result<std::vector<token_id>, model_runner_errc>
+    [[nodiscard]] result<std::vector<token_id>, model_runner_error>
     encode_chat(std::span<const chat_message> messages) override;
 
-    [[nodiscard]] result<std::string, model_runner_errc>
+    [[nodiscard]] result<std::string, model_runner_error>
     decode(std::span<const token_id> tokens) const override;
 
-    [[nodiscard]] result<std::vector<token_id>, model_runner_errc>
+    [[nodiscard]] result<std::vector<token_id>, model_runner_error>
     execute(const model_batch& batch, model_state& state) override;
 
 private:

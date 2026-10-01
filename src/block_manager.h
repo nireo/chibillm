@@ -1,4 +1,6 @@
 #pragma once
+
+#include "error.h"
 #include "model_state.h"
 #include <deque>
 #include <unordered_map>
@@ -10,6 +12,18 @@ enum class block_manager_errc {
     invalid_block_size,
     too_many_blocks
 };
+
+[[nodiscard]] inline std::string_view
+error_name(block_manager_errc code) noexcept
+{
+    static constexpr std::array names {
+        "block_manager.invalid_block_count",
+        "block_manager.invalid_block_size",
+        "block_manager.too_many_blocks",
+    };
+    const auto index = static_cast<std::size_t>(code);
+    return index < names.size() ? names[index] : "block_manager.unknown_error";
+}
 
 class block_manager final : public model_state {
 public:
@@ -43,7 +57,7 @@ public:
     }
 
     sequence_resources resources(seq_id id) const noexcept override;
-    result<void, state_errc> reserve(seq_id id, std::size_t token_count) override;
+    result<void, state_error> reserve(seq_id id, std::size_t token_count) override;
     void release(seq_id id) noexcept override;
 
 private:

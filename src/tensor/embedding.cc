@@ -6,7 +6,7 @@
 
 namespace chibillm {
 
-result<metal_tensor, tensor_op_errc>
+result<metal_tensor, tensor_op_error>
 embed_tokens(const metal_context& context,
              const metal_tensor& weight,
              std::span<const token_id> tokens)

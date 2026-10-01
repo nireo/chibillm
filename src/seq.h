@@ -1,5 +1,7 @@
 #pragma once
 
+#include "error.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -38,6 +40,20 @@ enum class seq_errc : std::uint8_t {
     too_many_scheduled_tokens,
     no_work_scheduled,
 };
+
+[[nodiscard]] inline std::string_view
+error_name(seq_errc code) noexcept
+{
+    static constexpr std::array names {
+        "seq.empty_prompt",           "seq.invalid_max_new_tokens",
+        "seq.already_finished",       "seq.invalid_state_transition",
+        "seq.invalid_finish_reason",  "seq.zero_scheduled_tokens",
+        "seq.work_already_scheduled", "seq.too_many_scheduled_tokens",
+        "seq.no_work_scheduled",
+    };
+    const auto index = static_cast<std::size_t>(code);
+    return index < names.size() ? names[index] : "seq.unknown_error";
+}
 
 struct generation_params {
     std::size_t max_new_tokens { 64 };

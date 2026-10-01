@@ -30,6 +30,14 @@ enum class chat_errc {
     generation_failed
 };
 
+std::string_view
+error_name(chat_errc code) noexcept
+{
+    return code == chat_errc::context_full ? "chat.context_full" : "chat.generation_failed";
+}
+
+using chat_error = error<chat_errc>;
+
 // Only prefill uses a transient status line; generated text owns the terminal.
 class generation_display {
 public:
@@ -127,7 +135,7 @@ private:
     clock::time_point next_refresh_;
 };
 
-result<std::string, chat_errc>
+result<std::string, chat_error>
 generate(model_runner& runner,
          inference_engine& engine,
          std::span<const chat_message> history,
@@ -142,7 +150,7 @@ generate(model_runner& runner,
     auto prompt = runner.encode_chat(history);
     metrics.tokenization_seconds = seconds(encode_started, clock::now());
     if (!prompt)
-        return fail(chat_errc::generation_failed);
+        return fail(chat_errc::generation_failed, prompt.error(), "tokenization");
     metrics.prompt_tokens = prompt->size();
     metrics.stage = "context_check";
     const auto context_length = runner.info().max_context_tokens;
@@ -156,19 +164,23 @@ generate(model_runner& runner,
     auto sequence = seq::make(1, std::move(*prompt),
                               { .max_new_tokens = metrics.token_budget, .ignore_eos = false });
     metrics.admission_at = seconds(submitted, clock::now());
-    if (!sequence || !engine.add(std::move(*sequence)))
-        return fail(chat_errc::generation_failed);
+    if (!sequence)
+        return fail(chat_errc::generation_failed, sequence.error(), "create sequence");
+    auto added = engine.add(std::move(*sequence));
+    if (!added)
+        return fail(chat_errc::generation_failed, added.error(), "admission");
 
     metrics.stage = "decoder_setup";
     auto decoder = stream ? runner.make_decoder() : nullptr;
     if (stream && !decoder)
-        return fail(chat_errc::generation_failed);
+        return fail(chat_errc::generation_failed, "decoder creation returned null",
+                    "decoder setup");
     std::string text;
     display.update(0, metrics.prompt_tokens, clock::now());
     while (!engine.is_finished()) {
         const auto* current = engine.find_sequence(1);
         if (!current)
-            return fail(chat_errc::generation_failed);
+            return fail(chat_errc::generation_failed, "sequence is missing", "generation");
         const auto processed_before = current->processed_token_count();
         const bool prefill = processed_before < metrics.prompt_tokens;
         metrics.stage = prefill ? "prefill" : "decode";
@@ -176,7 +188,7 @@ generate(model_runner& runner,
         auto updates = engine.step();
         const auto step_finished = clock::now();
         if (!updates)
-            return fail(chat_errc::generation_failed);
+            return fail(chat_errc::generation_failed, updates.error(), metrics.stage);
         metrics.record_batch(prefill,
                              prefill ? current->processed_token_count() - processed_before : 0,
                              seconds(step_started, step_finished));
@@ -197,14 +209,14 @@ generate(model_runner& runner,
                 const auto decode_finished = clock::now();
                 metrics.text_decode_seconds += seconds(decode_started, decode_finished);
                 if (!delta)
-                    return fail(chat_errc::generation_failed);
+                    return fail(chat_errc::generation_failed, delta.error(), "text decode");
                 if (!delta->empty()) {
                     metrics.stage = "output";
                     display.emit(*delta);
                     const auto written = clock::now();
                     metrics.output_write_seconds += seconds(decode_finished, written);
                     if (!std::cout)
-                        return fail(chat_errc::generation_failed);
+                        return fail(chat_errc::generation_failed, "answer write failed", "output");
                     if (!metrics.first_text_seconds)
                         metrics.first_text_seconds = seconds(submitted, written);
                 }
@@ -214,14 +226,15 @@ generate(model_runner& runner,
 
     const auto* finished = engine.find_sequence(1);
     if (!finished || !metrics.first_token_at)
-        return fail(chat_errc::generation_failed);
+        return fail(chat_errc::generation_failed, "no completed sequence or sampled token",
+                    "completion");
     if (!stream) {
         metrics.stage = "text_decode";
         const auto decode_started = clock::now();
         auto response = runner.decode(finished->completion_tokens());
         metrics.text_decode_seconds += seconds(decode_started, clock::now());
         if (!response)
-            return fail(chat_errc::generation_failed);
+            return fail(chat_errc::generation_failed, response.error(), "text decode");
         text = std::move(*response);
         metrics.output_bytes = text.size();
         metrics.stage = "output";
@@ -230,7 +243,7 @@ generate(model_runner& runner,
         const auto written = clock::now();
         metrics.output_write_seconds += seconds(write_started, written);
         if (!std::cout)
-            return fail(chat_errc::generation_failed);
+            return fail(chat_errc::generation_failed, "answer write failed", "output");
         if (!text.empty())
             metrics.first_text_seconds = seconds(submitted, written);
     }
@@ -239,7 +252,7 @@ generate(model_runner& runner,
     display.finish();
     metrics.output_write_seconds += seconds(write_started, clock::now());
     if (!std::cout)
-        return fail(chat_errc::generation_failed);
+        return fail(chat_errc::generation_failed, "answer flush failed", "output");
     metrics.stop = finished->reason() == finish_reason::eos ? "eos"
         : metrics.token_budget < max_new_tokens             ? "context_capacity"
                                                             : "token_limit";
@@ -316,7 +329,7 @@ run_repl(model_runner& runner,
     progress = progress && ::isatty(STDOUT_FILENO) && ::isatty(STDERR_FILENO);
     auto engine = inference_engine::make(config, runner);
     if (!engine) {
-        std::cerr << "failed to create inference state\n";
+        std::cerr << "failed to create inference state: " << describe_error(engine.error()) << '\n';
         return 1;
     }
     // Disambiguates request IDs across append-mode sessions. Not a prompt identifier.
@@ -349,9 +362,18 @@ run_repl(model_runner& runner,
                                  submitted, metrics);
         // Ends after final answer flush (including buffered replies), before cleanup/reporting.
         metrics.end_to_end_seconds = seconds(submitted, clock::now());
-        const bool cleanup_failed =
-            engine->find_sequence(1) && (!engine->cancel(1) || !engine->remove(1));
-        if (cleanup_failed) {
+        std::optional<inference_engine_error> cleanup_error;
+        if (engine->find_sequence(1)) {
+            auto cancelled = engine->cancel(1);
+            if (!cancelled) {
+                cleanup_error = std::move(cancelled.error());
+            } else {
+                auto removed = engine->remove(1);
+                if (!removed)
+                    cleanup_error = std::move(removed.error());
+            }
+        }
+        if (cleanup_error) {
             metrics.status = "error";
             metrics.stage = "cleanup";
         }
@@ -362,15 +384,21 @@ run_repl(model_runner& runner,
             std::cerr << "failed to write metrics\n";
             return 1;
         }
-        if (cleanup_failed) {
-            std::cerr << "failed to release inference state\n";
+        if (cleanup_error) {
+            if (!response)
+                std::cerr << "generation failed: " << describe_error(response.error()) << '\n';
+            std::cerr
+                << "failed to release inference state: "
+                << describe_error(*cleanup_error)
+                << '\n';
             return 1;
         }
         if (!response) {
             history.pop_back();
-            std::cerr << (response.error() == chat_errc::context_full
-                              ? "conversation is too long; use /reset\n"
-                              : "generation failed\n");
+            if (response.error() == chat_errc::context_full)
+                std::cerr << "conversation is too long; use /reset\n";
+            else
+                std::cerr << "generation failed: " << describe_error(response.error()) << '\n';
             continue;
         }
         print_performance(metrics);

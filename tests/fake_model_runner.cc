@@ -12,7 +12,7 @@ fake_model_runner::info() const noexcept
     return info_;
 }
 
-result<std::vector<token_id>, model_runner_errc>
+result<std::vector<token_id>, model_runner_error>
 fake_model_runner::encode_chat(std::span<const chat_message> messages)
 {
     if (messages.empty()) {
@@ -31,7 +31,7 @@ fake_model_runner::encode_chat(std::span<const chat_message> messages)
     return tokens;
 }
 
-result<std::string, model_runner_errc>
+result<std::string, model_runner_error>
 fake_model_runner::decode(std::span<const token_id> tokens) const
 {
     std::string text;
@@ -45,7 +45,7 @@ fake_model_runner::decode(std::span<const token_id> tokens) const
     return text;
 }
 
-result<std::vector<token_id>, model_runner_errc>
+result<std::vector<token_id>, model_runner_error>
 fake_model_runner::execute(const model_batch& batch, model_state&)
 {
     if (batch.empty()) {

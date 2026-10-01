@@ -13,7 +13,7 @@
 namespace chibillm {
 namespace {
 
-result<metal_tensor, tensor_op_errc>
+result<metal_tensor, tensor_op_error>
 run_linear_attention(const metal_context& context,
                      const qwen3_5_config& config,
                      const qwen3_5_layer_weights& weights,
@@ -80,7 +80,7 @@ run_linear_attention(const metal_context& context,
 
 // Validate routing before any persistent state can be mutated. Shape checks for
 // individual weights remain in the tensor ops; a later failure requires abort.
-result<void, tensor_op_errc>
+result<void, tensor_op_error>
 validate_routing(const qwen3_5_config& config,
                  const qwen3_5_weights& weights,
                  const model_batch& batch,
@@ -145,7 +145,7 @@ validate_routing(const qwen3_5_config& config,
 
 } // namespace
 
-result<metal_tensor, tensor_op_errc>
+result<metal_tensor, tensor_op_error>
 run_qwen3_5_layers(const metal_context& context,
                    const qwen3_5_config& config,
                    const qwen3_5_weights& weights,
@@ -166,7 +166,7 @@ run_qwen3_5_layers(const metal_context& context,
     auto metadata = prepare_paged_batch(batch, config.max_position_embeddings,
                                         state.cache().block_count(), state.block_size());
     if (!metadata)
-        return fail(tensor_op_errc::input_shape_mismatch);
+        return fail(tensor_op_errc::input_shape_mismatch, metadata.error(), "prepare batch");
     CL_TRY(validate_routing(config, weights, batch, state));
     auto uploaded =
         upload_attention_metadata(context,
@@ -189,12 +189,12 @@ run_qwen3_5_layers(const metal_context& context,
                                          uploaded->slots, *prepared, *state.cache_layer(layer),
                                          state.cache());
         if (!mixed)
-            return fail(mixed.error());
+            return fail(at_stage(mixed.error(), "layer " + std::to_string(layer)));
         auto output = normalized_swiglu(context, layer_weights.post_attention_norm,
                                         layer_weights.gateup_packed, layer_weights.mlp_down,
                                         config.rms_epsilon, *mixed, true);
         if (!output)
-            return fail(output.error());
+            return fail(at_stage(output.error(), "layer " + std::to_string(layer)));
         hidden_states = std::move(*output);
     }
     return std::move(hidden_states);
