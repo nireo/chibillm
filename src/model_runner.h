@@ -4,8 +4,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "model_batch.h"
@@ -45,6 +47,9 @@ struct model_info {
     std::size_t max_context_tokens;
     token_id eos_token;
 };
+
+// Returns the length of the complete UTF-8 prefix, or std::nullopt for invalid bytes.
+[[nodiscard]] std::optional<std::size_t> complete_utf8_prefix(std::string_view text);
 
 class text_decoder {
 public:

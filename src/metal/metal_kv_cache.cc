@@ -3,7 +3,7 @@
 #include <utility>
 #include <vector>
 
-#include "tensor/dtype.h"
+#include "tensor/types.h"
 
 namespace chibillm {
 

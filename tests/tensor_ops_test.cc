@@ -13,8 +13,7 @@
 
 #include "metal/metal_kv_cache.h"
 #include "metal_test_support.h"
-#include "tensor/layers.h"
-#include "tensor/output.h"
+#include "tensor/functions.h"
 #include "tensor/tensor_ops.h"
 
 using chibillm::add;

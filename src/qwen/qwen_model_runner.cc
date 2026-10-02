@@ -1,8 +1,8 @@
 #include "qwen/qwen_model_runner.h"
 #include "metal/metal_model_state.h"
+#include "model_runner.h"
 #include "qwen/qwen3_5_model_state.h"
-#include "qwen/qwen_chat.h"
-#include "text.h"
+#include "qwen/qwen_tokenizer.h"
 
 #include <algorithm>
 #include <limits>
@@ -12,8 +12,7 @@
 
 #include "model_format/safetensors.h"
 #include "qwen/qwen_layer.h"
-#include "tensor/embedding.h"
-#include "tensor/output.h"
+#include "tensor/functions.h"
 
 namespace chibillm {
 namespace {

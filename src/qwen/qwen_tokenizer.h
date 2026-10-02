@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "model_runner.h"
 #include "result.h"
 #include "seq.h"
 
@@ -40,6 +41,9 @@ error_name(qwen_tokenizer_errc code) noexcept
     const auto index = static_cast<std::size_t>(code);
     return index < names.size() ? names[index] : "qwen_tokenizer.unknown_error";
 }
+
+result<std::string, model_runner_error> format_qwen_chat(std::span<const chat_message> messages,
+                                                         bool thinking = false);
 
 class qwen_tokenizer {
 public:

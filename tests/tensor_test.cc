@@ -13,8 +13,7 @@
 #include <type_traits>
 #include <utility>
 
-#include "tensor/tensor_descriptor.h"
-#include "tensor/tensor_shape.h"
+#include "tensor/types.h"
 
 using chibillm::bf16;
 using chibillm::dtype;

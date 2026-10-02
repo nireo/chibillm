@@ -27,9 +27,8 @@
 #include "qwen/qwen_model_runner.h"
 #include "qwen/qwen_weights.h"
 #include "safetensors_test_support.h"
-#include "tensor/bf16.h"
-#include "tensor/embedding.h"
-#include "tensor/output.h"
+#include "tensor/functions.h"
+#include "tensor/types.h"
 
 using chibillm::attention_metadata;
 using chibillm::bf16;

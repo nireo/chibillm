@@ -10,7 +10,7 @@
 #include "metal/metal_context.h"
 #include "metal/metal_error.h"
 #include "result.h"
-#include "tensor/tensor_descriptor.h"
+#include "tensor/types.h"
 
 namespace chibillm {
 

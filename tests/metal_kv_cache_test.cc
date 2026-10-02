@@ -6,7 +6,7 @@
 #include <limits>
 
 #include "metal/metal_kv_cache.h"
-#include "tensor/dtype.h"
+#include "tensor/types.h"
 
 using chibillm::dtype;
 using chibillm::kv_cache_config;

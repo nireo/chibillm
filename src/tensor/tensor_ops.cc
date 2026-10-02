@@ -1,6 +1,6 @@
 #include "tensor/tensor_ops.h"
 #include "metal/metal_kernels.h"
-#include "tensor/dtype.h"
+#include "tensor/types.h"
 
 #include <array>
 #include <cmath>

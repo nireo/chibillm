@@ -14,8 +14,7 @@
 
 #include "metal/metal_context.h"
 #include "metal/metal_tensor.h"
-#include "tensor/bf16.h"
-#include "tensor/dtype.h"
+#include "tensor/types.h"
 
 namespace metal_test {
 
