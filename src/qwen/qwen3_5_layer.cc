@@ -26,28 +26,22 @@ run_linear_attention(const metal_context& context,
     const auto rows = hidden_states.descriptor().shape().dimensions()[0];
     const auto qkv_width = 2 * config.linear_key_width() + config.linear_value_width();
     const auto value_width = config.linear_value_width();
-    auto normalized = allocate_tensor(context, dtype::f32, { rows, config.hidden_size });
+    auto normalized =
+        rms_norm(context, hidden_states, weights.input_norm, config.rms_epsilon, true);
     if (!normalized)
         return fail(normalized.error());
-    CL_TRY(rms_norm(context, hidden_states, weights.input_norm, config.rms_epsilon, *normalized,
-                    true));
-
-    auto qkv = allocate_tensor(context, dtype::f32, { rows, qkv_width });
+    auto qkv = linear(context, *normalized, attention.qkv_projection);
     if (!qkv)
         return fail(qkv.error());
-    auto gate = allocate_tensor(context, dtype::f32, { rows, value_width });
+    auto gate = linear(context, *normalized, attention.gate_projection);
     if (!gate)
         return fail(gate.error());
-    auto a = allocate_tensor(context, dtype::f32, { rows, config.linear_value_head_count });
+    auto a = linear(context, *normalized, attention.decay_projection);
     if (!a)
         return fail(a.error());
-    auto b = allocate_tensor(context, dtype::f32, { rows, config.linear_value_head_count });
+    auto b = linear(context, *normalized, attention.learning_rate_projection);
     if (!b)
         return fail(b.error());
-    CL_TRY(linear_split(context, *normalized, attention.qkv_projection, { &*qkv }));
-    CL_TRY(linear_split(context, *normalized, attention.gate_projection, { &*gate }));
-    CL_TRY(linear_split(context, *normalized, attention.decay_projection, { &*a }));
-    CL_TRY(linear_split(context, *normalized, attention.learning_rate_projection, { &*b }));
 
     auto convolved = allocate_tensor(context, dtype::f32, { rows, qkv_width });
     if (!convolved)
@@ -67,15 +61,10 @@ run_linear_attention(const metal_context& context,
                                 memory.recurrent, *mixed, 1e-6F, chunk));
     }
 
-    auto gated = allocate_tensor(context, dtype::f32, { rows, value_width });
+    auto gated = rms_norm_gated(context, *mixed, *gate, attention.norm, config.rms_epsilon);
     if (!gated)
         return fail(gated.error());
-    CL_TRY(rms_norm_gated(context, *mixed, *gate, attention.norm, config.rms_epsilon, *gated));
-    auto output = allocate_tensor(context, dtype::f32, { rows, config.hidden_size });
-    if (!output)
-        return fail(output.error());
-    CL_TRY(linear_add(context, *gated, attention.output, hidden_states, *output));
-    return std::move(*output);
+    return linear_add(context, *gated, attention.output, hidden_states);
 }
 
 // Validate routing before any persistent state can be mutated. Shape checks for

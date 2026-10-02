@@ -69,6 +69,14 @@ private:
     std::size_t tile_count_ = 0;
 };
 
+[[nodiscard]] result<metal_tensor, tensor_op_error>
+paged_attention(const metal_context& context,
+                const metal_tensor& queries,
+                const prepared_attention_batch& metadata,
+                std::size_t layer,
+                std::size_t query_head_count,
+                const metal_kv_cache& cache);
+
 result<void, tensor_op_error> paged_attention(const metal_context& context,
                                               const metal_tensor& queries,
                                               const prepared_attention_batch& metadata,

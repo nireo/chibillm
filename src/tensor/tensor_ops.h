@@ -2,6 +2,7 @@
 
 #include "error.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -89,6 +90,44 @@ using tensor_op_error = error<tensor_op_errc>;
 allocate_tensor(const metal_context& context, dtype type, std::vector<std::size_t> dimensions);
 [[nodiscard]] result<metal_tensor, tensor_op_error>
 upload_u32(const metal_context& context, std::span<const std::uint32_t> values);
+
+// Allocating operations return owned f32 outputs. The output-buffer overloads
+// below remain available for in-place execution and buffer reuse. Both forms
+// enqueue work in the current compute pass without adding synchronization.
+[[nodiscard]] result<metal_tensor, tensor_op_error>
+linear(const metal_context& context, const metal_tensor& input, const metal_tensor& weight);
+[[nodiscard]] result<metal_tensor, tensor_op_error> linear_add(const metal_context& context,
+                                                               const metal_tensor& input,
+                                                               const metal_tensor& weight,
+                                                               const metal_tensor& residual);
+[[nodiscard]] result<std::array<metal_tensor, 2>, tensor_op_error>
+linear_split(const metal_context& context,
+             const metal_tensor& input,
+             const metal_tensor& packed_weight,
+             std::size_t first_width,
+             std::size_t second_width);
+[[nodiscard]] result<std::array<metal_tensor, 3>, tensor_op_error>
+linear_split(const metal_context& context,
+             const metal_tensor& input,
+             const metal_tensor& packed_weight,
+             std::size_t first_width,
+             std::size_t second_width,
+             std::size_t third_width);
+[[nodiscard]] result<metal_tensor, tensor_op_error> rms_norm(const metal_context& context,
+                                                             const metal_tensor& input,
+                                                             const metal_tensor& weight,
+                                                             float epsilon,
+                                                             bool zero_centered = false);
+[[nodiscard]] result<metal_tensor, tensor_op_error>
+silu_mul(const metal_context& context, const metal_tensor& gate, const metal_tensor& up);
+[[nodiscard]] result<std::array<metal_tensor, 2>, tensor_op_error>
+split_heads(const metal_context& context, const metal_tensor& input, std::size_t head_count);
+[[nodiscard]] result<metal_tensor, tensor_op_error> rope(const metal_context& context,
+                                                         const metal_tensor& input,
+                                                         const metal_tensor& positions,
+                                                         std::size_t head_count,
+                                                         float theta,
+                                                         std::size_t rotary_dimension = 0);
 
 // projects input and adds a same-shaped f32 residual into output.
 [[nodiscard]] result<void, tensor_op_error> linear_add(const metal_context& context,

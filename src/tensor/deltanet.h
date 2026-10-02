@@ -59,6 +59,12 @@ gated_delta_rule(const metal_context& context,
 // input/gate/output: f32 [tokens, heads * value_dim], weight: f32 [value_dim].
 // Each head is normalized independently, then scaled by weight and SiLU(gate).
 // This norm uses weight directly, NOT the zero-centered (1 + weight) variant.
+[[nodiscard]] result<metal_tensor, tensor_op_error> rms_norm_gated(const metal_context& context,
+                                                                   const metal_tensor& input,
+                                                                   const metal_tensor& gate,
+                                                                   const metal_tensor& weight,
+                                                                   float epsilon);
+
 [[nodiscard]] result<void, tensor_op_error> rms_norm_gated(const metal_context& context,
                                                            const metal_tensor& input,
                                                            const metal_tensor& gate,

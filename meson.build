@@ -73,6 +73,7 @@ chibillm_metal = static_library(
     'src/metal/metal_kv_cache.cc',
     'src/model_format/weight_reader.cc',
     'src/tensor/tensor_ops.cc',
+    'src/tensor/tensor_functions.cc',
   ],
   include_directories: src_include,
   dependencies: metal_framework_dep,

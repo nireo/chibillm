@@ -45,6 +45,34 @@ private:
     std::string pending_;
 };
 
+// Finish the forward pass once, then read only one token per requested row.
+result<std::vector<token_id>, model_runner_error>
+finish_greedy(compute_pass& pass,
+              const metal_context& context,
+              const metal_tensor& norm,
+              const metal_tensor& vocabulary,
+              float epsilon,
+              const metal_tensor& hidden_states,
+              std::span<const std::size_t> logits_indices,
+              bool zero_centered = false)
+{
+    if (logits_indices.empty()) {
+        auto finished = pass.finish();
+        if (!finished)
+            return fail(model_runner_errc::backend_failure, finished.error(),
+                        "finish compute pass");
+        return std::vector<token_id> {};
+    }
+    auto encoded = encode_greedy(context, norm, vocabulary, epsilon, hidden_states, logits_indices,
+                                 zero_centered);
+    if (!encoded)
+        return fail(model_runner_errc::backend_failure, encoded.error(), "greedy output");
+    auto finished = pass.finish();
+    if (!finished)
+        return fail(model_runner_errc::backend_failure, finished.error(), "finish compute pass");
+    return read_greedy(*encoded);
+}
+
 } // namespace
 
 result<qwen_model_runner, qwen_model_runner_error>
@@ -207,27 +235,8 @@ qwen_model_runner::execute(const model_batch& batch, model_state& state)
     if (!final_hidden) {
         return fail(model_runner_errc::backend_failure, final_hidden.error(), "layers");
     }
-    if (metadata->logits_indices.empty()) {
-        auto finished = pass.finish();
-        if (!finished)
-            return fail(model_runner_errc::backend_failure, finished.error(),
-                        "finish compute pass");
-        return std::vector<token_id> {};
-    }
-    auto encoded_tokens =
-        encode_greedy(context_, weights_.final_norm, weights_.output, config_.rms_epsilon,
-                      *final_hidden, metadata->logits_indices);
-    if (!encoded_tokens) {
-        return fail(model_runner_errc::backend_failure, encoded_tokens.error(), "greedy output");
-    }
-    auto pass_finished = pass.finish();
-    if (!pass_finished) {
-        return fail(model_runner_errc::backend_failure, pass_finished.error(),
-                    "finish compute pass");
-    }
-
-    // The pass writes only one int32 per sequence for the CPU to read.
-    return read_greedy(*encoded_tokens);
+    return finish_greedy(pass, context_, weights_.final_norm, weights_.output, config_.rms_epsilon,
+                         *final_hidden, metadata->logits_indices);
 }
 
 result<qwen3_5_model_runner, qwen_model_runner_error>
@@ -359,23 +368,8 @@ qwen3_5_model_runner::execute(const model_batch& batch, model_state& state)
         run_qwen3_5_layers(context_, config_, weights_, std::move(*hidden), batch, *hybrid);
     if (!output)
         return fail(model_runner_errc::backend_failure, output.error(), "layers");
-    if (metadata->logits_indices.empty()) {
-        auto finished = pass.finish();
-        if (!finished)
-            return fail(model_runner_errc::backend_failure, finished.error(),
-                        "finish compute pass");
-        return std::vector<token_id> {};
-    }
-    // Qwen3.5 ties the vocabulary projection to the embedding and uses a
-    // zero-centered final RMSNorm, just like its decoder-layer norms.
-    auto encoded = encode_greedy(context_, weights_.final_norm, weights_.token_embedding,
-                                 config_.rms_epsilon, *output, metadata->logits_indices, true);
-    if (!encoded)
-        return fail(model_runner_errc::backend_failure, encoded.error(), "greedy output");
-    auto finished = pass.finish();
-    if (!finished)
-        return fail(model_runner_errc::backend_failure, finished.error(), "finish compute pass");
-    return read_greedy(*encoded);
+    return finish_greedy(pass, context_, weights_.final_norm, weights_.token_embedding,
+                         config_.rms_epsilon, *output, metadata->logits_indices, true);
 }
 
 } // namespace chibillm

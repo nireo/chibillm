@@ -23,28 +23,18 @@ normalized_swiglu(const metal_context& context,
         return fail(tensor_op_errc::input_shape_mismatch);
     }
 
-    const auto rows = shape.dimensions()[0];
-    auto normalized = allocate_tensor(context, dtype::f32, { rows, hidden_size });
+    auto normalized = rms_norm(context, hidden_states, norm, epsilon, zero_centered);
     if (!normalized)
         return fail(normalized.error());
-    CL_TRY(rms_norm(context, hidden_states, norm, epsilon, *normalized, zero_centered));
-    auto gate = allocate_tensor(context, dtype::f32, { rows, intermediate_size });
-    if (!gate)
-        return fail(gate.error());
-    auto up = allocate_tensor(context, dtype::f32, { rows, intermediate_size });
-    if (!up)
-        return fail(up.error());
-    CL_TRY(linear_split(context, *normalized, gateup, { &*gate, &*up }));
-    auto activated = allocate_tensor(context, dtype::f32, { rows, intermediate_size });
+    auto projected =
+        linear_split(context, *normalized, gateup, intermediate_size, intermediate_size);
+    if (!projected)
+        return fail(projected.error());
+    auto& [gate, up] = *projected;
+    auto activated = silu_mul(context, gate, up);
     if (!activated)
         return fail(activated.error());
-    CL_TRY(silu_mul(context, *gate, *up, *activated));
-    auto residual = allocate_tensor(context, dtype::f32, { rows, hidden_size });
-    if (!residual)
-        return fail(residual.error());
-    CL_TRY(linear_add(context, *activated, down, hidden_states, *residual));
-
-    return std::move(*residual);
+    return linear_add(context, *activated, down, hidden_states);
 }
 
 } // namespace chibillm

@@ -377,7 +377,8 @@ TEST_CASE("binary elementwise ops validate shapes and dtypes")
         CHECK(op(context, valid, valid, bad_shape).error()
               == tensor_op_errc::output_shape_mismatch);
     };
-    test_validation(silu_mul);
+    test_validation([](const metal_context& ctx, const metal_tensor& gate, const metal_tensor& up,
+                       metal_tensor& output) { return silu_mul(ctx, gate, up, output); });
     test_validation(add);
 }
 
@@ -985,4 +986,104 @@ TEST_CASE("paged attention validates inputs and metadata")
                   .error()
               == tensor_op_errc::cache_block_out_of_range);
     }
+}
+
+TEST_CASE("allocating helpers compose with temporary tensors in one compute pass")
+{
+    auto made = metal_context::make(load_shader_source());
+    REQUIRE(made.has_value());
+    auto& context = *made;
+    for (const auto rows : { 1U, 3U }) {
+        CAPTURE(rows);
+        auto input = make_tensor(context, dtype::f32, { rows, 2 });
+        auto norm = make_tensor(context, dtype::bf16, { 2 });
+        auto packed = make_tensor(context, dtype::bf16, { 6, 2 });
+        auto projection = make_tensor(context, dtype::bf16, { 1, 3 });
+        auto down = make_tensor(context, dtype::bf16, { 2, 1 });
+        std::vector<float> inputs;
+        for (unsigned row = 0; row < rows; ++row) {
+            inputs.push_back(1.0F + row);
+            inputs.push_back(-2.0F + row);
+        }
+        write_floats(input, inputs);
+        write_bf16(norm, { 1.0F, 0.5F });
+        write_bf16(packed, { 1, 0, 0, 1, 1, 1, 2, 0, 0, 2, 1, -1 });
+        write_bf16(projection, { 1, 2, -1 });
+        write_bf16(down, { 1, -2 });
+        chibillm::compute_pass pass(context);
+        REQUIRE(pass.begin().has_value());
+        auto output = [&] {
+            auto normalized = rms_norm(context, input, norm, 0.5F);
+            REQUIRE(normalized.has_value());
+            auto projected = chibillm::linear_split(context, *normalized, packed, 3, 3);
+            REQUIRE(projected.has_value());
+            auto& [gate, up] = *projected;
+            auto activated = silu_mul(context, gate, up);
+            REQUIRE(activated.has_value());
+            auto reduced = chibillm::linear(context, *activated, projection);
+            REQUIRE(reduced.has_value());
+            return linear_add(context, *reduced, down, input);
+        }(); // All intermediate tensors are destroyed before the GPU finishes.
+        REQUIRE(output.has_value());
+        REQUIRE(pass.finish().has_value());
+        std::vector<float> expected;
+        for (unsigned row = 0; row < rows; ++row) {
+            const auto x = inputs[2 * row], y = inputs[2 * row + 1];
+            const auto scale = 1.0F / std::sqrt((x * x + y * y) / 2 + 0.5F);
+            const auto a = x * scale, b = y * scale * 0.5F;
+            const auto silu = [](float v) { return v / (1.0F + std::exp(-v)); };
+            const auto reduced = silu(a) * (2 * a) + 2 * silu(b) * (2 * b) - silu(a + b) * (a - b);
+            expected.push_back(x + reduced);
+            expected.push_back(y - 2 * reduced);
+        }
+        check_floats(*output, expected);
+        check_floats(input, inputs);
+    }
+}
+
+TEST_CASE("allocating packed projections preserve unequal widths and head ordering")
+{
+    const auto& context = test_context();
+    auto input = make_tensor(context, dtype::f32, { 1, 2 });
+    auto packed = make_tensor(context, dtype::bf16, { 7, 2 });
+    write_floats(input, { 2, 3 });
+    write_bf16(packed, { 1, 0, 0, 1, 2, 0, 0, 2, 1, 1, 1, -1, -1, 1 });
+    auto projected = chibillm::linear_split(context, input, packed, 4, 1, 2);
+    REQUIRE(projected.has_value());
+    auto& [query_gate, key, value] = *projected;
+    auto split = chibillm::split_heads(context, query_gate, 2);
+    REQUIRE(split.has_value());
+    check_floats((*split)[0], { 2, 4 });
+    check_floats((*split)[1], { 3, 6 });
+    check_floats(key, { 5 });
+    check_floats(value, { -1, 1 });
+}
+
+TEST_CASE("allocating helpers reject malformed inputs and propagate operation errors")
+{
+    const auto& context = test_context();
+    auto input = make_tensor(context, dtype::f32, { 2, 2 });
+    auto norm = make_tensor(context, dtype::bf16, { 2 });
+    auto weight = make_tensor(context, dtype::bf16, { 3, 2 });
+    auto bad_rank = make_tensor(context, dtype::f32, { 4 });
+    auto bad_inner = make_tensor(context, dtype::bf16, { 3, 1 });
+    auto bad_residual = make_tensor(context, dtype::f32, { 1, 3 });
+    CHECK(rms_norm(context, bad_rank, norm, 1e-6F).error() == tensor_op_errc::invalid_rank);
+    CHECK(rms_norm(context, input, norm, 0.0F).error() == tensor_op_errc::invalid_epsilon);
+    CHECK(chibillm::linear(context, norm, weight).error() == tensor_op_errc::invalid_rank);
+    CHECK(chibillm::linear(context, input, bad_inner).error()
+          == tensor_op_errc::inner_dimension_mismatch);
+    CHECK(linear_add(context, input, weight, bad_residual).error()
+          == tensor_op_errc::input_shape_mismatch);
+    CHECK(chibillm::linear_split(context, input, weight, 1, 1).error()
+          == tensor_op_errc::inner_dimension_mismatch);
+    CHECK(chibillm::linear_split(context, input, weight, 0, 3).error()
+          == tensor_op_errc::inner_dimension_mismatch);
+    CHECK(chibillm::linear_split(context, input, weight, std::numeric_limits<std::size_t>::max(), 4)
+              .error()
+          == tensor_op_errc::inner_dimension_mismatch);
+    CHECK(chibillm::split_heads(context, input, 0).error() == tensor_op_errc::invalid_head_count);
+    CHECK(chibillm::split_heads(context, input, 2).error()
+          == tensor_op_errc::invalid_head_dimension);
+    CHECK(silu_mul(context, input, bad_residual).error() == tensor_op_errc::input_shape_mismatch);
 }
