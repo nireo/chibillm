@@ -44,6 +44,29 @@ private:
     std::string pending_;
 };
 
+result<std::vector<token_id>, model_runner_error>
+encode_qwen_chat(const qwen_tokenizer& tokenizer, std::span<const chat_message> messages)
+{
+    auto prompt = format_qwen_chat(messages);
+    if (!prompt)
+        return fail(prompt.error());
+    auto tokens = tokenizer.encode(*prompt);
+    if (!tokens) {
+        return fail(model_runner_errc::tokenizer_failure, tokens.error(), "chat encode");
+    }
+    return std::move(*tokens);
+}
+
+result<std::string, model_runner_error>
+decode_qwen_text(const qwen_tokenizer& tokenizer, std::span<const token_id> tokens)
+{
+    auto text = tokenizer.decode(tokens);
+    if (!text) {
+        return fail(model_runner_errc::tokenizer_failure, text.error(), "text decode");
+    }
+    return std::move(*text);
+}
+
 // Finish the forward pass once, then read only one token per requested row.
 result<std::vector<token_id>, model_runner_error>
 finish_greedy(compute_pass& pass,
@@ -175,24 +198,13 @@ qwen_model_runner::info() const noexcept
 result<std::vector<token_id>, model_runner_error>
 qwen_model_runner::encode_chat(std::span<const chat_message> messages)
 {
-    auto prompt = format_qwen_chat(messages);
-    if (!prompt)
-        return fail(prompt.error());
-    auto tokens = tokenizer_.encode(*prompt);
-    if (!tokens) {
-        return fail(model_runner_errc::tokenizer_failure, tokens.error(), "chat encode");
-    }
-    return std::move(*tokens);
+    return encode_qwen_chat(tokenizer_, messages);
 }
 
 result<std::string, model_runner_error>
 qwen_model_runner::decode(std::span<const token_id> tokens) const
 {
-    auto text = tokenizer_.decode(tokens);
-    if (!text) {
-        return fail(model_runner_errc::tokenizer_failure, text.error(), "text decode");
-    }
-    return std::move(*text);
+    return decode_qwen_text(tokenizer_, tokens);
 }
 
 result<std::vector<token_id>, model_runner_error>
@@ -322,22 +334,13 @@ qwen3_5_model_runner::info() const noexcept
 result<std::vector<token_id>, model_runner_error>
 qwen3_5_model_runner::encode_chat(std::span<const chat_message> messages)
 {
-    auto prompt = format_qwen_chat(messages);
-    if (!prompt)
-        return fail(prompt.error());
-    auto tokens = tokenizer_.encode(*prompt);
-    if (!tokens)
-        return fail(model_runner_errc::tokenizer_failure, tokens.error(), "chat encode");
-    return std::move(*tokens);
+    return encode_qwen_chat(tokenizer_, messages);
 }
 
 result<std::string, model_runner_error>
 qwen3_5_model_runner::decode(std::span<const token_id> tokens) const
 {
-    auto text = tokenizer_.decode(tokens);
-    if (!text)
-        return fail(model_runner_errc::tokenizer_failure, text.error(), "text decode");
-    return std::move(*text);
+    return decode_qwen_text(tokenizer_, tokens);
 }
 
 result<std::vector<token_id>, model_runner_error>

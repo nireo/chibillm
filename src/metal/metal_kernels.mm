@@ -4,10 +4,40 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
+#include <type_traits>
 
 namespace chibillm {
 namespace {
+// Shader dimensions are uint32_t; callers keep geometry-specific checks nearby.
+bool
+shader_dimensions_fit(std::initializer_list<std::size_t> dimensions, std::size_t minimum = 0)
+{
+    return std::ranges::all_of(dimensions, [minimum](const auto dimension) {
+        return dimension >= minimum && dimension <= std::numeric_limits<std::uint32_t>::max();
+    });
+}
+
+template <typename... Buffers>
+void
+bind_buffers(id<MTLComputeCommandEncoder> encoder,
+             NSUInteger first_index,
+             const Buffers&... buffers)
+{
+    ([encoder setBuffer:buffers offset:0 atIndex:first_index++], ...);
+}
+
+template <typename... Values>
+void
+bind_constants(id<MTLComputeCommandEncoder> encoder,
+               NSUInteger first_index,
+               const Values&... values)
+{
+    static_assert((std::is_trivially_copyable_v<Values> && ...));
+    ([encoder setBytes:&values length:sizeof(values) atIndex:first_index++], ...);
+}
+
 MTLSize
 adaptive_2d_threadgroup_size(id<MTLComputePipelineState> pipeline,
                              std::size_t grid_width,
@@ -51,8 +81,7 @@ metal_kernels::dispatch_linear_add_bf16(const metal_buffer& input,
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
-        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
-        if (input_features > max_shader_dimension || output_features > max_shader_dimension) {
+        if (!shader_dimensions_fit({ input_features, output_features })) {
             return fail(make_error(metal_errc::invalid_input,
                                    "linear-add dimensions exceed the shader uint range"));
         }
@@ -72,27 +101,17 @@ metal_kernels::dispatch_linear_add_bf16(const metal_buffer& input,
             static_cast<std::uint32_t>(outputs_per_threadgroup);
         const auto shader_simd_width = static_cast<std::uint32_t>(simd_width);
 
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened) {
-            return fail(opened.error());
-        }
-        id<MTLComputeCommandEncoder> encoder = opened->encoder;
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:weight.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:residual.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:3];
-        [encoder setBytes:&shader_input_features length:sizeof(shader_input_features) atIndex:4];
-        [encoder setBytes:&shader_output_features length:sizeof(shader_output_features) atIndex:5];
-        [encoder setBytes:&shader_outputs_per_threadgroup
-                   length:sizeof(shader_outputs_per_threadgroup)
-                  atIndex:6];
-        [encoder setBytes:&shader_simd_width length:sizeof(shader_simd_width) atIndex:7];
-        [encoder dispatchThreadgroups:MTLSizeMake(threadgroup_count, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
         const auto profile_name =
             input_features > output_features ? "linear_decode_contract" : "linear_decode_square";
-        return implementation_->complete_dispatch_encoder(*opened, profile_name);
+        return implementation_->dispatch(profile_name, [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            bind_buffers(encoder, 0, input.implementation_->buffer, weight.implementation_->buffer,
+                         residual.implementation_->buffer, output.implementation_->buffer);
+            bind_constants(encoder, 4, shader_input_features, shader_output_features,
+                           shader_outputs_per_threadgroup, shader_simd_width);
+            [encoder dispatchThreadgroups:MTLSizeMake(threadgroup_count, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
+        });
     }
 }
 
@@ -106,11 +125,8 @@ metal_kernels::dispatch_linear_split_bf16(const metal_buffer& input,
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
-        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
         const auto total_width = widths[0] + widths[1] + widths[2];
-        if (rows > max_shader_dimension
-            || input_features > max_shader_dimension
-            || total_width > max_shader_dimension) {
+        if (!shader_dimensions_fit({ rows, input_features, total_width })) {
             return fail(make_error(metal_errc::invalid_input,
                                    "linear split dimensions exceed the shader uint range"));
         }
@@ -123,91 +139,78 @@ metal_kernels::dispatch_linear_split_bf16(const metal_buffer& input,
             static_cast<std::uint32_t>(widths[2]),
         };
 
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened) {
-            return fail(opened.error());
-        }
-        id<MTLComputeCommandEncoder> encoder = opened->encoder;
-
         const bool use_tensorops = implementation_->tensorops_enabled && rows > 1;
-        const auto pipeline = use_tensorops ? implementation_->linear_bf16_tensorops_pipeline
-            : rows == 1                     ? implementation_->linear_split_bf16_decode_pipeline
-                                            : implementation_->linear_split_bf16_pipeline;
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
-        if (use_tensorops) {
-            [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:3];
-            [encoder setBytes:&shader_input_features
-                       length:sizeof(shader_input_features)
-                      atIndex:4];
-            const auto simd_width = static_cast<std::size_t>(pipeline.threadExecutionWidth);
-            std::size_t weight_row_offset = 0;
-            for (std::size_t i = 0; i < outputs.size(); ++i) {
-                if (widths[i] == 0) {
-                    continue;
-                }
-                const auto weight_offset_bytes =
-                    weight_row_offset * input_features * sizeof(std::uint16_t);
-                [encoder setBuffer:weight.implementation_->buffer
-                            offset:weight_offset_bytes
-                           atIndex:1];
-                [encoder setBuffer:outputs[i]->implementation_->buffer offset:0 atIndex:2];
-                [encoder setBytes:&shader_widths[i] length:sizeof(shader_widths[i]) atIndex:5];
-                [encoder
-                     dispatchThreadgroups:MTLSizeMake((widths[i] + 63) / 64, (rows + 63) / 64, 1)
-                    threadsPerThreadgroup:MTLSizeMake(4 * simd_width, 1, 1)];
-                weight_row_offset += widths[i];
-            }
-        } else {
-            [encoder setBuffer:weight.implementation_->buffer offset:0 atIndex:1];
-            for (std::size_t i = 0; i < outputs.size(); ++i) {
-                [encoder setBuffer:outputs[i]->implementation_->buffer offset:0 atIndex:2 + i];
-            }
-        }
-        if (!use_tensorops && rows == 1) {
-            const auto simd_width = static_cast<std::size_t>(pipeline.threadExecutionWidth);
-            constexpr std::size_t preferred_thread_count = 64;
-            auto thread_count =
-                std::min(preferred_thread_count,
-                         static_cast<std::size_t>(pipeline.maxTotalThreadsPerThreadgroup));
-            thread_count -= thread_count % simd_width;
-            const auto outputs_per_threadgroup = thread_count / simd_width;
-            const auto threadgroup_count = (total_width - 1) / outputs_per_threadgroup + 1;
-            const auto shader_outputs_per_threadgroup =
-                static_cast<std::uint32_t>(outputs_per_threadgroup);
-            const auto shader_simd_width = static_cast<std::uint32_t>(simd_width);
-
-            [encoder setBytes:&shader_input_features
-                       length:sizeof(shader_input_features)
-                      atIndex:5];
-            for (std::size_t i = 0; i < shader_widths.size(); ++i) {
-                [encoder setBytes:&shader_widths[i] length:sizeof(shader_widths[i]) atIndex:6 + i];
-            }
-            [encoder setBytes:&shader_outputs_per_threadgroup
-                       length:sizeof(shader_outputs_per_threadgroup)
-                      atIndex:9];
-            [encoder setBytes:&shader_simd_width length:sizeof(shader_simd_width) atIndex:10];
-            [encoder dispatchThreadgroups:MTLSizeMake(threadgroup_count, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
-        } else if (!use_tensorops) {
-            [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:5];
-            [encoder setBytes:&shader_input_features
-                       length:sizeof(shader_input_features)
-                      atIndex:6];
-            for (std::size_t i = 0; i < shader_widths.size(); ++i) {
-                [encoder setBytes:&shader_widths[i] length:sizeof(shader_widths[i]) atIndex:7 + i];
-            }
-            [encoder dispatchThreads:MTLSizeMake(total_width, rows, 1)
-                threadsPerThreadgroup:adaptive_2d_threadgroup_size(
-                                          implementation_->linear_split_bf16_pipeline, total_width,
-                                          rows)];
-        }
-
         const auto profile_name = use_tensorops ? "linear_split_tensorops"
             : rows != 1                         ? "linear_split_prefill"
             : total_width > input_features * 4  ? "linear_split_decode_wide"
                                                 : "linear_split_decode_qkv";
-        return implementation_->complete_dispatch_encoder(*opened, profile_name);
+        return implementation_->dispatch(profile_name, [&](id<MTLComputeCommandEncoder> encoder) {
+            const auto pipeline = use_tensorops ? implementation_->linear_bf16_tensorops_pipeline
+                : rows == 1                     ? implementation_->linear_split_bf16_decode_pipeline
+                                                : implementation_->linear_split_bf16_pipeline;
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
+            if (use_tensorops) {
+                bind_constants(encoder, 3, shader_rows, shader_input_features);
+                const auto simd_width = static_cast<std::size_t>(pipeline.threadExecutionWidth);
+                std::size_t weight_row_offset = 0;
+                for (std::size_t i = 0; i < outputs.size(); ++i) {
+                    if (widths[i] == 0) {
+                        continue;
+                    }
+                    const auto weight_offset_bytes =
+                        weight_row_offset * input_features * sizeof(std::uint16_t);
+                    [encoder setBuffer:weight.implementation_->buffer
+                                offset:weight_offset_bytes
+                               atIndex:1];
+                    [encoder setBuffer:outputs[i]->implementation_->buffer offset:0 atIndex:2];
+                    bind_constants(encoder, 5, shader_widths[i]);
+                    [encoder dispatchThreadgroups:MTLSizeMake((widths[i] + 63) / 64,
+                                                              (rows + 63) / 64, 1)
+                            threadsPerThreadgroup:MTLSizeMake(4 * simd_width, 1, 1)];
+                    weight_row_offset += widths[i];
+                }
+            } else {
+                [encoder setBuffer:weight.implementation_->buffer offset:0 atIndex:1];
+                for (std::size_t i = 0; i < outputs.size(); ++i) {
+                    [encoder setBuffer:outputs[i]->implementation_->buffer offset:0 atIndex:2 + i];
+                }
+            }
+            if (!use_tensorops && rows == 1) {
+                const auto simd_width = static_cast<std::size_t>(pipeline.threadExecutionWidth);
+                constexpr std::size_t preferred_thread_count = 64;
+                auto thread_count =
+                    std::min(preferred_thread_count,
+                             static_cast<std::size_t>(pipeline.maxTotalThreadsPerThreadgroup));
+                thread_count -= thread_count % simd_width;
+                const auto outputs_per_threadgroup = thread_count / simd_width;
+                const auto threadgroup_count = (total_width - 1) / outputs_per_threadgroup + 1;
+                const auto shader_outputs_per_threadgroup =
+                    static_cast<std::uint32_t>(outputs_per_threadgroup);
+                const auto shader_simd_width = static_cast<std::uint32_t>(simd_width);
+
+                bind_constants(encoder, 5, shader_input_features);
+                for (std::size_t i = 0; i < shader_widths.size(); ++i) {
+                    [encoder setBytes:&shader_widths[i]
+                               length:sizeof(shader_widths[i])
+                              atIndex:6 + i];
+                }
+                bind_constants(encoder, 9, shader_outputs_per_threadgroup, shader_simd_width);
+                [encoder dispatchThreadgroups:MTLSizeMake(threadgroup_count, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
+            } else if (!use_tensorops) {
+                bind_constants(encoder, 5, shader_rows, shader_input_features);
+                for (std::size_t i = 0; i < shader_widths.size(); ++i) {
+                    [encoder setBytes:&shader_widths[i]
+                               length:sizeof(shader_widths[i])
+                              atIndex:7 + i];
+                }
+                [encoder dispatchThreads:MTLSizeMake(total_width, rows, 1)
+                    threadsPerThreadgroup:adaptive_2d_threadgroup_size(
+                                              implementation_->linear_split_bf16_pipeline,
+                                              total_width, rows)];
+            }
+        });
     }
 }
 
@@ -220,8 +223,7 @@ metal_kernels::dispatch_embedding_bf16(const metal_buffer& token_ids,
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
-        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
-        if (token_count > max_shader_dimension || hidden_size > max_shader_dimension) {
+        if (!shader_dimensions_fit({ token_count, hidden_size })) {
             return fail(make_error(metal_errc::invalid_input,
                                    "embedding dimensions exceed the shader uint range"));
         }
@@ -229,24 +231,17 @@ metal_kernels::dispatch_embedding_bf16(const metal_buffer& token_ids,
         const auto shader_token_count = static_cast<std::uint32_t>(token_count);
         const auto shader_hidden_size = static_cast<std::uint32_t>(hidden_size);
 
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened) {
-            return fail(opened.error());
-        }
-        id<MTLComputeCommandEncoder> encoder = opened->encoder;
+        return implementation_->dispatch("embedding", [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:implementation_->embedding_bf16_pipeline];
+            bind_buffers(encoder, 0, token_ids.implementation_->buffer,
+                         weight.implementation_->buffer, output.implementation_->buffer);
+            bind_constants(encoder, 3, shader_token_count, shader_hidden_size);
 
-        [encoder setComputePipelineState:implementation_->embedding_bf16_pipeline];
-        [encoder setBuffer:token_ids.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:weight.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBytes:&shader_token_count length:sizeof(shader_token_count) atIndex:3];
-        [encoder setBytes:&shader_hidden_size length:sizeof(shader_hidden_size) atIndex:4];
-
-        [encoder dispatchThreads:MTLSizeMake(hidden_size, token_count, 1)
-            threadsPerThreadgroup:adaptive_2d_threadgroup_size(
-                                      implementation_->embedding_bf16_pipeline, hidden_size,
-                                      token_count)];
-        return implementation_->complete_dispatch_encoder(*opened, "embedding");
+            [encoder dispatchThreads:MTLSizeMake(hidden_size, token_count, 1)
+                threadsPerThreadgroup:adaptive_2d_threadgroup_size(
+                                          implementation_->embedding_bf16_pipeline, hidden_size,
+                                          token_count)];
+        });
     }
 }
 
@@ -261,8 +256,7 @@ metal_kernels::dispatch_rms_norm_bf16(const metal_buffer& input,
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
-        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
-        if (rows > max_shader_dimension || hidden_size > max_shader_dimension) {
+        if (!shader_dimensions_fit({ rows, hidden_size })) {
             return fail(make_error(metal_errc::invalid_input,
                                    "rms norm dimensions exceed the shader uint range"));
         }
@@ -270,32 +264,24 @@ metal_kernels::dispatch_rms_norm_bf16(const metal_buffer& input,
         const auto shader_rows = static_cast<std::uint32_t>(rows);
         const auto shader_hidden_size = static_cast<std::uint32_t>(hidden_size);
 
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened) {
-            return fail(opened.error());
-        }
-        id<MTLComputeCommandEncoder> encoder = opened->encoder;
-
-        [encoder setComputePipelineState:implementation_->rms_norm_bf16_pipeline];
-        [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:weight.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:3];
-        [encoder setBytes:&shader_hidden_size length:sizeof(shader_hidden_size) atIndex:4];
-        [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:5];
-
-        const float weight_offset = zero_centered ? 1.0F : 0.0F;
-        [encoder setBytes:&weight_offset length:sizeof(weight_offset) atIndex:6];
-
-        constexpr std::size_t preferred_thread_count = 256;
-        const auto max_threads = static_cast<std::size_t>(
-            implementation_->rms_norm_bf16_pipeline.maxTotalThreadsPerThreadgroup);
-        const auto thread_count = std::bit_floor(std::min(preferred_thread_count, max_threads));
-
-        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
         const auto profile_name = hidden_size <= 256 ? "rms_norm_grouped" : "rms_norm_hidden";
-        return implementation_->complete_dispatch_encoder(*opened, profile_name);
+        return implementation_->dispatch(profile_name, [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:implementation_->rms_norm_bf16_pipeline];
+            bind_buffers(encoder, 0, input.implementation_->buffer, weight.implementation_->buffer,
+                         output.implementation_->buffer);
+            bind_constants(encoder, 3, shader_rows, shader_hidden_size, epsilon);
+
+            const float weight_offset = zero_centered ? 1.0F : 0.0F;
+            bind_constants(encoder, 6, weight_offset);
+
+            constexpr std::size_t preferred_thread_count = 256;
+            const auto max_threads = static_cast<std::size_t>(
+                implementation_->rms_norm_bf16_pipeline.maxTotalThreadsPerThreadgroup);
+            const auto thread_count = std::bit_floor(std::min(preferred_thread_count, max_threads));
+
+            [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
+        });
     }
 }
 
@@ -316,11 +302,7 @@ metal_kernels::dispatch_greedy_vocabulary_bf16(const metal_buffer& hidden_states
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
-        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
-        if (rows > max_shader_dimension
-            || hidden_size > max_shader_dimension
-            || vocabulary_size > max_shader_dimension
-            || partial_count > max_shader_dimension) {
+        if (!shader_dimensions_fit({ rows, hidden_size, vocabulary_size, partial_count })) {
             return fail(make_error(metal_errc::invalid_input,
                                    "GPU sampling dimensions exceed the shader uint range"));
         }
@@ -352,56 +334,46 @@ metal_kernels::dispatch_greedy_vocabulary_bf16(const metal_buffer& hidden_states
         const auto outputs_per_simdgroup =
             static_cast<std::uint32_t>(outputs_per_threadgroup / simdgroup_count);
         const auto shader_simd_width = static_cast<std::uint32_t>(simd_width);
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened) {
-            return fail(opened.error());
-        }
-        id<MTLComputeCommandEncoder> encoder = opened->encoder;
+        return implementation_->dispatch(
+            "greedy_vocabulary_argmax", [&](id<MTLComputeCommandEncoder> encoder) {
+                [encoder setComputePipelineState:implementation_->gather_rows_f32_pipeline];
+                bind_buffers(encoder, 0, hidden_states.implementation_->buffer,
+                             row_indices.implementation_->buffer,
+                             normalized.implementation_->buffer);
+                bind_constants(encoder, 3, shader_hidden_size);
+                [encoder dispatchThreads:MTLSizeMake(hidden_size, rows, 1)
+                    threadsPerThreadgroup:adaptive_2d_threadgroup_size(
+                                              implementation_->gather_rows_f32_pipeline,
+                                              hidden_size, rows)];
 
-        [encoder setComputePipelineState:implementation_->gather_rows_f32_pipeline];
-        [encoder setBuffer:hidden_states.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:row_indices.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:normalized.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBytes:&shader_hidden_size length:sizeof(shader_hidden_size) atIndex:3];
-        [encoder dispatchThreads:MTLSizeMake(hidden_size, rows, 1)
-            threadsPerThreadgroup:adaptive_2d_threadgroup_size(
-                                      implementation_->gather_rows_f32_pipeline, hidden_size,
-                                      rows)];
+                [encoder setComputePipelineState:implementation_->rms_norm_bf16_pipeline];
+                bind_buffers(encoder, 0, normalized.implementation_->buffer,
+                             norm_weight.implementation_->buffer,
+                             normalized.implementation_->buffer);
+                bind_constants(encoder, 3, shader_rows, shader_hidden_size, epsilon);
 
-        [encoder setComputePipelineState:implementation_->rms_norm_bf16_pipeline];
-        [encoder setBuffer:normalized.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:norm_weight.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:normalized.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:3];
-        [encoder setBytes:&shader_hidden_size length:sizeof(shader_hidden_size) atIndex:4];
-        [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:5];
+                const float weight_offset = zero_centered ? 1.0F : 0.0F;
+                bind_constants(encoder, 6, weight_offset);
 
-        const float weight_offset = zero_centered ? 1.0F : 0.0F;
-        [encoder setBytes:&weight_offset length:sizeof(weight_offset) atIndex:6];
+                [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
 
-        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
+                [encoder setComputePipelineState:projection_pipeline];
+                bind_buffers(encoder, 0, normalized.implementation_->buffer,
+                             vocabulary_weight.implementation_->buffer,
+                             partial_maxima.implementation_->buffer);
+                bind_constants(encoder, 3, shader_hidden_size, shader_vocabulary_size,
+                               shader_partial_count, outputs_per_simdgroup, shader_simd_width);
+                [encoder dispatchThreadgroups:MTLSizeMake(partial_count, rows, 1)
+                        threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
 
-        [encoder setComputePipelineState:projection_pipeline];
-        [encoder setBuffer:normalized.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:vocabulary_weight.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:partial_maxima.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBytes:&shader_hidden_size length:sizeof(shader_hidden_size) atIndex:3];
-        [encoder setBytes:&shader_vocabulary_size length:sizeof(shader_vocabulary_size) atIndex:4];
-        [encoder setBytes:&shader_partial_count length:sizeof(shader_partial_count) atIndex:5];
-        [encoder setBytes:&outputs_per_simdgroup length:sizeof(outputs_per_simdgroup) atIndex:6];
-        [encoder setBytes:&shader_simd_width length:sizeof(shader_simd_width) atIndex:7];
-        [encoder dispatchThreadgroups:MTLSizeMake(partial_count, rows, 1)
-                threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
-
-        [encoder setComputePipelineState:implementation_->reduce_argmax_pipeline];
-        [encoder setBuffer:partial_maxima.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:token_ids.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBytes:&shader_partial_count length:sizeof(shader_partial_count) atIndex:2];
-        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
-
-        return implementation_->complete_dispatch_encoder(*opened, "greedy_vocabulary_argmax");
+                [encoder setComputePipelineState:implementation_->reduce_argmax_pipeline];
+                bind_buffers(encoder, 0, partial_maxima.implementation_->buffer,
+                             token_ids.implementation_->buffer);
+                bind_constants(encoder, 2, shader_partial_count);
+                [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(thread_count, 1, 1)];
+            });
     }
 }
 
@@ -414,37 +386,31 @@ metal_kernels::dispatch_silu_mul_f32(const metal_buffer& gate,
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
-        if (element_count > std::numeric_limits<std::uint32_t>::max()) {
+        if (!shader_dimensions_fit({ element_count })) {
             return fail(make_error(metal_errc::invalid_input,
                                    "silu multiply element count exceeds the shader uint range"));
         }
 
         const auto shader_element_count = static_cast<std::uint32_t>(element_count);
 
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened) {
-            return fail(opened.error());
-        }
-        id<MTLComputeCommandEncoder> encoder = opened->encoder;
+        return implementation_->dispatch(
+            sigmoid_only ? "sigmoid_mul" : "silu_mul", [&](id<MTLComputeCommandEncoder> encoder) {
+                [encoder setComputePipelineState:implementation_->silu_mul_f32_pipeline];
+                bind_buffers(encoder, 0, gate.implementation_->buffer, up.implementation_->buffer,
+                             output.implementation_->buffer);
+                bind_constants(encoder, 3, shader_element_count);
+                const std::uint32_t shader_sigmoid_only = sigmoid_only;
+                bind_constants(encoder, 4, shader_sigmoid_only);
 
-        [encoder setComputePipelineState:implementation_->silu_mul_f32_pipeline];
-        [encoder setBuffer:gate.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:up.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBytes:&shader_element_count length:sizeof(shader_element_count) atIndex:3];
-        const std::uint32_t shader_sigmoid_only = sigmoid_only;
-        [encoder setBytes:&shader_sigmoid_only length:sizeof(shader_sigmoid_only) atIndex:4];
+                constexpr std::size_t preferred_threadgroup_size = 256;
+                const auto threadgroup_size = std::min(
+                    preferred_threadgroup_size,
+                    static_cast<std::size_t>(
+                        implementation_->silu_mul_f32_pipeline.maxTotalThreadsPerThreadgroup));
 
-        constexpr std::size_t preferred_threadgroup_size = 256;
-        const auto threadgroup_size =
-            std::min(preferred_threadgroup_size,
-                     static_cast<std::size_t>(
-                         implementation_->silu_mul_f32_pipeline.maxTotalThreadsPerThreadgroup));
-
-        [encoder dispatchThreads:MTLSizeMake(element_count, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
-        return implementation_->complete_dispatch_encoder(
-            *opened, sigmoid_only ? "sigmoid_mul" : "silu_mul");
+                [encoder dispatchThreads:MTLSizeMake(element_count, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
+            });
     }
 }
 
@@ -456,34 +422,28 @@ metal_kernels::dispatch_add_f32(const metal_buffer& lhs,
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
-        if (element_count > std::numeric_limits<std::uint32_t>::max()) {
+        if (!shader_dimensions_fit({ element_count })) {
             return fail(make_error(metal_errc::invalid_input,
                                    "add element count exceeds the shader uint range"));
         }
 
         const auto shader_element_count = static_cast<std::uint32_t>(element_count);
 
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened) {
-            return fail(opened.error());
-        }
-        id<MTLComputeCommandEncoder> encoder = opened->encoder;
+        return implementation_->dispatch("add", [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:implementation_->add_f32_pipeline];
+            bind_buffers(encoder, 0, lhs.implementation_->buffer, rhs.implementation_->buffer,
+                         output.implementation_->buffer);
+            bind_constants(encoder, 3, shader_element_count);
 
-        [encoder setComputePipelineState:implementation_->add_f32_pipeline];
-        [encoder setBuffer:lhs.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:rhs.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBytes:&shader_element_count length:sizeof(shader_element_count) atIndex:3];
+            constexpr std::size_t preferred_threadgroup_size = 256;
+            const auto threadgroup_size =
+                std::min(preferred_threadgroup_size,
+                         static_cast<std::size_t>(
+                             implementation_->add_f32_pipeline.maxTotalThreadsPerThreadgroup));
 
-        constexpr std::size_t preferred_threadgroup_size = 256;
-        const auto threadgroup_size =
-            std::min(preferred_threadgroup_size,
-                     static_cast<std::size_t>(
-                         implementation_->add_f32_pipeline.maxTotalThreadsPerThreadgroup));
-
-        [encoder dispatchThreads:MTLSizeMake(element_count, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
-        return implementation_->complete_dispatch_encoder(*opened, "add");
+            [encoder dispatchThreads:MTLSizeMake(element_count, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
+        });
     }
 }
 
@@ -498,29 +458,22 @@ metal_kernels::dispatch_split_heads_f32(const metal_buffer& input,
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
         const auto width = head_count * head_dimension;
-        const auto max_dimension = std::numeric_limits<std::uint32_t>::max();
-        if (rows > max_dimension || width > max_dimension) {
+        if (!shader_dimensions_fit({ rows, width })) {
             return fail(make_error(metal_errc::invalid_input,
                                    "head split dimensions exceed the shader uint range"));
         }
 
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened)
-            return fail(opened.error());
-
-        auto encoder = opened->encoder;
-        const auto pipeline = implementation_->split_heads_f32_pipeline;
-        const auto shader_width = static_cast<std::uint32_t>(width);
-        const auto shader_head_dimension = static_cast<std::uint32_t>(head_dimension);
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:first.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:second.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBytes:&shader_width length:sizeof(shader_width) atIndex:3];
-        [encoder setBytes:&shader_head_dimension length:sizeof(shader_head_dimension) atIndex:4];
-        [encoder dispatchThreads:MTLSizeMake(width, rows, 1)
-            threadsPerThreadgroup:adaptive_2d_threadgroup_size(pipeline, width, rows)];
-        return implementation_->complete_dispatch_encoder(*opened, "split_heads");
+        return implementation_->dispatch("split_heads", [&](id<MTLComputeCommandEncoder> encoder) {
+            const auto pipeline = implementation_->split_heads_f32_pipeline;
+            const auto shader_width = static_cast<std::uint32_t>(width);
+            const auto shader_head_dimension = static_cast<std::uint32_t>(head_dimension);
+            [encoder setComputePipelineState:pipeline];
+            bind_buffers(encoder, 0, input.implementation_->buffer, first.implementation_->buffer,
+                         second.implementation_->buffer);
+            bind_constants(encoder, 3, shader_width, shader_head_dimension);
+            [encoder dispatchThreads:MTLSizeMake(width, rows, 1)
+                threadsPerThreadgroup:adaptive_2d_threadgroup_size(pipeline, width, rows)];
+        });
     }
 }
 
@@ -536,12 +489,8 @@ metal_kernels::dispatch_rope_f32(const metal_buffer& input,
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
-        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
         const auto pair_columns = head_count * (head_dimension / 2);
-        if (rows > max_shader_dimension
-            || head_count > max_shader_dimension
-            || head_dimension > max_shader_dimension
-            || pair_columns > max_shader_dimension) {
+        if (!shader_dimensions_fit({ rows, head_count, head_dimension, pair_columns })) {
             return fail(make_error(metal_errc::invalid_input,
                                    "rope dimensions exceed the shader uint range"));
         }
@@ -578,28 +527,18 @@ metal_kernels::dispatch_rope_f32(const metal_buffer& input,
             }
         }
 
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened) {
-            return fail(opened.error());
-        }
-        id<MTLComputeCommandEncoder> encoder = opened->encoder;
+        return implementation_->dispatch("rope", [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:implementation_->rope_f32_pipeline];
+            bind_buffers(encoder, 0, input.implementation_->buffer,
+                         positions.implementation_->buffer, output.implementation_->buffer);
+            bind_constants(encoder, 3, shader_rows, shader_head_count, shader_head_dimension);
+            [encoder setBuffer:frequency_buffer offset:0 atIndex:6];
+            bind_constants(encoder, 7, shader_rotary_dimension);
 
-        [encoder setComputePipelineState:implementation_->rope_f32_pipeline];
-        [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:positions.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:3];
-        [encoder setBytes:&shader_head_count length:sizeof(shader_head_count) atIndex:4];
-        [encoder setBytes:&shader_head_dimension length:sizeof(shader_head_dimension) atIndex:5];
-        [encoder setBuffer:frequency_buffer offset:0 atIndex:6];
-        [encoder setBytes:&shader_rotary_dimension
-                   length:sizeof(shader_rotary_dimension)
-                  atIndex:7];
-
-        [encoder dispatchThreads:MTLSizeMake(pair_columns, rows, 1)
-            threadsPerThreadgroup:adaptive_2d_threadgroup_size(implementation_->rope_f32_pipeline,
-                                                               pair_columns, rows)];
-        return implementation_->complete_dispatch_encoder(*opened, "rope");
+            [encoder dispatchThreads:MTLSizeMake(pair_columns, rows, 1)
+                threadsPerThreadgroup:adaptive_2d_threadgroup_size(
+                                          implementation_->rope_f32_pipeline, pair_columns, rows)];
+        });
     }
 }
 
@@ -616,11 +555,7 @@ metal_kernels::dispatch_store_kv_f32(const metal_buffer& keys,
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
-        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
-        if (rows > max_shader_dimension
-            || feature_count > max_shader_dimension
-            || layer > max_shader_dimension
-            || slot_count > max_shader_dimension) {
+        if (!shader_dimensions_fit({ rows, feature_count, layer, slot_count })) {
             return fail(make_error(metal_errc::invalid_input,
                                    "kv store dimensions exceed the shader uint range"));
         }
@@ -630,27 +565,19 @@ metal_kernels::dispatch_store_kv_f32(const metal_buffer& keys,
         const auto shader_layer = static_cast<std::uint32_t>(layer);
         const auto shader_slot_count = static_cast<std::uint32_t>(slot_count);
 
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened) {
-            return fail(opened.error());
-        }
-        id<MTLComputeCommandEncoder> encoder = opened->encoder;
+        return implementation_->dispatch("store_kv", [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:implementation_->store_kv_f32_pipeline];
+            bind_buffers(encoder, 0, keys.implementation_->buffer, values.implementation_->buffer,
+                         slot_mapping.implementation_->buffer, key_cache.implementation_->buffer,
+                         value_cache.implementation_->buffer);
+            bind_constants(encoder, 5, shader_rows, shader_feature_count, shader_layer,
+                           shader_slot_count);
 
-        [encoder setComputePipelineState:implementation_->store_kv_f32_pipeline];
-        [encoder setBuffer:keys.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:values.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:slot_mapping.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBuffer:key_cache.implementation_->buffer offset:0 atIndex:3];
-        [encoder setBuffer:value_cache.implementation_->buffer offset:0 atIndex:4];
-        [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:5];
-        [encoder setBytes:&shader_feature_count length:sizeof(shader_feature_count) atIndex:6];
-        [encoder setBytes:&shader_layer length:sizeof(shader_layer) atIndex:7];
-        [encoder setBytes:&shader_slot_count length:sizeof(shader_slot_count) atIndex:8];
-
-        [encoder dispatchThreads:MTLSizeMake(feature_count, rows, 1)
-            threadsPerThreadgroup:adaptive_2d_threadgroup_size(
-                                      implementation_->store_kv_f32_pipeline, feature_count, rows)];
-        return implementation_->complete_dispatch_encoder(*opened, "store_kv");
+            [encoder dispatchThreads:MTLSizeMake(feature_count, rows, 1)
+                threadsPerThreadgroup:adaptive_2d_threadgroup_size(
+                                          implementation_->store_kv_f32_pipeline, feature_count,
+                                          rows)];
+        });
     }
 }
 
@@ -688,17 +615,9 @@ metal_kernels::dispatch_paged_flash_attention_prefill_f32(const metal_buffer& qu
                 head_dimension, block_size, slot_count, layer, block_table_entry_count);
         }
 
-        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
-        if (rows > max_shader_dimension
-            || query_head_count > max_shader_dimension
-            || kv_head_count > max_shader_dimension
-            || head_dimension > max_shader_dimension
-            || block_size > max_shader_dimension
-            || slot_count > max_shader_dimension
-            || layer > max_shader_dimension
-            || block_table_entry_count > max_shader_dimension
-            || query_tile_count > max_shader_dimension
-            || simd_width > max_shader_dimension
+        if (!shader_dimensions_fit({ rows, query_head_count, kv_head_count, head_dimension,
+                                     block_size, slot_count, layer, block_table_entry_count,
+                                     query_tile_count, simd_width })
             || query_tile_count == 0
             || query_tile_starts.size_bytes() < query_tile_count * sizeof(std::uint32_t)
             || query_tile_lengths.size_bytes() < query_tile_count * sizeof(std::uint32_t)) {
@@ -727,48 +646,30 @@ metal_kernels::dispatch_paged_flash_attention_prefill_f32(const metal_buffer& qu
         const auto shader_query_tile_count = static_cast<std::uint32_t>(query_tile_count);
         const auto shader_simd_width = static_cast<std::uint32_t>(simd_width);
 
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened) {
-            return fail(opened.error());
-        }
-        id<MTLComputeCommandEncoder> encoder = opened->encoder;
-        [encoder
-            setComputePipelineState:implementation_->paged_flash_attention_prefill_f32_pipeline];
-        [encoder setBuffer:queries.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:positions.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:block_table.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBuffer:block_table_offsets.implementation_->buffer offset:0 atIndex:3];
-        [encoder setBuffer:block_table_lengths.implementation_->buffer offset:0 atIndex:4];
-        [encoder setBuffer:key_cache.implementation_->buffer offset:0 atIndex:5];
-        [encoder setBuffer:value_cache.implementation_->buffer offset:0 atIndex:6];
-        [encoder setBuffer:query_tile_starts.implementation_->buffer offset:0 atIndex:7];
-        [encoder setBuffer:query_tile_lengths.implementation_->buffer offset:0 atIndex:8];
-        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:9];
-        [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:10];
-        [encoder setBytes:&shader_query_head_count
-                   length:sizeof(shader_query_head_count)
-                  atIndex:11];
-        [encoder setBytes:&shader_kv_head_count length:sizeof(shader_kv_head_count) atIndex:12];
-        [encoder setBytes:&shader_head_dimension length:sizeof(shader_head_dimension) atIndex:13];
-        [encoder setBytes:&shader_block_size length:sizeof(shader_block_size) atIndex:14];
-        [encoder setBytes:&shader_slot_count length:sizeof(shader_slot_count) atIndex:15];
-        [encoder setBytes:&shader_layer length:sizeof(shader_layer) atIndex:16];
-        [encoder setBytes:&shader_block_table_entry_count
-                   length:sizeof(shader_block_table_entry_count)
-                  atIndex:17];
-        [encoder setBytes:&shader_query_tile_count
-                   length:sizeof(shader_query_tile_count)
-                  atIndex:18];
-        [encoder setBytes:&shader_simd_width length:sizeof(shader_simd_width) atIndex:19];
-        constexpr std::size_t query_tile_size = 8;
-        constexpr std::size_t key_tile_size = 16;
-        [encoder setThreadgroupMemoryLength:query_tile_size * key_tile_size * sizeof(float)
-                                    atIndex:0];
-        [encoder setThreadgroupMemoryLength:query_tile_size * sizeof(float) atIndex:1];
-        [encoder setThreadgroupMemoryLength:query_tile_size * sizeof(float) atIndex:2];
-        [encoder dispatchThreadgroups:MTLSizeMake(query_head_count, query_tile_count, 1)
-                threadsPerThreadgroup:MTLSizeMake(simd_width, 1, 1)];
-        return implementation_->complete_dispatch_encoder(*opened, "paged_flash_attention_prefill");
+        return implementation_->dispatch(
+            "paged_flash_attention_prefill", [&](id<MTLComputeCommandEncoder> encoder) {
+                [encoder setComputePipelineState:implementation_->
+                                                 paged_flash_attention_prefill_f32_pipeline];
+                bind_buffers(
+                    encoder, 0, queries.implementation_->buffer, positions.implementation_->buffer,
+                    block_table.implementation_->buffer,
+                    block_table_offsets.implementation_->buffer,
+                    block_table_lengths.implementation_->buffer, key_cache.implementation_->buffer,
+                    value_cache.implementation_->buffer, query_tile_starts.implementation_->buffer,
+                    query_tile_lengths.implementation_->buffer, output.implementation_->buffer);
+                bind_constants(encoder, 10, shader_rows, shader_query_head_count,
+                               shader_kv_head_count, shader_head_dimension, shader_block_size,
+                               shader_slot_count, shader_layer, shader_block_table_entry_count,
+                               shader_query_tile_count, shader_simd_width);
+                constexpr std::size_t query_tile_size = 8;
+                constexpr std::size_t key_tile_size = 16;
+                [encoder setThreadgroupMemoryLength:query_tile_size * key_tile_size * sizeof(float)
+                                            atIndex:0];
+                [encoder setThreadgroupMemoryLength:query_tile_size * sizeof(float) atIndex:1];
+                [encoder setThreadgroupMemoryLength:query_tile_size * sizeof(float) atIndex:2];
+                [encoder dispatchThreadgroups:MTLSizeMake(query_head_count, query_tile_count, 1)
+                        threadsPerThreadgroup:MTLSizeMake(simd_width, 1, 1)];
+            });
     }
 }
 
@@ -792,15 +693,8 @@ metal_kernels::dispatch_paged_attention_f32(const metal_buffer& queries,
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
-        constexpr auto max_shader_dimension = std::numeric_limits<std::uint32_t>::max();
-        if (rows > max_shader_dimension
-            || query_head_count > max_shader_dimension
-            || kv_head_count > max_shader_dimension
-            || head_dimension > max_shader_dimension
-            || block_size > max_shader_dimension
-            || slot_count > max_shader_dimension
-            || layer > max_shader_dimension
-            || block_table_entry_count > max_shader_dimension) {
+        if (!shader_dimensions_fit({ rows, query_head_count, kv_head_count, head_dimension,
+                                     block_size, slot_count, layer, block_table_entry_count })) {
             return fail(make_error(metal_errc::invalid_input,
                                    "paged attention dimensions exceed the shader uint range"));
         }
@@ -853,100 +747,60 @@ metal_kernels::dispatch_paged_attention_f32(const metal_buffer& queries,
 
             const auto shader_chunk_size = static_cast<std::uint32_t>(attention_chunk_size);
             const auto shader_chunk_count = static_cast<std::uint32_t>(chunk_count);
-            auto opened = implementation_->open_dispatch_encoder();
-            if (!opened) {
-                return fail(opened.error());
-            }
-            id<MTLComputeCommandEncoder> encoder = opened->encoder;
+            return implementation_->dispatch(
+                "paged_attention_chunked_decode", [&](id<MTLComputeCommandEncoder> encoder) {
+                    [encoder setComputePipelineState:implementation_->
+                                                     paged_attention_partial_f32_pipeline];
+                    bind_buffers(
+                        encoder, 0, queries.implementation_->buffer,
+                        positions.implementation_->buffer, block_table.implementation_->buffer,
+                        block_table_offsets.implementation_->buffer,
+                        block_table_lengths.implementation_->buffer,
+                        key_cache.implementation_->buffer, value_cache.implementation_->buffer,
+                        partials->implementation_->buffer);
+                    bind_constants(encoder, 8, shader_rows, shader_query_head_count,
+                                   shader_kv_head_count, shader_head_dimension, shader_block_size,
+                                   shader_slot_count, shader_layer, shader_block_table_entry_count,
+                                   shader_simdgroup_count, shader_chunk_size, shader_chunk_count);
+                    [encoder setThreadgroupMemoryLength:head_dimension * sizeof(float) atIndex:0];
+                    [encoder setThreadgroupMemoryLength:4 * sizeof(float) atIndex:1];
+                    [encoder dispatchThreadgroups:MTLSizeMake(query_head_count * chunk_count, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(head_dimension, 1, 1)];
 
-            [encoder setComputePipelineState:implementation_->paged_attention_partial_f32_pipeline];
-            [encoder setBuffer:queries.implementation_->buffer offset:0 atIndex:0];
-            [encoder setBuffer:positions.implementation_->buffer offset:0 atIndex:1];
-            [encoder setBuffer:block_table.implementation_->buffer offset:0 atIndex:2];
-            [encoder setBuffer:block_table_offsets.implementation_->buffer offset:0 atIndex:3];
-            [encoder setBuffer:block_table_lengths.implementation_->buffer offset:0 atIndex:4];
-            [encoder setBuffer:key_cache.implementation_->buffer offset:0 atIndex:5];
-            [encoder setBuffer:value_cache.implementation_->buffer offset:0 atIndex:6];
-            [encoder setBuffer:partials->implementation_->buffer offset:0 atIndex:7];
-            [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:8];
-            [encoder setBytes:&shader_query_head_count
-                       length:sizeof(shader_query_head_count)
-                      atIndex:9];
-            [encoder setBytes:&shader_kv_head_count length:sizeof(shader_kv_head_count) atIndex:10];
-            [encoder setBytes:&shader_head_dimension
-                       length:sizeof(shader_head_dimension)
-                      atIndex:11];
-            [encoder setBytes:&shader_block_size length:sizeof(shader_block_size) atIndex:12];
-            [encoder setBytes:&shader_slot_count length:sizeof(shader_slot_count) atIndex:13];
-            [encoder setBytes:&shader_layer length:sizeof(shader_layer) atIndex:14];
-            [encoder setBytes:&shader_block_table_entry_count
-                       length:sizeof(shader_block_table_entry_count)
-                      atIndex:15];
-            [encoder setBytes:&shader_simdgroup_count
-                       length:sizeof(shader_simdgroup_count)
-                      atIndex:16];
-            [encoder setBytes:&shader_chunk_size length:sizeof(shader_chunk_size) atIndex:17];
-            [encoder setBytes:&shader_chunk_count length:sizeof(shader_chunk_count) atIndex:18];
-            [encoder setThreadgroupMemoryLength:head_dimension * sizeof(float) atIndex:0];
-            [encoder setThreadgroupMemoryLength:4 * sizeof(float) atIndex:1];
-            [encoder dispatchThreadgroups:MTLSizeMake(query_head_count * chunk_count, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(head_dimension, 1, 1)];
-
-            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            [encoder setComputePipelineState:implementation_->paged_attention_reduce_f32_pipeline];
-            [encoder setBuffer:partials->implementation_->buffer offset:0 atIndex:0];
-            [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:1];
-            [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:2];
-            [encoder setBytes:&shader_query_head_count
-                       length:sizeof(shader_query_head_count)
-                      atIndex:3];
-            [encoder setBytes:&shader_head_dimension
-                       length:sizeof(shader_head_dimension)
-                      atIndex:4];
-            [encoder setBytes:&shader_chunk_count length:sizeof(shader_chunk_count) atIndex:5];
-            [encoder setThreadgroupMemoryLength:chunk_count * sizeof(float) atIndex:0];
-            [encoder setThreadgroupMemoryLength:sizeof(float) atIndex:1];
-            [encoder dispatchThreadgroups:MTLSizeMake(query_head_count, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(head_dimension, 1, 1)];
-            return implementation_->complete_dispatch_encoder(*opened,
-                                                              "paged_attention_chunked_decode");
+                    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    [encoder setComputePipelineState:implementation_->
+                                                     paged_attention_reduce_f32_pipeline];
+                    bind_buffers(encoder, 0, partials->implementation_->buffer,
+                                 output.implementation_->buffer);
+                    bind_constants(encoder, 2, shader_rows, shader_query_head_count,
+                                   shader_head_dimension, shader_chunk_count);
+                    [encoder setThreadgroupMemoryLength:chunk_count * sizeof(float) atIndex:0];
+                    [encoder setThreadgroupMemoryLength:sizeof(float) atIndex:1];
+                    [encoder dispatchThreadgroups:MTLSizeMake(query_head_count, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(head_dimension, 1, 1)];
+                });
         }
 
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened) {
-            return fail(opened.error());
-        }
-        id<MTLComputeCommandEncoder> encoder = opened->encoder;
+        return implementation_->dispatch(
+            rows == 1 ? "paged_attention_decode" : "paged_attention_prefill",
+            [&](id<MTLComputeCommandEncoder> encoder) {
+                [encoder setComputePipelineState:implementation_->paged_attention_f32_pipeline];
+                bind_buffers(encoder, 0, queries.implementation_->buffer,
+                             positions.implementation_->buffer, block_table.implementation_->buffer,
+                             block_table_offsets.implementation_->buffer,
+                             block_table_lengths.implementation_->buffer,
+                             key_cache.implementation_->buffer, value_cache.implementation_->buffer,
+                             output.implementation_->buffer);
+                bind_constants(encoder, 8, shader_rows, shader_query_head_count,
+                               shader_kv_head_count, shader_head_dimension, shader_block_size,
+                               shader_slot_count, shader_layer, shader_block_table_entry_count,
+                               shader_simdgroup_count);
+                [encoder setThreadgroupMemoryLength:head_dimension * sizeof(float) atIndex:0];
+                [encoder setThreadgroupMemoryLength:4 * sizeof(float) atIndex:1];
 
-        [encoder setComputePipelineState:implementation_->paged_attention_f32_pipeline];
-        [encoder setBuffer:queries.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:positions.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:block_table.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBuffer:block_table_offsets.implementation_->buffer offset:0 atIndex:3];
-        [encoder setBuffer:block_table_lengths.implementation_->buffer offset:0 atIndex:4];
-        [encoder setBuffer:key_cache.implementation_->buffer offset:0 atIndex:5];
-        [encoder setBuffer:value_cache.implementation_->buffer offset:0 atIndex:6];
-        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:7];
-        [encoder setBytes:&shader_rows length:sizeof(shader_rows) atIndex:8];
-        [encoder setBytes:&shader_query_head_count
-                   length:sizeof(shader_query_head_count)
-                  atIndex:9];
-        [encoder setBytes:&shader_kv_head_count length:sizeof(shader_kv_head_count) atIndex:10];
-        [encoder setBytes:&shader_head_dimension length:sizeof(shader_head_dimension) atIndex:11];
-        [encoder setBytes:&shader_block_size length:sizeof(shader_block_size) atIndex:12];
-        [encoder setBytes:&shader_slot_count length:sizeof(shader_slot_count) atIndex:13];
-        [encoder setBytes:&shader_layer length:sizeof(shader_layer) atIndex:14];
-        [encoder setBytes:&shader_block_table_entry_count
-                   length:sizeof(shader_block_table_entry_count)
-                  atIndex:15];
-        [encoder setBytes:&shader_simdgroup_count length:sizeof(shader_simdgroup_count) atIndex:16];
-        [encoder setThreadgroupMemoryLength:head_dimension * sizeof(float) atIndex:0];
-        [encoder setThreadgroupMemoryLength:4 * sizeof(float) atIndex:1];
-
-        [encoder dispatchThreadgroups:MTLSizeMake(query_head_count, rows, 1)
-                threadsPerThreadgroup:MTLSizeMake(head_dimension, 1, 1)];
-        return implementation_->complete_dispatch_encoder(
-            *opened, rows == 1 ? "paged_attention_decode" : "paged_attention_prefill");
+                [encoder dispatchThreadgroups:MTLSizeMake(query_head_count, rows, 1)
+                        threadsPerThreadgroup:MTLSizeMake(head_dimension, 1, 1)];
+            });
     }
 }
 
@@ -962,13 +816,7 @@ metal_kernels::dispatch_causal_conv1d_silu(const metal_buffer& input,
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
-        constexpr auto limit = std::numeric_limits<std::uint32_t>::max();
-        if (rows == 0
-            || rows > limit
-            || channels == 0
-            || channels > limit
-            || kernel == 0
-            || kernel > limit)
+        if (!shader_dimensions_fit({ rows, channels, kernel }, 1))
             return fail(
                 make_error(metal_errc::invalid_input, "invalid DeltaNet shader dimensions"));
         if (!f32_rows_fit(input, row_offset, rows, channels)
@@ -979,20 +827,21 @@ metal_kernels::dispatch_causal_conv1d_silu(const metal_buffer& input,
                                            static_cast<std::uint32_t>(channels),
                                            static_cast<std::uint32_t>(kernel) };
         const auto pipeline = implementation_->causal_conv1d_silu_pipeline;
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened)
-            return fail(opened.error());
-        id<MTLComputeCommandEncoder> encoder = opened->encoder;
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:input.implementation_->buffer offset:row_offset_bytes atIndex:0];
-        [encoder setBuffer:weight.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:history.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBuffer:output.implementation_->buffer offset:row_offset_bytes atIndex:3];
-        [encoder setBytes:geometry length:sizeof(geometry) atIndex:4];
-        const auto threads = std::min<std::size_t>(256, pipeline.maxTotalThreadsPerThreadgroup);
-        [encoder dispatchThreads:MTLSizeMake(channels, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-        return implementation_->complete_dispatch_encoder(*opened, "causal_conv1d_silu");
+        return implementation_->dispatch(
+            "causal_conv1d_silu", [&](id<MTLComputeCommandEncoder> encoder) {
+                [encoder setComputePipelineState:pipeline];
+                [encoder setBuffer:input.implementation_->buffer offset:row_offset_bytes atIndex:0];
+                bind_buffers(encoder, 1, weight.implementation_->buffer,
+                             history.implementation_->buffer);
+                [encoder setBuffer:output.implementation_->buffer
+                            offset:row_offset_bytes
+                           atIndex:3];
+                bind_constants(encoder, 4, geometry);
+                const auto threads =
+                    std::min<std::size_t>(256, pipeline.maxTotalThreadsPerThreadgroup);
+                [encoder dispatchThreads:MTLSizeMake(channels, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            });
     }
 }
 
@@ -1016,16 +865,7 @@ metal_kernels::dispatch_gated_delta_rule(const metal_buffer& qkv,
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
         constexpr auto limit = std::numeric_limits<std::uint32_t>::max();
-        if (rows == 0
-            || rows > limit
-            || key_heads == 0
-            || key_heads > limit
-            || value_heads == 0
-            || value_heads > limit
-            || key_dim == 0
-            || key_dim > limit
-            || value_dim == 0
-            || value_dim > limit
+        if (!shader_dimensions_fit({ rows, key_heads, value_heads, key_dim, value_dim }, 1)
             || value_heads % key_heads != 0
             || value_heads > limit / value_dim
             || key_heads > (limit - value_heads * value_dim) / key_dim / 2)
@@ -1057,58 +897,53 @@ metal_kernels::dispatch_gated_delta_rule(const metal_buffer& qkv,
             auto work = context_.make_shared_buffer(block * value_width * 3 * sizeof(float));
             if (!work)
                 return fail(work.error());
-            auto opened = implementation_->open_dispatch_encoder();
-            if (!opened)
-                return fail(opened.error());
-            id<MTLComputeCommandEncoder> encoder = opened->encoder;
-            [encoder setBuffer:A_log.implementation_->buffer offset:0 atIndex:3];
-            [encoder setBuffer:dt_bias.implementation_->buffer offset:0 atIndex:4];
-            [encoder setBuffer:state.implementation_->buffer offset:0 atIndex:5];
-            [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:8];
-            [encoder setBuffer:normalized->implementation_->buffer offset:0 atIndex:9];
-            [encoder setBuffer:gates->implementation_->buffer offset:0 atIndex:10];
-            [encoder setBuffer:products->implementation_->buffer offset:0 atIndex:11];
-            [encoder setBuffer:work->implementation_->buffer offset:0 atIndex:12];
-            for (std::size_t begin = 0; begin < rows; begin += block) {
-                const auto count = std::min(block, rows - begin);
-                const auto offset = row_offset + begin;
-                const std::uint32_t geometry[] = { static_cast<std::uint32_t>(count),
-                                                   static_cast<std::uint32_t>(key_heads),
-                                                   static_cast<std::uint32_t>(value_heads),
-                                                   static_cast<std::uint32_t>(key_dim),
-                                                   static_cast<std::uint32_t>(value_dim) };
-                [encoder setBytes:geometry length:sizeof(geometry) atIndex:7];
-                [encoder setBuffer:qkv.implementation_->buffer
-                            offset:offset * qkv_width * sizeof(float)
-                           atIndex:0];
-                [encoder setBuffer:a.implementation_->buffer
-                            offset:offset * value_heads * sizeof(float)
-                           atIndex:1];
-                [encoder setBuffer:b.implementation_->buffer
-                            offset:offset * value_heads * sizeof(float)
-                           atIndex:2];
-                [encoder setBuffer:output.implementation_->buffer
-                            offset:offset * value_width * sizeof(float)
-                           atIndex:6];
-                auto dispatch = [&](id<MTLComputePipelineState> pipeline, MTLSize grid,
-                                    MTLSize threads) {
-                    [encoder setComputePipelineState:pipeline];
-                    [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
-                };
-                dispatch(implementation_->delta_prepare_pipeline,
-                         MTLSizeMake(count, value_heads, 1), MTLSizeMake(32, 1, 1));
-                dispatch(implementation_->delta_products_pipeline,
-                         MTLSizeMake(count, count, value_heads), MTLSizeMake(8, 8, 1));
-                dispatch(implementation_->delta_project_pipeline,
-                         MTLSizeMake(value_width, count, 1), MTLSizeMake(32, 4, 1));
-                dispatch(implementation_->delta_solve_pipeline, MTLSizeMake(value_width, 1, 1),
-                         MTLSizeMake(128, 1, 1));
-                dispatch(implementation_->delta_finish_pipeline,
-                         MTLSizeMake(value_width, std::max(count, key_dim), 1),
-                         MTLSizeMake(32, 4, 1));
-            }
-            return implementation_->complete_dispatch_encoder(*opened,
-                                                              "gated_delta_rule_chunkwise");
+            return implementation_->dispatch(
+                "gated_delta_rule_chunkwise", [&](id<MTLComputeCommandEncoder> encoder) {
+                    bind_buffers(encoder, 3, A_log.implementation_->buffer,
+                                 dt_bias.implementation_->buffer, state.implementation_->buffer);
+                    bind_constants(encoder, 8, epsilon);
+                    bind_buffers(encoder, 9, normalized->implementation_->buffer,
+                                 gates->implementation_->buffer, products->implementation_->buffer,
+                                 work->implementation_->buffer);
+                    for (std::size_t begin = 0; begin < rows; begin += block) {
+                        const auto count = std::min(block, rows - begin);
+                        const auto offset = row_offset + begin;
+                        const std::uint32_t geometry[] = { static_cast<std::uint32_t>(count),
+                                                           static_cast<std::uint32_t>(key_heads),
+                                                           static_cast<std::uint32_t>(value_heads),
+                                                           static_cast<std::uint32_t>(key_dim),
+                                                           static_cast<std::uint32_t>(value_dim) };
+                        bind_constants(encoder, 7, geometry);
+                        [encoder setBuffer:qkv.implementation_->buffer
+                                    offset:offset * qkv_width * sizeof(float)
+                                   atIndex:0];
+                        [encoder setBuffer:a.implementation_->buffer
+                                    offset:offset * value_heads * sizeof(float)
+                                   atIndex:1];
+                        [encoder setBuffer:b.implementation_->buffer
+                                    offset:offset * value_heads * sizeof(float)
+                                   atIndex:2];
+                        [encoder setBuffer:output.implementation_->buffer
+                                    offset:offset * value_width * sizeof(float)
+                                   atIndex:6];
+                        auto dispatch = [&](id<MTLComputePipelineState> pipeline, MTLSize grid,
+                                            MTLSize threads) {
+                            [encoder setComputePipelineState:pipeline];
+                            [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+                        };
+                        dispatch(implementation_->delta_prepare_pipeline,
+                                 MTLSizeMake(count, value_heads, 1), MTLSizeMake(32, 1, 1));
+                        dispatch(implementation_->delta_products_pipeline,
+                                 MTLSizeMake(count, count, value_heads), MTLSizeMake(8, 8, 1));
+                        dispatch(implementation_->delta_project_pipeline,
+                                 MTLSizeMake(value_width, count, 1), MTLSizeMake(32, 4, 1));
+                        dispatch(implementation_->delta_solve_pipeline,
+                                 MTLSizeMake(value_width, 1, 1), MTLSizeMake(128, 1, 1));
+                        dispatch(implementation_->delta_finish_pipeline,
+                                 MTLSizeMake(value_width, std::max(count, key_dim), 1),
+                                 MTLSizeMake(32, 4, 1));
+                    }
+                });
         }
         const auto qkv_offset_bytes = row_offset * qkv_width * sizeof(float);
         const auto gate_offset_bytes = row_offset * value_heads * sizeof(float);
@@ -1119,24 +954,23 @@ metal_kernels::dispatch_gated_delta_rule(const metal_buffer& qkv,
                                            static_cast<std::uint32_t>(key_dim),
                                            static_cast<std::uint32_t>(value_dim) };
         const auto pipeline = implementation_->gated_delta_rule_pipeline;
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened)
-            return fail(opened.error());
-        id<MTLComputeCommandEncoder> encoder = opened->encoder;
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:qkv.implementation_->buffer offset:qkv_offset_bytes atIndex:0];
-        [encoder setBuffer:a.implementation_->buffer offset:gate_offset_bytes atIndex:1];
-        [encoder setBuffer:b.implementation_->buffer offset:gate_offset_bytes atIndex:2];
-        [encoder setBuffer:A_log.implementation_->buffer offset:0 atIndex:3];
-        [encoder setBuffer:dt_bias.implementation_->buffer offset:0 atIndex:4];
-        [encoder setBuffer:state.implementation_->buffer offset:0 atIndex:5];
-        [encoder setBuffer:output.implementation_->buffer offset:output_offset_bytes atIndex:6];
-        [encoder setBytes:geometry length:sizeof(geometry) atIndex:7];
-        [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:8];
-        const auto threads = std::min<std::size_t>(256, pipeline.maxTotalThreadsPerThreadgroup);
-        [encoder dispatchThreads:MTLSizeMake(value_heads * value_dim, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-        return implementation_->complete_dispatch_encoder(*opened, "gated_delta_rule");
+        return implementation_->dispatch(
+            "gated_delta_rule", [&](id<MTLComputeCommandEncoder> encoder) {
+                [encoder setComputePipelineState:pipeline];
+                [encoder setBuffer:qkv.implementation_->buffer offset:qkv_offset_bytes atIndex:0];
+                [encoder setBuffer:a.implementation_->buffer offset:gate_offset_bytes atIndex:1];
+                [encoder setBuffer:b.implementation_->buffer offset:gate_offset_bytes atIndex:2];
+                bind_buffers(encoder, 3, A_log.implementation_->buffer,
+                             dt_bias.implementation_->buffer, state.implementation_->buffer);
+                [encoder setBuffer:output.implementation_->buffer
+                            offset:output_offset_bytes
+                           atIndex:6];
+                bind_constants(encoder, 7, geometry, epsilon);
+                const auto threads =
+                    std::min<std::size_t>(256, pipeline.maxTotalThreadsPerThreadgroup);
+                [encoder dispatchThreads:MTLSizeMake(value_heads * value_dim, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            });
     }
 }
 
@@ -1151,28 +985,24 @@ metal_kernels::dispatch_rms_norm_gated(const metal_buffer& input,
 {
     @autoreleasepool {
         const auto& implementation_ = context_.implementation_;
-        constexpr auto limit = std::numeric_limits<std::uint32_t>::max();
-        if (groups == 0 || groups > limit || width == 0 || width > limit)
+        if (!shader_dimensions_fit({ groups, width }, 1))
             return fail(
                 make_error(metal_errc::invalid_input, "invalid DeltaNet shader dimensions"));
         const std::uint32_t geometry[] = { static_cast<std::uint32_t>(groups),
                                            static_cast<std::uint32_t>(width) };
         const auto pipeline = implementation_->rms_norm_gated_pipeline;
-        auto opened = implementation_->open_dispatch_encoder();
-        if (!opened)
-            return fail(opened.error());
-        id<MTLComputeCommandEncoder> encoder = opened->encoder;
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:input.implementation_->buffer offset:0 atIndex:0];
-        [encoder setBuffer:gate.implementation_->buffer offset:0 atIndex:1];
-        [encoder setBuffer:weight.implementation_->buffer offset:0 atIndex:2];
-        [encoder setBuffer:output.implementation_->buffer offset:0 atIndex:3];
-        [encoder setBytes:geometry length:sizeof(geometry) atIndex:4];
-        [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:5];
-        const auto threads = std::min<std::size_t>(256, pipeline.maxTotalThreadsPerThreadgroup);
-        [encoder dispatchThreads:MTLSizeMake(groups, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-        return implementation_->complete_dispatch_encoder(*opened, "rms_norm_gated");
+        return implementation_->dispatch(
+            "rms_norm_gated", [&](id<MTLComputeCommandEncoder> encoder) {
+                [encoder setComputePipelineState:pipeline];
+                bind_buffers(encoder, 0, input.implementation_->buffer,
+                             gate.implementation_->buffer, weight.implementation_->buffer,
+                             output.implementation_->buffer);
+                bind_constants(encoder, 4, geometry, epsilon);
+                const auto threads =
+                    std::min<std::size_t>(256, pipeline.maxTotalThreadsPerThreadgroup);
+                [encoder dispatchThreads:MTLSizeMake(groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            });
     }
 }
 

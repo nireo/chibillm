@@ -1,6 +1,7 @@
 #include "tensor/tensor_ops.h"
 #include "metal/metal_kernels.h"
 #include "tensor/types.h"
+#include "tensor/validation.h"
 
 #include <array>
 #include <cmath>
@@ -10,6 +11,38 @@
 #include <vector>
 
 namespace chibillm {
+
+namespace {
+
+result<std::size_t, tensor_op_error>
+validate_elementwise_output(const metal_tensor& lhs,
+                            const metal_tensor& rhs,
+                            const metal_tensor& output)
+{
+    const auto& lhs_descriptor = lhs.descriptor();
+    const auto& rhs_descriptor = rhs.descriptor();
+    const auto& output_descriptor = output.descriptor();
+    const auto& lhs_shape = lhs_descriptor.shape();
+    const auto& rhs_shape = rhs_descriptor.shape();
+    const auto& output_shape = output_descriptor.shape();
+
+    CL_TRY(validate_tensor_layouts(
+        { { lhs, 2, dtype::f32 }, { rhs, 2, dtype::f32 }, { output, 2, dtype::f32 } }));
+
+    if (lhs_shape.dimensions()[0] != rhs_shape.dimensions()[0]
+        || lhs_shape.dimensions()[1] != rhs_shape.dimensions()[1]) {
+        return fail(tensor_op_errc::input_shape_mismatch);
+    }
+
+    if (output_shape.dimensions()[0] != lhs_shape.dimensions()[0]
+        || output_shape.dimensions()[1] != lhs_shape.dimensions()[1]) {
+        return fail(tensor_op_errc::output_shape_mismatch);
+    }
+
+    return lhs_shape.element_count();
+}
+
+} // namespace
 
 result<metal_tensor, tensor_op_error>
 allocate_tensor(const metal_context& context, dtype type, std::vector<std::size_t> dimensions)
@@ -45,18 +78,10 @@ linear_add(const metal_context& context,
     const auto& residual_shape = residual.descriptor().shape();
     const auto& output_shape = output.descriptor().shape();
 
-    if (input_shape.rank() != 2
-        || weight_shape.rank() != 2
-        || residual_shape.rank() != 2
-        || output_shape.rank() != 2) {
-        return fail(tensor_op_errc::invalid_rank);
-    }
-    if (input.descriptor().type() != dtype::f32
-        || weight.descriptor().type() != dtype::bf16
-        || residual.descriptor().type() != dtype::f32
-        || output.descriptor().type() != dtype::f32) {
-        return fail(tensor_op_errc::unsupported_dtype);
-    }
+    CL_TRY(validate_tensor_layouts({ { input, 2, dtype::f32 },
+                                     { weight, 2, dtype::bf16 },
+                                     { residual, 2, dtype::f32 },
+                                     { output, 2, dtype::f32 } }));
 
     const auto rows = input_shape.dimensions()[0];
     const auto input_features = input_shape.dimensions()[1];
@@ -104,13 +129,8 @@ linear_split(const metal_context& context,
 {
     const auto& input_shape = input.descriptor().shape();
     const auto& weight_shape = packed_weight.descriptor().shape();
-    if (input_shape.rank() != 2 || weight_shape.rank() != 2) {
-        return fail(tensor_op_errc::invalid_rank);
-    }
-    if (input.descriptor().type() != dtype::f32
-        || packed_weight.descriptor().type() != dtype::bf16) {
-        return fail(tensor_op_errc::unsupported_dtype);
-    }
+    CL_TRY(
+        validate_tensor_layouts({ { input, 2, dtype::f32 }, { packed_weight, 2, dtype::bf16 } }));
     if (outputs.size() == 0 || outputs.size() > 3) {
         return fail(tensor_op_errc::output_shape_mismatch);
     }
@@ -167,15 +187,8 @@ embedding_lookup(const metal_context& context,
     const auto& weight_shape = weight.descriptor().shape();
     const auto& output_shape = output.descriptor().shape();
 
-    if (token_shape.rank() != 1 || weight_shape.rank() != 2 || output_shape.rank() != 2) {
-        return fail(tensor_op_errc::invalid_rank);
-    }
-
-    if (token_ids.descriptor().type() != dtype::i32
-        || weight.descriptor().type() != dtype::bf16
-        || output.descriptor().type() != dtype::f32) {
-        return fail(tensor_op_errc::unsupported_dtype);
-    }
+    CL_TRY(validate_tensor_layouts(
+        { { token_ids, 1, dtype::i32 }, { weight, 2, dtype::bf16 }, { output, 2, dtype::f32 } }));
 
     const auto token_count = token_shape.dimensions()[0];
     const auto vocabulary_size = weight_shape.dimensions()[0];
@@ -217,15 +230,8 @@ rms_norm(const metal_context& context,
     const auto& weight_shape = weight.descriptor().shape();
     const auto& output_shape = output.descriptor().shape();
 
-    if (input_shape.rank() != 2 || weight_shape.rank() != 1 || output_shape.rank() != 2) {
-        return fail(tensor_op_errc::invalid_rank);
-    }
-
-    if (input.descriptor().type() != dtype::f32
-        || weight.descriptor().type() != dtype::bf16
-        || output.descriptor().type() != dtype::f32) {
-        return fail(tensor_op_errc::unsupported_dtype);
-    }
+    CL_TRY(validate_tensor_layouts(
+        { { input, 2, dtype::f32 }, { weight, 1, dtype::bf16 }, { output, 2, dtype::f32 } }));
 
     const auto rows = input_shape.dimensions()[0];
     const auto hidden_size = input_shape.dimensions()[1];
@@ -262,35 +268,12 @@ gate_mul(const metal_context& context,
          metal_tensor& output,
          bool sigmoid_only)
 {
-    const auto& gate_descriptor = gate.descriptor();
-    const auto& up_descriptor = up.descriptor();
-    const auto& output_descriptor = output.descriptor();
-    const auto& gate_shape = gate_descriptor.shape();
-    const auto& up_shape = up_descriptor.shape();
-    const auto& output_shape = output_descriptor.shape();
-
-    if (gate_shape.rank() != 2 || up_shape.rank() != 2 || output_shape.rank() != 2) {
-        return fail(tensor_op_errc::invalid_rank);
-    }
-
-    if (gate_descriptor.type() != dtype::f32
-        || up_descriptor.type() != dtype::f32
-        || output_descriptor.type() != dtype::f32) {
-        return fail(tensor_op_errc::unsupported_dtype);
-    }
-
-    if (gate_shape.dimensions()[0] != up_shape.dimensions()[0]
-        || gate_shape.dimensions()[1] != up_shape.dimensions()[1]) {
-        return fail(tensor_op_errc::input_shape_mismatch);
-    }
-
-    if (output_shape.dimensions()[0] != gate_shape.dimensions()[0]
-        || output_shape.dimensions()[1] != gate_shape.dimensions()[1]) {
-        return fail(tensor_op_errc::output_shape_mismatch);
-    }
+    auto count = validate_elementwise_output(gate, up, output);
+    if (!count)
+        return fail(count.error());
 
     const auto dispatched = metal_kernels(context).dispatch_silu_mul_f32(
-        gate.buffer(), up.buffer(), output.buffer(), gate_shape.element_count(), sigmoid_only);
+        gate.buffer(), up.buffer(), output.buffer(), *count, sigmoid_only);
     if (!dispatched) {
         return fail(tensor_op_errc::backend_failure, dispatched.error());
     }
@@ -324,35 +307,12 @@ add(const metal_context& context,
     const metal_tensor& rhs,
     metal_tensor& output)
 {
-    const auto& lhs_descriptor = lhs.descriptor();
-    const auto& rhs_descriptor = rhs.descriptor();
-    const auto& output_descriptor = output.descriptor();
-    const auto& lhs_shape = lhs_descriptor.shape();
-    const auto& rhs_shape = rhs_descriptor.shape();
-    const auto& output_shape = output_descriptor.shape();
+    auto count = validate_elementwise_output(lhs, rhs, output);
+    if (!count)
+        return fail(count.error());
 
-    if (lhs_shape.rank() != 2 || rhs_shape.rank() != 2 || output_shape.rank() != 2) {
-        return fail(tensor_op_errc::invalid_rank);
-    }
-
-    if (lhs_descriptor.type() != dtype::f32
-        || rhs_descriptor.type() != dtype::f32
-        || output_descriptor.type() != dtype::f32) {
-        return fail(tensor_op_errc::unsupported_dtype);
-    }
-
-    if (lhs_shape.dimensions()[0] != rhs_shape.dimensions()[0]
-        || lhs_shape.dimensions()[1] != rhs_shape.dimensions()[1]) {
-        return fail(tensor_op_errc::input_shape_mismatch);
-    }
-
-    if (output_shape.dimensions()[0] != lhs_shape.dimensions()[0]
-        || output_shape.dimensions()[1] != lhs_shape.dimensions()[1]) {
-        return fail(tensor_op_errc::output_shape_mismatch);
-    }
-
-    const auto dispatched = metal_kernels(context).dispatch_add_f32(
-        lhs.buffer(), rhs.buffer(), output.buffer(), lhs_shape.element_count());
+    const auto dispatched = metal_kernels(context).dispatch_add_f32(lhs.buffer(), rhs.buffer(),
+                                                                    output.buffer(), *count);
     if (!dispatched) {
         return fail(tensor_op_errc::backend_failure, dispatched.error());
     }
@@ -368,15 +328,8 @@ split_heads(const metal_context& context,
             metal_tensor& second)
 {
     const auto& shape = input.descriptor().shape();
-    if (shape.rank() != 2
-        || first.descriptor().shape().rank() != 2
-        || second.descriptor().shape().rank() != 2)
-        return fail(tensor_op_errc::invalid_rank);
-
-    if (input.descriptor().type() != dtype::f32
-        || first.descriptor().type() != dtype::f32
-        || second.descriptor().type() != dtype::f32)
-        return fail(tensor_op_errc::unsupported_dtype);
+    CL_TRY(validate_tensor_layouts(
+        { { input, 2, dtype::f32 }, { first, 2, dtype::f32 }, { second, 2, dtype::f32 } }));
 
     if (head_count == 0)
         return fail(tensor_op_errc::invalid_head_count);
@@ -418,15 +371,8 @@ rope(const metal_context& context,
     const auto& position_shape = positions.descriptor().shape();
     const auto& output_shape = output.descriptor().shape();
 
-    if (input_shape.rank() != 2 || position_shape.rank() != 1 || output_shape.rank() != 2) {
-        return fail(tensor_op_errc::invalid_rank);
-    }
-
-    if (input.descriptor().type() != dtype::f32
-        || positions.descriptor().type() != dtype::u32
-        || output.descriptor().type() != dtype::f32) {
-        return fail(tensor_op_errc::unsupported_dtype);
-    }
+    CL_TRY(validate_tensor_layouts(
+        { { input, 2, dtype::f32 }, { positions, 1, dtype::u32 }, { output, 2, dtype::f32 } }));
 
     const auto rows = input_shape.dimensions()[0];
     const auto feature_count = input_shape.dimensions()[1];
@@ -481,15 +427,8 @@ store_kv(const metal_context& context,
     const auto& value_shape = values.descriptor().shape();
     const auto& slot_shape = slot_mapping.descriptor().shape();
 
-    if (key_shape.rank() != 2 || value_shape.rank() != 2 || slot_shape.rank() != 1) {
-        return fail(tensor_op_errc::invalid_rank);
-    }
-
-    if (keys.descriptor().type() != dtype::f32
-        || values.descriptor().type() != dtype::f32
-        || slot_mapping.descriptor().type() != dtype::u32) {
-        return fail(tensor_op_errc::unsupported_dtype);
-    }
+    CL_TRY(validate_tensor_layouts(
+        { { keys, 2, dtype::f32 }, { values, 2, dtype::f32 }, { slot_mapping, 1, dtype::u32 } }));
 
     const auto rows = key_shape.dimensions()[0];
     const auto feature_count = key_shape.dimensions()[1];

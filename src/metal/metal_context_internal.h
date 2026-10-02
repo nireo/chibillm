@@ -156,6 +156,12 @@ struct metal_context::implementation {
     // what one dispatch encodes into; see definition below.
     struct dispatch_frame;
 
+    [[nodiscard]] result<dispatch_frame, metal_error> make_dispatch_encoder();
+    [[nodiscard]] id<MTLCommandBuffer> drain_compute_pass();
+
+    template <typename Encode>
+    [[nodiscard]] result<void, metal_error> dispatch(std::string_view profile_name, Encode encode);
+
     [[nodiscard]] result<dispatch_frame, metal_error> open_dispatch_encoder();
     [[nodiscard]] result<void, metal_error>
     complete_dispatch_encoder(const dispatch_frame& frame, std::string_view profile_name = {});
@@ -168,5 +174,16 @@ struct metal_context::implementation::dispatch_frame {
     id<MTLCommandBuffer> command_buffer;
     id<MTLComputeCommandEncoder> encoder;
 };
+
+template <typename Encode>
+result<void, metal_error>
+metal_context::implementation::dispatch(std::string_view profile_name, Encode encode)
+{
+    auto frame = open_dispatch_encoder();
+    if (!frame)
+        return fail(frame.error());
+    encode(frame->encoder);
+    return complete_dispatch_encoder(*frame, profile_name);
+}
 
 } // namespace chibillm

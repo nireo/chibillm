@@ -258,6 +258,22 @@ parse_mrope_sections(const json& rope)
     return sections;
 }
 
+template <typename Config>
+result<void, qwen_config_errc>
+parse_common_geometry(const json& object, Config& config)
+{
+    CL_TRY_ASSIGN(config.vocabulary_size, required_size(object, "vocab_size"));
+    CL_TRY_ASSIGN(config.hidden_size, required_size(object, "hidden_size"));
+    CL_TRY_ASSIGN(config.intermediate_size, required_size(object, "intermediate_size"));
+    CL_TRY_ASSIGN(config.layer_count, required_size(object, "num_hidden_layers"));
+    CL_TRY_ASSIGN(config.query_head_count, required_size(object, "num_attention_heads"));
+    CL_TRY_ASSIGN(config.kv_head_count, required_size(object, "num_key_value_heads"));
+    CL_TRY_ASSIGN(config.head_dimension, required_size(object, "head_dim"));
+    CL_TRY_ASSIGN(config.max_position_embeddings, required_size(object, "max_position_embeddings"));
+    CL_TRY_ASSIGN(config.rms_epsilon, required_positive_float(object, "rms_norm_eps"));
+    return {};
+}
+
 result<qwen3_config, qwen_config_errc>
 parse_qwen3_object(const json& object)
 {
@@ -271,15 +287,7 @@ parse_qwen3_object(const json& object)
     CL_TRY(require_null_or_missing(object, "rope_scaling"));
 
     qwen3_config config {};
-    CL_TRY_ASSIGN(config.vocabulary_size, required_size(object, "vocab_size"));
-    CL_TRY_ASSIGN(config.hidden_size, required_size(object, "hidden_size"));
-    CL_TRY_ASSIGN(config.intermediate_size, required_size(object, "intermediate_size"));
-    CL_TRY_ASSIGN(config.layer_count, required_size(object, "num_hidden_layers"));
-    CL_TRY_ASSIGN(config.query_head_count, required_size(object, "num_attention_heads"));
-    CL_TRY_ASSIGN(config.kv_head_count, required_size(object, "num_key_value_heads"));
-    CL_TRY_ASSIGN(config.head_dimension, required_size(object, "head_dim"));
-    CL_TRY_ASSIGN(config.max_position_embeddings, required_size(object, "max_position_embeddings"));
-    CL_TRY_ASSIGN(config.rms_epsilon, required_positive_float(object, "rms_norm_eps"));
+    CL_TRY(parse_common_geometry(object, config));
     CL_TRY_ASSIGN(config.rope_theta, required_positive_float(object, "rope_theta"));
     CL_TRY_ASSIGN(config.bos_token_id, required_token_id(object, "bos_token_id"));
     CL_TRY_ASSIGN(config.eos_token_id, required_token_id(object, "eos_token_id"));
@@ -319,15 +327,7 @@ parse_qwen3_5_object(const json& object)
     CL_TRY(require_bool_value(*rope, "mrope_interleaved", true));
 
     qwen3_5_config config {};
-    CL_TRY_ASSIGN(config.vocabulary_size, required_size(*text, "vocab_size"));
-    CL_TRY_ASSIGN(config.hidden_size, required_size(*text, "hidden_size"));
-    CL_TRY_ASSIGN(config.intermediate_size, required_size(*text, "intermediate_size"));
-    CL_TRY_ASSIGN(config.layer_count, required_size(*text, "num_hidden_layers"));
-    CL_TRY_ASSIGN(config.query_head_count, required_size(*text, "num_attention_heads"));
-    CL_TRY_ASSIGN(config.kv_head_count, required_size(*text, "num_key_value_heads"));
-    CL_TRY_ASSIGN(config.head_dimension, required_size(*text, "head_dim"));
-    CL_TRY_ASSIGN(config.max_position_embeddings, required_size(*text, "max_position_embeddings"));
-    CL_TRY_ASSIGN(config.rms_epsilon, required_positive_float(*text, "rms_norm_eps"));
+    CL_TRY(parse_common_geometry(*text, config));
     CL_TRY_ASSIGN(config.eos_token_id, required_token_id(*text, "eos_token_id"));
     CL_TRY_ASSIGN(config.tie_word_embeddings, required_bool(*text, "tie_word_embeddings"));
     CL_TRY_ASSIGN(config.full_attention_interval, required_size(*text, "full_attention_interval"));

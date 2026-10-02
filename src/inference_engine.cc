@@ -83,11 +83,12 @@ inference_engine::step()
                                   describe_error(sampled_tokens.error()) });
     }
 
-    if (sampled_tokens->size() != batch->sample_count()) {
+    const auto sample_count = batch->sample_count();
+    if (sampled_tokens->size() != sample_count) {
         return fail_after_abort(*scheduled,
                                 { inference_engine_errc::runner_result_count_mismatch,
                                   "expected "
-                                      + std::to_string(batch->sample_count())
+                                      + std::to_string(sample_count)
                                       + " samples, received "
                                       + std::to_string(sampled_tokens->size()) });
     }

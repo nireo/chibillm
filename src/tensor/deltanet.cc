@@ -1,5 +1,6 @@
 #include "tensor/deltanet.h"
 #include "metal/metal_kernels.h"
+#include "tensor/validation.h"
 
 #include <algorithm>
 #include <cmath>
@@ -21,12 +22,6 @@ aliases(const metal_tensor& writable, std::initializer_list<const metal_tensor*>
         tensors, [&](const auto* tensor) { return &writable.buffer() == &tensor->buffer(); });
 }
 
-bool
-all_f32(std::initializer_list<const metal_tensor*> tensors)
-{
-    return std::ranges::all_of(
-        tensors, [](const auto* tensor) { return tensor->descriptor().type() == dtype::f32; });
-}
 } // namespace
 
 result<void, tensor_op_error>
@@ -37,14 +32,10 @@ causal_conv1d_silu(const metal_context& context,
                    metal_tensor& output,
                    std::optional<deltanet_chunk> chunk)
 {
-    if (input.descriptor().shape().rank() != 2
-        || weight.descriptor().shape().rank() != 3
-        || history.descriptor().shape().rank() != 2
-        || output.descriptor().shape().rank() != 2)
-        return fail(tensor_op_errc::invalid_rank);
-
-    if (!all_f32({ &input, &history, &output }) || weight.descriptor().type() != dtype::bf16)
-        return fail(tensor_op_errc::unsupported_dtype);
+    CL_TRY(validate_tensor_layouts({ { input, 2, dtype::f32 },
+                                     { weight, 3, dtype::bf16 },
+                                     { history, 2, dtype::f32 },
+                                     { output, 2, dtype::f32 } }));
 
     const auto dims = input.descriptor().shape().dimensions();
     const auto kernel = weight.descriptor().shape().dimensions()[2];
@@ -83,18 +74,13 @@ gated_delta_rule(const metal_context& context,
                  float epsilon,
                  std::optional<deltanet_chunk> chunk)
 {
-    if (qkv.descriptor().shape().rank() != 2
-        || a.descriptor().shape().rank() != 2
-        || b.descriptor().shape().rank() != 2
-        || A_log.descriptor().shape().rank() != 1
-        || dt_bias.descriptor().shape().rank() != 1
-        || state.descriptor().shape().rank() != 3
-        || output.descriptor().shape().rank() != 2)
-        return fail(tensor_op_errc::invalid_rank);
-
-    if (!all_f32({ &qkv, &a, &b, &A_log, &state, &output })
-        || dt_bias.descriptor().type() != dtype::bf16)
-        return fail(tensor_op_errc::unsupported_dtype);
+    CL_TRY(validate_tensor_layouts({ { qkv, 2, dtype::f32 },
+                                     { a, 2, dtype::f32 },
+                                     { b, 2, dtype::f32 },
+                                     { A_log, 1, dtype::f32 },
+                                     { dt_bias, 1, dtype::bf16 },
+                                     { state, 3, dtype::f32 },
+                                     { output, 2, dtype::f32 } }));
 
     if (!std::isfinite(epsilon) || epsilon <= 0)
         return fail(tensor_op_errc::invalid_epsilon);
@@ -144,14 +130,10 @@ rms_norm_gated(const metal_context& context,
                float epsilon,
                metal_tensor& output)
 {
-    if (input.descriptor().shape().rank() != 2
-        || gate.descriptor().shape().rank() != 2
-        || weight.descriptor().shape().rank() != 1
-        || output.descriptor().shape().rank() != 2)
-        return fail(tensor_op_errc::invalid_rank);
-
-    if (!all_f32({ &input, &gate, &weight, &output }))
-        return fail(tensor_op_errc::unsupported_dtype);
+    CL_TRY(validate_tensor_layouts({ { input, 2, dtype::f32 },
+                                     { gate, 2, dtype::f32 },
+                                     { weight, 1, dtype::f32 },
+                                     { output, 2, dtype::f32 } }));
 
     if (!std::isfinite(epsilon) || epsilon <= 0)
         return fail(tensor_op_errc::invalid_epsilon);

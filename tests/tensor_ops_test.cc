@@ -234,6 +234,46 @@ TEST_CASE("rms norm normalizes full rows and repeated groups")
                    2.0F / std::sqrt(5.0F) });
 }
 
+TEST_CASE("head normalization and RoPE can reuse their input in one compute pass")
+{
+    auto made = metal_context::make(load_shader_source());
+    REQUIRE(made);
+    auto& context = *made;
+    constexpr std::size_t head_dimension = 256;
+    for (const auto rows : { 1U, 3U }) {
+        for (const auto heads : { 2U, 4U }) {
+            CAPTURE(rows);
+            CAPTURE(heads);
+            auto input = make_tensor(context, dtype::f32, { rows, heads * head_dimension });
+            auto in_place = make_tensor(context, dtype::f32, { rows, heads * head_dimension });
+            auto weight = make_tensor(context, dtype::bf16, { head_dimension });
+            auto positions = make_tensor(context, dtype::u32, { rows });
+            std::vector<float> values(rows * heads * head_dimension);
+            for (std::size_t i = 0; i < values.size(); ++i)
+                values[i] = static_cast<float>(static_cast<int>(i % 29) - 14) / 7.0F;
+            write_floats(input, values);
+            write_floats(in_place, values);
+            write_bf16(weight, std::vector<float>(head_dimension, 0.5F));
+            std::vector<std::uint32_t> position_values(rows);
+            for (std::size_t row = 0; row < rows; ++row)
+                position_values[row] = 17 + row;
+            write_u32(positions, position_values);
+
+            chibillm::compute_pass pass(context);
+            REQUIRE(pass.begin());
+            auto normalized = chibillm::rms_norm(context, input, weight, 1e-6F);
+            REQUIRE(normalized);
+            auto expected = chibillm::rope(context, *normalized, positions, heads, 10000.0F);
+            REQUIRE(expected);
+            REQUIRE(rms_norm(context, in_place, weight, 1e-6F, in_place));
+            REQUIRE(rope(context, in_place, positions, heads, 10000.0F, in_place));
+            REQUIRE(pass.finish());
+            check_floats(in_place, read_floats(*expected));
+            check_floats(input, values);
+        }
+    }
+}
+
 TEST_CASE("zero-centered rms norm preserves FP32 offsets for rows and head groups")
 {
     const auto& context = test_context();
@@ -371,6 +411,8 @@ TEST_CASE("binary elementwise ops validate shapes and dtypes")
 
     auto test_validation = [&](auto op) {
         CHECK(op(context, bad_rank, valid, valid).error() == tensor_op_errc::invalid_rank);
+        CHECK(op(context, bad_dtype, bad_rank, valid).error() == tensor_op_errc::invalid_rank);
+        CHECK(op(context, bad_shape, valid, bad_rank).error() == tensor_op_errc::invalid_rank);
         CHECK(op(context, bad_dtype, valid, valid).error() == tensor_op_errc::unsupported_dtype);
         CHECK(op(context, valid, bad_shape, valid).error() == tensor_op_errc::input_shape_mismatch);
         CHECK(op(context, valid, valid, bad_shape).error()

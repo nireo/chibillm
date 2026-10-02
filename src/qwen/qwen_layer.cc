@@ -23,13 +23,10 @@ apply_rope(const metal_context& context,
            qwen_qkv qkv,
            const metal_tensor& positions)
 {
-    auto query = rope(context, qkv.query, positions, config.query_head_count, config.rope_theta);
-    if (!query)
-        return fail(query.error());
-    auto key = rope(context, qkv.key, positions, config.kv_head_count, config.rope_theta);
-    if (!key)
-        return fail(key.error());
-    return qwen_qkv { std::move(*query), std::move(*key), std::move(qkv.value) };
+    CL_TRY(
+        rope(context, qkv.query, positions, config.query_head_count, config.rope_theta, qkv.query));
+    CL_TRY(rope(context, qkv.key, positions, config.kv_head_count, config.rope_theta, qkv.key));
+    return qkv;
 }
 
 result<metal_tensor, tensor_op_error>
@@ -97,14 +94,10 @@ normalize_qwen_qk(const metal_context& context,
         || key_shape.dimensions()[1] != config.kv_width())
         return fail(tensor_op_errc::output_shape_mismatch);
 
-    auto query = rms_norm(context, qkv.query, weights.query_norm, config.rms_epsilon);
-    if (!query)
-        return fail(query.error());
-    auto key = rms_norm(context, qkv.key, weights.key_norm, config.rms_epsilon);
-    if (!key)
-        return fail(key.error());
-
-    return qwen_qkv { std::move(*query), std::move(*key), std::move(qkv.value) };
+    // QKV is owned here; normalize each head in place before rotating it.
+    CL_TRY(rms_norm(context, qkv.query, weights.query_norm, config.rms_epsilon, qkv.query));
+    CL_TRY(rms_norm(context, qkv.key, weights.key_norm, config.rms_epsilon, qkv.key));
+    return qkv;
 }
 
 result<metal_tensor, tensor_op_error>

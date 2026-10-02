@@ -1,24 +1,11 @@
 #include "metal/metal_context.h"
 #include "metal/metal_context_internal.h"
 #include "metal/metal_error.h"
-#include <algorithm>
-#include <bit>
-#include <cmath>
-#include <cstring>
-#include <limits>
-
 #include <Metal/Metal.h>
 
 #include <algorithm>
-#include <bit>
-#include <cmath>
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <limits>
-#include <map>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -36,6 +23,25 @@ message_from_error(NSError* error, std::string_view fallback)
 
     const char* message = error.localizedDescription.UTF8String;
     return message == nullptr ? std::string(fallback) : std::string(message);
+}
+
+void
+commit_and_wait(id<MTLCommandBuffer> command_buffer, id<MTLComputeCommandEncoder> encoder)
+{
+    [encoder endEncoding];
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+}
+
+result<void, metal_error>
+check_completion(id<MTLCommandBuffer> command_buffer)
+{
+    if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+        return fail(
+            make_error(metal_errc::execution_failed,
+                       message_from_error(command_buffer.error, "Metal command execution failed")));
+    }
+    return {};
 }
 
 bool
@@ -81,6 +87,12 @@ metal_context::implementation::open_dispatch_encoder()
         return dispatch_frame { nil, pass_encoder };
     }
 
+    return make_dispatch_encoder();
+}
+
+result<metal_context::implementation::dispatch_frame, metal_error>
+metal_context::implementation::make_dispatch_encoder()
+{
     id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
     if (command_buffer == nil) {
         return fail(make_error(metal_errc::command_buffer_creation_failed,
@@ -106,15 +118,8 @@ metal_context::implementation::complete_dispatch_encoder(const dispatch_frame& f
         return {};
     }
 
-    [frame.encoder endEncoding];
-    [frame.command_buffer commit];
-    [frame.command_buffer waitUntilCompleted];
-
-    if (frame.command_buffer.status != MTLCommandBufferStatusCompleted) {
-        return fail(make_error(
-            metal_errc::execution_failed,
-            message_from_error(frame.command_buffer.error, "Metal command execution failed")));
-    }
+    commit_and_wait(frame.command_buffer, frame.encoder);
+    CL_TRY(check_completion(frame.command_buffer));
 
     if (profiling_enabled && !profile_name.empty()) {
         auto& stats = profile[std::string(profile_name)];
@@ -371,21 +376,12 @@ metal_context::begin_compute_pass()
                                    "cannot begin a compute pass while one is already open"));
         }
 
-        id<MTLCommandBuffer> command_buffer = [implementation_->command_queue commandBuffer];
-        if (command_buffer == nil) {
-            return fail(make_error(metal_errc::command_buffer_creation_failed,
-                                   "failed to create a Metal command buffer"));
-        }
-
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return fail(make_error(metal_errc::command_encoder_creation_failed,
-                                   "failed to create a Metal compute encoder"));
-        }
-
+        auto frame = implementation_->make_dispatch_encoder();
+        if (!frame)
+            return fail(frame.error());
         implementation_->arena->begin_pass();
-        implementation_->pass_command_buffer = command_buffer;
-        implementation_->pass_encoder = encoder;
+        implementation_->pass_command_buffer = frame->command_buffer;
+        implementation_->pass_encoder = frame->encoder;
         return {};
     }
 }
@@ -399,24 +395,7 @@ metal_context::end_compute_pass()
                                    "cannot end a compute pass while none is open"));
         }
 
-        // detach first so a failure below still leaves the context reusable.
-        id<MTLCommandBuffer> command_buffer = implementation_->pass_command_buffer;
-        id<MTLComputeCommandEncoder> encoder = implementation_->pass_encoder;
-        implementation_->pass_command_buffer = nil;
-        implementation_->pass_encoder = nil;
-
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        implementation_->arena->complete_pass();
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return fail(make_error(
-                metal_errc::execution_failed,
-                message_from_error(command_buffer.error, "Metal command execution failed")));
-        }
-
-        return {};
+        return check_completion(implementation_->drain_compute_pass());
     }
 }
 
@@ -428,18 +407,22 @@ metal_context::abort_compute_pass() noexcept
             return;
         }
 
-        id<MTLCommandBuffer> command_buffer = implementation_->pass_command_buffer;
-        id<MTLComputeCommandEncoder> encoder = implementation_->pass_encoder;
-        implementation_->pass_command_buffer = nil;
-        implementation_->pass_encoder = nil;
-
-        // nothing encoded here may be read afterwards; commit only so shared-memory
-        // writes settle deterministically before the caller sees the error.
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        implementation_->arena->complete_pass();
+        (void)implementation_->drain_compute_pass();
     }
+}
+
+id<MTLCommandBuffer>
+metal_context::implementation::drain_compute_pass()
+{
+    // Detach first so errors leave the context reusable. Both success and abort
+    // must settle GPU writes before shared memory or arena buffers can be reused.
+    id<MTLCommandBuffer> command_buffer = pass_command_buffer;
+    id<MTLComputeCommandEncoder> encoder = pass_encoder;
+    pass_command_buffer = nil;
+    pass_encoder = nil;
+    commit_and_wait(command_buffer, encoder);
+    arena->complete_pass();
+    return command_buffer;
 }
 
 result<metal_buffer, metal_error>

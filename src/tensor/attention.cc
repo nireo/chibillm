@@ -1,5 +1,6 @@
 #include "tensor/attention.h"
 #include "metal/metal_kernels.h"
+#include "tensor/validation.h"
 #include <cstring>
 #include <vector>
 
@@ -44,21 +45,11 @@ validate_shapes(const metal_tensor& queries,
     const auto& length_shape = block_table_lengths.descriptor().shape();
     const auto& output_shape = output.descriptor().shape();
 
-    if (query_shape.rank() != 2
-        || position_shape.rank() != 1
-        || offset_shape.rank() != 1
-        || length_shape.rank() != 1
-        || output_shape.rank() != 2) {
-        return fail(tensor_op_errc::invalid_rank);
-    }
-
-    if (queries.descriptor().type() != dtype::f32
-        || positions.descriptor().type() != dtype::u32
-        || block_table_offsets.descriptor().type() != dtype::u32
-        || block_table_lengths.descriptor().type() != dtype::u32
-        || output.descriptor().type() != dtype::f32) {
-        return fail(tensor_op_errc::unsupported_dtype);
-    }
+    CL_TRY(validate_tensor_layouts({ { queries, 2, dtype::f32 },
+                                     { positions, 1, dtype::u32 },
+                                     { block_table_offsets, 1, dtype::u32 },
+                                     { block_table_lengths, 1, dtype::u32 },
+                                     { output, 2, dtype::f32 } }));
 
     const auto rows = query_shape.dimensions()[0];
     const auto query_feature_count = query_shape.dimensions()[1];
