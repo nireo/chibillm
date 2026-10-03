@@ -2,6 +2,7 @@
 #include "metal/metal_context.h"
 #include <Metal/Metal.h>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -135,6 +136,7 @@ struct metal_context::implementation {
     id<MTLComputePipelineState> split_heads_f32_pipeline;
     id<MTLComputePipelineState> store_kv_f32_pipeline;
     id<MTLComputePipelineState> paged_attention_f32_pipeline;
+    id<MTLComputePipelineState> paged_attention_simd_f32_pipeline;
     id<MTLComputePipelineState> paged_flash_attention_prefill_f32_pipeline;
     id<MTLComputePipelineState> paged_attention_partial_f32_pipeline;
     id<MTLComputePipelineState> paged_attention_reduce_f32_pipeline;
@@ -145,8 +147,11 @@ struct metal_context::implementation {
     id<MTLComputeCommandEncoder> pass_encoder;
     std::string device_name;
     bool profiling_enabled = false;
+    bool pass_profiling_enabled = false;
+    std::chrono::steady_clock::time_point pass_started;
     bool tensorops_enabled = false;
     bool flash_attention_enabled = false;
+    bool simd_attention_enabled = true;
     bool chunkwise_delta_enabled = true;
     std::map<std::string, profile_stats> profile;
     std::mutex rope_frequency_mutex;

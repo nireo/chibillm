@@ -869,6 +869,75 @@ TEST_CASE("paged FlashAttention merges key tiles across a cached prefix")
     }
 }
 
+TEST_CASE("wide-head attention matches a stable CPU reference for ragged paged batches")
+{
+    const auto& context = test_context();
+    for (const std::size_t dimension : { 129u, 192u, 256u, 257u }) {
+        CAPTURE(dimension);
+        constexpr std::size_t rows = 5, heads = 4, kv_heads = 2;
+        auto made = metal_kv_cache::make(context, { 2, 6, 16, kv_heads, dimension });
+        REQUIRE(made);
+        auto cache = std::move(*made);
+        std::vector<float> keys(cache.element_count()), values(keys.size());
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            keys[i] = std::sin(static_cast<float>(i) * 0.17F);
+            values[i] = std::cos(static_cast<float>(i) * 0.11F);
+        }
+        write_floats(cache.keys(), keys);
+        write_floats(cache.values(), values);
+        auto queries = make_tensor(context, dtype::f32, { rows, heads * dimension });
+        std::vector<float> query_values(rows * heads * dimension);
+        for (std::size_t i = 0; i < query_values.size(); ++i)
+            query_values[i] = 20.0F * std::sin(static_cast<float>(i) * 0.13F);
+        write_floats(queries, query_values);
+        const std::vector<std::uint32_t> pos { 17, 18, 7, 32, 9 };
+        const std::vector<std::uint32_t> tables { 4, 1, 5, 3, 0, 2 };
+        const std::vector<std::uint32_t> offsets { 0, 0, 3, 3, 0 };
+        auto positions = make_tensor(context, dtype::u32, { rows });
+        auto table = make_tensor(context, dtype::u32, { tables.size() });
+        auto table_offsets = make_tensor(context, dtype::u32, { rows });
+        auto lengths = make_tensor(context, dtype::u32, { rows });
+        auto output = make_tensor(context, dtype::f32, { rows, heads * dimension });
+        write_u32(positions, pos);
+        write_u32(table, tables);
+        write_u32(table_offsets, offsets);
+        write_u32(lengths, std::vector<std::uint32_t>(rows, 3));
+        REQUIRE(paged_attention(context, queries, positions, table, table_offsets, lengths, 1,
+                                heads, cache, output));
+        const auto actual = read_floats(output);
+        for (std::size_t row = 0; row < rows; ++row) {
+            for (std::size_t head = 0; head < heads; ++head) {
+                const auto base = (row * heads + head) * dimension;
+                const auto kv_head = head / (heads / kv_heads);
+                std::vector<double> scores(pos[row] + 1);
+                double maximum = -std::numeric_limits<double>::infinity();
+                for (std::size_t token = 0; token < scores.size(); ++token) {
+                    const auto cache_base = *cache.element_offset(
+                        1, tables[offsets[row] + token / 16], token % 16, kv_head, 0);
+                    double score = 0.0;
+                    for (std::size_t f = 0; f < dimension; ++f)
+                        score += static_cast<double>(query_values[base + f]) * keys[cache_base + f];
+                    scores[token] = score / std::sqrt(static_cast<double>(dimension));
+                    maximum = std::max(maximum, scores[token]);
+                }
+                double denominator = 0.0;
+                std::vector<double> expected(dimension, 0.0);
+                for (std::size_t token = 0; token < scores.size(); ++token) {
+                    const auto weight = std::exp(scores[token] - maximum);
+                    denominator += weight;
+                    const auto cache_base = *cache.element_offset(
+                        1, tables[offsets[row] + token / 16], token % 16, kv_head, 0);
+                    for (std::size_t f = 0; f < dimension; ++f)
+                        expected[f] += weight * values[cache_base + f];
+                }
+                for (std::size_t f = 0; f < dimension; ++f)
+                    CHECK(actual[base + f]
+                          == doctest::Approx(expected[f] / denominator).epsilon(3e-5).scale(1.0));
+            }
+        }
+    }
+}
+
 TEST_CASE("paged attention combines multiple context chunks")
 {
     const auto* context = &test_context();

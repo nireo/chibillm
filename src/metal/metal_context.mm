@@ -297,6 +297,8 @@ metal_context::make(std::string_view shader_source)
 
         CL_TRY_ASSIGN(implementation->paged_attention_f32_pipeline,
                       make_compute_pipeline(device, library, @"paged_attention_f32"));
+        CL_TRY_ASSIGN(implementation->paged_attention_simd_f32_pipeline,
+                      make_compute_pipeline(device, library, @"paged_attention_simd_f32"));
         CL_TRY_ASSIGN(implementation->paged_flash_attention_prefill_f32_pipeline,
                       make_compute_pipeline(device, library, @"paged_flash_attention_prefill_f32"));
         CL_TRY_ASSIGN(implementation->paged_attention_partial_f32_pipeline,
@@ -329,17 +331,22 @@ metal_context::make(std::string_view shader_source)
         implementation->chunkwise_delta_enabled =
             !environment_flag("CHIBILLM_DISABLE_CHUNKWISE_DELTA");
         implementation->profiling_enabled = environment_flag("CHIBILLM_PROFILE");
+        implementation->pass_profiling_enabled = environment_flag("CHIBILLM_PROFILE_PASSES");
         implementation->tensorops_enabled = implementation->linear_bf16_tensorops_pipeline != nil
             && !environment_flag("CHIBILLM_DISABLE_TENSOROPS");
         implementation->flash_attention_enabled =
             !environment_flag("CHIBILLM_DISABLE_FLASH_ATTENTION");
+        implementation->simd_attention_enabled =
+            !environment_flag("CHIBILLM_DISABLE_SIMD_ATTENTION");
 
         std::fprintf(stderr,
-                     "[metal] device=%s shaders=%s tensorops=%s flash-attention=%s profile=%s\n",
+                     "[metal] device=%s shaders=%s tensorops=%s flash-attention=%s profile=%s "
+                     "pass-profile=%s\n",
                      implementation->device_name.c_str(), compiled_metal4 ? "Metal 4" : "legacy",
                      implementation->tensorops_enabled ? "enabled" : "disabled",
                      implementation->flash_attention_enabled ? "enabled" : "disabled",
-                     implementation->profiling_enabled ? "detailed" : "off");
+                     implementation->profiling_enabled ? "detailed" : "off",
+                     implementation->pass_profiling_enabled ? "on" : "off");
 
         return metal_context { std::move(implementation) };
     }
@@ -382,6 +389,8 @@ metal_context::begin_compute_pass()
         implementation_->arena->begin_pass();
         implementation_->pass_command_buffer = frame->command_buffer;
         implementation_->pass_encoder = frame->encoder;
+        if (implementation_->pass_profiling_enabled)
+            implementation_->pass_started = std::chrono::steady_clock::now();
         return {};
     }
 }
@@ -420,7 +429,20 @@ metal_context::implementation::drain_compute_pass()
     id<MTLComputeCommandEncoder> encoder = pass_encoder;
     pass_command_buffer = nil;
     pass_encoder = nil;
+    const auto encoded_at = pass_profiling_enabled ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point {};
     commit_and_wait(command_buffer, encoder);
+    if (pass_profiling_enabled) {
+        const auto completed_at = std::chrono::steady_clock::now();
+        const auto milliseconds = [](auto duration) {
+            return std::chrono::duration<double, std::milli>(duration).count();
+        };
+        std::fprintf(stderr, "[metal-pass] encode_ms=%.6f wait_ms=%.6f gpu_ms=%.6f total_ms=%.6f\n",
+                     milliseconds(encoded_at - pass_started),
+                     milliseconds(completed_at - encoded_at),
+                     (command_buffer.GPUEndTime - command_buffer.GPUStartTime) * 1000.0,
+                     milliseconds(completed_at - pass_started));
+    }
     arena->complete_pass();
     return command_buffer;
 }

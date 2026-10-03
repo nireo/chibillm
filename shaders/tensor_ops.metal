@@ -654,6 +654,86 @@ paged_attention_f32(device const float* queries [[buffer(0)]],
     output[query_base + ulong(thread_index)] = value_accumulator / softmax_state[1];
 }
 
+// One SIMD group owns a query/head. Keeping the online softmax in registers
+// avoids cross-SIMD reductions and threadgroup barriers for every cached token.
+kernel void
+paged_attention_simd_f32(device const float* queries [[buffer(0)]],
+                         device const uint* positions [[buffer(1)]],
+                         device const uint* block_table [[buffer(2)]],
+                         device const uint* block_table_offsets [[buffer(3)]],
+                         device const uint* block_table_lengths [[buffer(4)]],
+                         device const float* key_cache [[buffer(5)]],
+                         device const float* value_cache [[buffer(6)]],
+                         device float* output [[buffer(7)]],
+                         constant uint& row_count [[buffer(8)]],
+                         constant uint& query_head_count [[buffer(9)]],
+                         constant uint& kv_head_count [[buffer(10)]],
+                         constant uint& head_dimension [[buffer(11)]],
+                         constant uint& block_size [[buffer(12)]],
+                         constant uint& slot_count [[buffer(13)]],
+                         constant uint& layer [[buffer(14)]],
+                         constant uint& block_table_entry_count [[buffer(15)]],
+                         constant uint& simd_width [[buffer(16)]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint3 group [[threadgroup_position_in_grid]])
+{
+    constexpr uint features_per_lane = 8;
+    const uint head = group.x, row = group.y;
+    if (head >= query_head_count
+        || row >= row_count
+        || head_dimension > simd_width * features_per_lane)
+        return;
+    const uint position = positions[row];
+    const uint table_offset = block_table_offsets[row];
+    const uint table_length = block_table_lengths[row];
+    if (table_offset > block_table_entry_count
+        || table_length > block_table_entry_count - table_offset
+        || position / block_size >= table_length)
+        return;
+
+    const uint kv_head = head / (query_head_count / kv_head_count);
+    const ulong query_base = (ulong(row) * query_head_count + head) * head_dimension;
+    float query[features_per_lane], accumulator[features_per_lane];
+    for (uint c = 0; c < features_per_lane; ++c) {
+        const uint feature = lane + c * simd_width;
+        query[c] = feature < head_dimension ? queries[query_base + feature] : 0.0F;
+        accumulator[c] = 0.0F;
+    }
+    float maximum = -INFINITY, denominator = 0.0F;
+    const float scale = rsqrt(float(head_dimension));
+    for (uint token = 0;; ++token) {
+        const uint block = block_table[table_offset + token / block_size];
+        const uint slot = block * block_size + token % block_size;
+        const ulong cache_base =
+            ((ulong(layer) * slot_count + slot) * kv_head_count + kv_head) * head_dimension;
+        float score = 0.0F;
+        for (uint c = 0; c < features_per_lane; ++c) {
+            const uint feature = lane + c * simd_width;
+            if (feature < head_dimension)
+                score += query[c] * key_cache[cache_base + feature];
+        }
+        score = simd_sum(score) * scale;
+        const float new_maximum = max(maximum, score);
+        const float rescale = exp(maximum - new_maximum);
+        const float weight = exp(score - new_maximum);
+        denominator = denominator * rescale + weight;
+        maximum = new_maximum;
+        for (uint c = 0; c < features_per_lane; ++c) {
+            const uint feature = lane + c * simd_width;
+            if (feature < head_dimension)
+                accumulator[c] =
+                    accumulator[c] * rescale + weight * value_cache[cache_base + feature];
+        }
+        if (token == position)
+            break;
+    }
+    for (uint c = 0; c < features_per_lane; ++c) {
+        const uint feature = lane + c * simd_width;
+        if (feature < head_dimension)
+            output[query_base + feature] = accumulator[c] / denominator;
+    }
+}
+
 // Paged FlashAttention-style prefill. One SIMD group owns one query-head tile,
 // keeps eight query/output rows in registers, and streams sixteen-key tiles
 // through a small threadgroup score buffer. Keys and values are therefore read

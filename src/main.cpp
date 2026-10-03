@@ -90,8 +90,11 @@ run_application(const cli_options& settings, const std::filesystem::path& shader
         return 1;
     }
     const auto kv_block_count = (context_length + kv_block_size - 1) / kv_block_size;
+    // A single chat can use larger matmul batches; serving keeps shorter
+    // reservations so concurrent requests can take turns.
     const scheduler_config config {
         .max_sequences = settings.serve ? 4u : 1u,
+        .max_batch_tokens = settings.serve ? 128u : 512u,
         .kv_block_count = kv_block_count,
         .kv_block_size = kv_block_size,
     };

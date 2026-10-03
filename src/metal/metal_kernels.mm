@@ -717,6 +717,32 @@ metal_kernels::dispatch_paged_attention_f32(const metal_buffer& queries,
             static_cast<std::uint32_t>(block_table_entry_count);
         const auto simd_width = static_cast<std::size_t>(
             implementation_->paged_attention_f32_pipeline.threadExecutionWidth);
+        const auto simd_pipeline = implementation_->paged_attention_simd_f32_pipeline;
+        const auto attention_simd_width =
+            static_cast<std::size_t>(simd_pipeline.threadExecutionWidth);
+        if (implementation_->simd_attention_enabled
+            && rows > 1
+            && head_dimension > 128
+            && head_dimension <= 8 * attention_simd_width) {
+            const auto shader_simd_width = static_cast<std::uint32_t>(attention_simd_width);
+            return implementation_->dispatch(
+                "paged_attention_simd_prefill", [&](id<MTLComputeCommandEncoder> encoder) {
+                    [encoder setComputePipelineState:simd_pipeline];
+                    bind_buffers(
+                        encoder, 0, queries.implementation_->buffer,
+                        positions.implementation_->buffer, block_table.implementation_->buffer,
+                        block_table_offsets.implementation_->buffer,
+                        block_table_lengths.implementation_->buffer,
+                        key_cache.implementation_->buffer, value_cache.implementation_->buffer,
+                        output.implementation_->buffer);
+                    bind_constants(encoder, 8, shader_rows, shader_query_head_count,
+                                   shader_kv_head_count, shader_head_dimension, shader_block_size,
+                                   shader_slot_count, shader_layer, shader_block_table_entry_count,
+                                   shader_simd_width);
+                    [encoder dispatchThreadgroups:MTLSizeMake(query_head_count, rows, 1)
+                            threadsPerThreadgroup:MTLSizeMake(attention_simd_width, 1, 1)];
+                });
+        }
         const auto shader_simdgroup_count =
             static_cast<std::uint32_t>((head_dimension - 1) / simd_width + 1);
 
