@@ -4,6 +4,8 @@
 # Editor/build caches
 /.cache/
 
+.DS_Store
+**/.DS_Store
 # Generated compilation database
 /compile_commands.json
 
