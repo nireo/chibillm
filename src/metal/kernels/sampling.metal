@@ -21,20 +21,23 @@ gather_rows_f32(device const float* input [[buffer(0)]],
     }
 }
 
-kernel void
-linear_bf16_partial_argmax(device const float* input [[buffer(0)]],
-                           device const bf16_storage* weight [[buffer(1)]],
-                           device argmax_pair* partials [[buffer(2)]],
-                           constant uint& hidden_size [[buffer(3)]],
-                           constant uint& vocabulary_size [[buffer(4)]],
-                           constant uint& partial_count [[buffer(5)]],
-                           constant uint& outputs_per_simdgroup [[buffer(6)]],
-                           constant uint& simd_width [[buffer(7)]],
-                           uint thread_index [[thread_index_in_threadgroup]],
-                           uint lane [[thread_index_in_simdgroup]],
-                           uint simdgroup [[simdgroup_index_in_threadgroup]],
-                           uint3 threadgroup_position [[threadgroup_position_in_grid]],
-                           uint simdgroups_per_threadgroup [[simdgroups_per_threadgroup]])
+template <typename Matrix>
+static inline void
+linear_partial_argmax_impl(device const float* input,
+                           Matrix weight,
+                           device argmax_pair* partials,
+                           constant uint& hidden_size,
+                           constant uint& vocabulary_size,
+                           constant uint& partial_count,
+                           constant uint& outputs_per_simdgroup,
+                           constant uint& simd_width,
+                           uint thread_index,
+                           uint lane,
+                           uint simdgroup,
+                           uint3 threadgroup_position,
+                           uint simdgroups_per_threadgroup,
+                           threadgroup float* simd_scores,
+                           threadgroup uint* simd_indices)
 {
     const uint row = threadgroup_position.y;
     const uint outputs_per_threadgroup = simdgroups_per_threadgroup * outputs_per_simdgroup;
@@ -48,8 +51,7 @@ linear_bf16_partial_argmax(device const float* input [[buffer(0)]],
         float accumulator = 0.0F;
         if (output_feature < vocabulary_size) {
             const ulong input_base = ulong(row) * ulong(hidden_size);
-            accumulator = linear_bf16_decode_dot(input + input_base, weight, hidden_size,
-                                                 output_feature, lane, simd_width);
+            accumulator = weight.dot(input + input_base, output_feature, lane, simd_width);
             if (lane == 0
                 && (accumulator > best_score
                     || (accumulator == best_score && output_feature < best_index))) {
@@ -59,8 +61,6 @@ linear_bf16_partial_argmax(device const float* input [[buffer(0)]],
         }
     }
 
-    threadgroup float simd_scores[32];
-    threadgroup uint simd_indices[32];
     if (lane == 0) {
         simd_scores[simdgroup] = best_score;
         simd_indices[simdgroup] = best_index;
@@ -78,6 +78,54 @@ linear_bf16_partial_argmax(device const float* input [[buffer(0)]],
         partials[ulong(row) * ulong(partial_count) + threadgroup_position.x] = { simd_scores[0],
                                                                                  simd_indices[0] };
     }
+}
+
+kernel void
+linear_bf16_partial_argmax(device const float* input [[buffer(0)]],
+                           device const bf16_storage* weight [[buffer(1)]],
+                           device argmax_pair* partials [[buffer(2)]],
+                           constant uint& hidden_size [[buffer(3)]],
+                           constant uint& vocabulary_size [[buffer(4)]],
+                           constant uint& partial_count [[buffer(5)]],
+                           constant uint& outputs_per_simdgroup [[buffer(6)]],
+                           constant uint& simd_width [[buffer(7)]],
+                           uint thread_index [[thread_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]],
+                           uint simdgroup [[simdgroup_index_in_threadgroup]],
+                           uint3 threadgroup_position [[threadgroup_position_in_grid]],
+                           uint simdgroups_per_threadgroup [[simdgroups_per_threadgroup]])
+{
+    threadgroup float simd_scores[32];
+    threadgroup uint simd_indices[32];
+    linear_partial_argmax_impl(input, bf16_matrix { weight, hidden_size }, partials, hidden_size,
+                               vocabulary_size, partial_count, outputs_per_simdgroup, simd_width,
+                               thread_index, lane, simdgroup, threadgroup_position,
+                               simdgroups_per_threadgroup, simd_scores, simd_indices);
+}
+
+kernel void
+linear_q4_partial_argmax(device const float* input [[buffer(0)]],
+                         device const uint* weight [[buffer(1)]],
+                         device argmax_pair* partials [[buffer(2)]],
+                         constant uint& hidden_size [[buffer(3)]],
+                         constant uint& vocabulary_size [[buffer(4)]],
+                         constant uint& partial_count [[buffer(5)]],
+                         constant uint& outputs_per_simdgroup [[buffer(6)]],
+                         constant uint& simd_width [[buffer(7)]],
+                         uint thread_index [[thread_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint simdgroup [[simdgroup_index_in_threadgroup]],
+                         uint3 threadgroup_position [[threadgroup_position_in_grid]],
+                         device const bf16_storage* scales [[buffer(8)]],
+                         device const bf16_storage* offsets [[buffer(9)]],
+                         uint simdgroups_per_threadgroup [[simdgroups_per_threadgroup]])
+{
+    threadgroup float simd_scores[32];
+    threadgroup uint simd_indices[32];
+    linear_partial_argmax_impl(input, q4_matrix { weight, scales, offsets, hidden_size }, partials,
+                               hidden_size, vocabulary_size, partial_count, outputs_per_simdgroup,
+                               simd_width, thread_index, lane, simdgroup, threadgroup_position,
+                               simdgroups_per_threadgroup, simd_scores, simd_indices);
 }
 
 kernel void

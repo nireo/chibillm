@@ -1,5 +1,6 @@
 #pragma once
 #include "metal/metal_context.h"
+#include "tensor/matrix.h"
 #include <array>
 
 namespace chibillm {
@@ -11,26 +12,17 @@ public:
 
     static constexpr std::size_t greedy_argmax_outputs_per_threadgroup = 64;
     [[nodiscard]] result<void, metal_error>
-    dispatch_linear_add_bf16(const metal_buffer& input,
-                             const metal_buffer& weight,
-                             const metal_buffer& residual,
-                             metal_buffer& output,
-                             std::size_t input_features,
-                             std::size_t output_features) const;
+    dispatch_projection(const metal_buffer& input,
+                        matrix_view weight,
+                        const std::array<metal_buffer*, 3>& outputs,
+                        std::size_t rows,
+                        const std::array<std::size_t, 3>& widths,
+                        const metal_buffer* residual = nullptr) const;
 
-    [[nodiscard]] result<void, metal_error>
-    dispatch_linear_split_bf16(const metal_buffer& input,
-                               const metal_buffer& weight,
-                               const std::array<metal_buffer*, 3>& outputs,
-                               std::size_t rows,
-                               std::size_t input_features,
-                               const std::array<std::size_t, 3>& widths) const;
-
-    [[nodiscard]] result<void, metal_error> dispatch_embedding_bf16(const metal_buffer& token_ids,
-                                                                    const metal_buffer& weight,
-                                                                    metal_buffer& output,
-                                                                    std::size_t token_count,
-                                                                    std::size_t hidden_size) const;
+    [[nodiscard]] result<void, metal_error> dispatch_embedding(const metal_buffer& token_ids,
+                                                               matrix_view weight,
+                                                               metal_buffer& output,
+                                                               std::size_t token_count) const;
 
     [[nodiscard]] result<void, metal_error> dispatch_rms_norm_bf16(const metal_buffer& input,
                                                                    const metal_buffer& weight,
@@ -41,19 +33,17 @@ public:
                                                                    bool zero_centered) const;
 
     [[nodiscard]] result<void, metal_error>
-    dispatch_greedy_vocabulary_bf16(const metal_buffer& hidden_states,
-                                    const metal_buffer& row_indices,
-                                    const metal_buffer& norm_weight,
-                                    const metal_buffer& vocabulary_weight,
-                                    metal_buffer& normalized,
-                                    metal_buffer& partial_maxima,
-                                    metal_buffer& token_ids,
-                                    std::size_t rows,
-                                    std::size_t hidden_size,
-                                    std::size_t vocabulary_size,
-                                    std::size_t partial_count,
-                                    float epsilon,
-                                    bool zero_centered) const;
+    dispatch_greedy_vocabulary(const metal_buffer& hidden_states,
+                               const metal_buffer& row_indices,
+                               const metal_buffer& norm_weight,
+                               matrix_view vocabulary_weight,
+                               metal_buffer& normalized,
+                               metal_buffer& partial_maxima,
+                               metal_buffer& token_ids,
+                               std::size_t rows,
+                               std::size_t partial_count,
+                               float epsilon,
+                               bool zero_centered) const;
 
     [[nodiscard]] result<void, metal_error> dispatch_silu_mul_f32(const metal_buffer& gate,
                                                                   const metal_buffer& up,
@@ -170,6 +160,22 @@ public:
                                                                     float epsilon) const;
 
 private:
+    [[nodiscard]] result<void, metal_error>
+    dispatch_linear_add_bf16(const metal_buffer& input,
+                             const metal_buffer& weight,
+                             const metal_buffer& residual,
+                             metal_buffer& output,
+                             std::size_t input_features,
+                             std::size_t output_features) const;
+
+    [[nodiscard]] result<void, metal_error>
+    dispatch_linear_split_bf16(const metal_buffer& input,
+                               const metal_buffer& weight,
+                               const std::array<metal_buffer*, 3>& outputs,
+                               std::size_t rows,
+                               std::size_t input_features,
+                               const std::array<std::size_t, 3>& widths) const;
+
     const metal_context& context_;
 };
 } // namespace chibillm

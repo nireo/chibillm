@@ -14,6 +14,7 @@ print_usage(std::ostream& output)
               "  --kv-cache-tokens N Shared server KV capacity (default: context length; multiple "
               "of 16)\n"
               "  --max-tokens N      Reply limit / server default (default: 8192)\n"
+              "  --quantize none|q4  Quantize eligible BF16 matrices once at load (default: none)\n"
               "  --serve             Start the HTTP server on 127.0.0.1:8000\n"
               "  --no-stream         Print REPL replies only when complete\n"
               "  --progress=auto|off  REPL prefill progress on terminals (default: auto)\n"
@@ -40,6 +41,14 @@ parse_cli_options(int argc, char** argv)
                 || std::string_view(argv[i]).starts_with('-'))
                 return fail("missing path for --metrics-jsonl");
             settings.metrics_jsonl = argv[i];
+        } else if (arg == "--quantize") {
+            if (++i >= argc)
+                return fail("missing value for --quantize");
+            const std::string_view value(argv[i]);
+            if (value != "none" && value != "q4")
+                return fail("invalid quantization: " + std::string(value));
+            settings.quantization =
+                value == "q4" ? weight_quantization::q4 : weight_quantization::none;
         } else if (arg == "--serve") {
             settings.serve = true;
         } else if (arg == "--context-length"

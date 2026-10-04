@@ -11,6 +11,7 @@
 #include "metal/metal_kv_cache.h"
 #include "metal/metal_tensor.h"
 #include "result.h"
+#include "tensor/matrix.h"
 
 namespace chibillm {
 
@@ -94,7 +95,7 @@ upload_u32(const metal_context& context, std::span<const std::uint32_t> values);
 // projects input and adds a same-shaped f32 residual into output.
 [[nodiscard]] result<void, tensor_op_error> linear_add(const metal_context& context,
                                                        const metal_tensor& input,
-                                                       const metal_tensor& weight,
+                                                       matrix_view weight,
                                                        const metal_tensor& residual,
                                                        metal_tensor& output);
 
@@ -102,13 +103,13 @@ upload_u32(const metal_context& context, std::span<const std::uint32_t> values);
 [[nodiscard]] result<void, tensor_op_error>
 linear_split(const metal_context& context,
              const metal_tensor& input,
-             const metal_tensor& packed_weight,
+             matrix_view packed_weight,
              std::initializer_list<metal_tensor*> outputs);
 
 // gathers i32 token ids [t] from bf16 weight [vocabulary, hidden] into f32 output [t, hidden].
 [[nodiscard]] result<void, tensor_op_error> embedding_lookup(const metal_context& context,
                                                              const metal_tensor& token_ids,
-                                                             const metal_tensor& weight,
+                                                             matrix_view weight,
                                                              metal_tensor& output);
 
 // Normalizes each contiguous weight-sized group. Zero-centered norms use

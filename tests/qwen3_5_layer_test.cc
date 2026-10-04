@@ -106,10 +106,11 @@ read_values(const metal_tensor& tensor)
 }
 
 vector
-project(const vector& input, const metal_tensor& weight)
+project(const vector& input, chibillm::matrix_view weight)
 {
-    const auto shape = weight.descriptor().shape().dimensions();
-    const auto w = read_values(weight);
+    const auto shape = weight.shape().dimensions();
+    REQUIRE(weight.dense());
+    const auto w = read_values(*weight.dense());
     vector output(input.size() / shape[1] * shape[0]);
     for (std::size_t t = 0; t < input.size() / shape[1]; ++t)
         for (std::size_t o = 0; o < shape[0]; ++o)
@@ -162,7 +163,7 @@ reference(const qwen3_5_config& c, const qwen3_5_weights& weights, vector hidden
         auto input = normalize(hidden, layer.input_norm, c.rms_epsilon);
         reference_layer memory;
         vector mixed;
-        const metal_tensor* output_weight;
+        const chibillm::matrix_weight* output_weight;
         if (const auto* a = std::get_if<qwen3_5_linear_attention_weights>(&layer.mixer)) {
             const auto kw = c.linear_key_width(), vw = c.linear_value_width(), width = 2 * kw + vw;
             const auto kh = c.linear_key_head_count, vh = c.linear_value_head_count;
@@ -503,7 +504,7 @@ TEST_CASE("Qwen3.5 hybrid execution can be aborted and retried after partial GPU
         const auto saved = snapshot_linear(*state, config);
         const auto batch = batch_for(*state, { { 29, 2 }, { 11, 1 } });
         REQUIRE(state->begin_batch(batch));
-        std::optional<metal_tensor> down;
+        std::optional<chibillm::matrix_weight> down;
         if (late_failure) {
             // Fail in the very last MLP, after both recurrent and KV layers have
             // encoded writes. The layer executor must not commit early.

@@ -37,13 +37,13 @@ make_output_like(const metal_context& context, const metal_tensor& input, Operat
 }
 
 result<std::array<std::size_t, 2>, tensor_op_error>
-projection_shape(const metal_tensor& input, const metal_tensor& weight)
+projection_shape(const metal_tensor& input, matrix_view weight)
 {
     const auto& input_shape = input.descriptor().shape();
-    const auto& weight_shape = weight.descriptor().shape();
+    const auto& weight_shape = weight.shape();
     if (input_shape.rank() != 2 || weight_shape.rank() != 2)
         return fail(tensor_op_errc::invalid_rank);
-    if (input.descriptor().type() != dtype::f32 || weight.descriptor().type() != dtype::bf16)
+    if (input.descriptor().type() != dtype::f32 || !weight.supported())
         return fail(tensor_op_errc::unsupported_dtype);
     if (input_shape.dimensions()[1] != weight_shape.dimensions()[1])
         return fail(tensor_op_errc::inner_dimension_mismatch);
@@ -67,7 +67,7 @@ validate_widths(std::size_t total, std::initializer_list<std::size_t> widths)
 } // namespace
 
 result<metal_tensor, tensor_op_error>
-linear(const metal_context& context, const metal_tensor& input, const metal_tensor& weight)
+linear(const metal_context& context, const metal_tensor& input, matrix_view weight)
 {
     auto shape = projection_shape(input, weight);
     if (!shape)
@@ -80,7 +80,7 @@ linear(const metal_context& context, const metal_tensor& input, const metal_tens
 result<metal_tensor, tensor_op_error>
 linear_add(const metal_context& context,
            const metal_tensor& input,
-           const metal_tensor& weight,
+           matrix_view weight,
            const metal_tensor& residual)
 {
     auto shape = projection_shape(input, weight);
@@ -94,7 +94,7 @@ linear_add(const metal_context& context,
 result<std::array<metal_tensor, 2>, tensor_op_error>
 linear_split(const metal_context& context,
              const metal_tensor& input,
-             const metal_tensor& packed_weight,
+             matrix_view packed_weight,
              std::size_t first_width,
              std::size_t second_width)
 {
@@ -115,7 +115,7 @@ linear_split(const metal_context& context,
 result<std::array<metal_tensor, 3>, tensor_op_error>
 linear_split(const metal_context& context,
              const metal_tensor& input,
-             const metal_tensor& packed_weight,
+             matrix_view packed_weight,
              std::size_t first_width,
              std::size_t second_width,
              std::size_t third_width)
@@ -220,17 +220,17 @@ rms_norm_gated(const metal_context& context,
 result<metal_tensor, tensor_op_error>
 normalized_swiglu(const metal_context& context,
                   const metal_tensor& norm,
-                  const metal_tensor& gateup,
-                  const metal_tensor& down,
+                  matrix_view gateup,
+                  matrix_view down,
                   float epsilon,
                   const metal_tensor& hidden_states,
                   bool zero_centered)
 {
-    if (norm.descriptor().shape().rank() != 1 || down.descriptor().shape().rank() != 2) {
+    if (norm.descriptor().shape().rank() != 1 || down.shape().rank() != 2) {
         return fail(tensor_op_errc::input_shape_mismatch);
     }
     const auto hidden_size = norm.descriptor().shape().dimensions()[0];
-    const auto intermediate_size = down.descriptor().shape().dimensions()[1];
+    const auto intermediate_size = down.shape().dimensions()[1];
     const auto& shape = hidden_states.descriptor().shape();
     if (shape.rank() != 2
         || hidden_states.descriptor().type() != dtype::f32
@@ -253,15 +253,18 @@ normalized_swiglu(const metal_context& context,
 }
 
 result<metal_tensor, tensor_op_error>
-embed_tokens(const metal_context& context,
-             const metal_tensor& weight,
-             std::span<const token_id> tokens)
+embed_tokens(const metal_context& context, matrix_view weight, std::span<const token_id> tokens)
 {
     if (tokens.empty()) {
         return fail(tensor_op_errc::empty_tokens);
     }
 
-    const auto hidden_size = weight.descriptor().shape().dimensions()[1];
+    if (weight.shape().rank() != 2)
+        return fail(tensor_op_errc::invalid_rank);
+    if (!weight.supported())
+        return fail(tensor_op_errc::unsupported_dtype);
+
+    const auto hidden_size = weight.shape().dimensions()[1];
     auto token_ids = allocate_tensor(context, dtype::i32, { tokens.size() });
     if (!token_ids) {
         return fail(token_ids.error());
@@ -284,18 +287,18 @@ embed_tokens(const metal_context& context,
 result<metal_tensor, tensor_op_error>
 encode_greedy(const metal_context& context,
               const metal_tensor& norm_weight,
-              const metal_tensor& vocabulary_weight,
+              matrix_view vocabulary_weight,
               float epsilon,
               const metal_tensor& hidden_states,
               std::span<const std::size_t> logits_indices,
               bool zero_centered)
 {
     const auto& norm_shape = norm_weight.descriptor().shape();
-    const auto& vocabulary_shape = vocabulary_weight.descriptor().shape();
+    const auto& vocabulary_shape = vocabulary_weight.shape();
     if (norm_shape.rank() != 1
         || vocabulary_shape.rank() != 2
         || norm_weight.descriptor().type() != dtype::bf16
-        || vocabulary_weight.descriptor().type() != dtype::bf16
+        || !vocabulary_weight.supported()
         || vocabulary_shape.dimensions()[1] != norm_shape.dimensions()[0]
         || !std::isfinite(epsilon)
         || epsilon <= 0) {
@@ -349,11 +352,10 @@ encode_greedy(const metal_context& context,
         return fail(token_ids.error());
     }
 
-    const auto operation = metal_kernels(context).dispatch_greedy_vocabulary_bf16(
-        hidden_states.buffer(), row_indices->buffer(), norm_weight.buffer(),
-        vocabulary_weight.buffer(), normalized->buffer(), partial_maxima->buffer(),
-        token_ids->buffer(), logits_indices.size(), hidden_size, vocabulary_size, partial_count,
-        epsilon, zero_centered);
+    const auto operation = metal_kernels(context).dispatch_greedy_vocabulary(
+        hidden_states.buffer(), row_indices->buffer(), norm_weight.buffer(), vocabulary_weight,
+        normalized->buffer(), partial_maxima->buffer(), token_ids->buffer(), logits_indices.size(),
+        partial_count, epsilon, zero_centered);
     if (!operation) {
         return fail(tensor_op_errc::backend_failure, operation.error(), "greedy projection");
     }

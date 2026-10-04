@@ -62,6 +62,7 @@ def answer_hashes(stdout, rows):
 def run_session(args, prompt, budget, count, metrics_path):
     command = [args.binary, '--context-length', str(args.context_length),
                '--max-tokens', str(budget), '--progress=off',
+               '--quantize', args.quantize,
                '--metrics-jsonl', str(metrics_path)]
     if not args.stream:
         command.append('--no-stream')
@@ -99,6 +100,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', default='build/chibillm')
     parser.add_argument('--model', default='qwen3_5_model')
+    parser.add_argument('--quantize', choices=['none', 'q4'], default='none')
     parser.add_argument('--output', required=True)
     parser.add_argument('--mode', choices=['warm', 'cold', 'both'], default='warm')
     parser.add_argument('--iterations', type=positive, default=3)
@@ -118,6 +120,7 @@ def main():
     report = {'schema_version': 1, 'environment': {
         'platform': platform.platform(), 'machine': platform.machine(), 'cpu': cpu,
         'binary_sha256': binary_hash, 'model_directory': str(Path(args.model).resolve()),
+        'quantization': args.quantize,
     }, 'processes': [], 'results': [], 'summaries': []}
     modes = ['cold', 'warm'] if args.mode == 'both' else [args.mode]
     with tempfile.TemporaryDirectory(prefix='chibillm-benchmark-') as directory:

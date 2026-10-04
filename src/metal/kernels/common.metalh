@@ -64,4 +64,70 @@ linear_bf16_decode_dot(device const float* input,
     return simd_sum(accumulator);
 }
 
+struct bf16_matrix {
+    device const bf16_storage* values;
+    uint columns;
+
+    float
+    load(ulong row, uint column) const
+    {
+        return load_bf16(values[row * columns + column]);
+    }
+
+    float
+    dot(device const float* input, uint row, uint lane, uint simd_width) const
+    {
+        return linear_bf16_decode_dot(input, values, columns, row, lane, simd_width);
+    }
+};
+
+struct q4_matrix {
+    device const uint* values;
+    device const bf16_storage* scales;
+    device const bf16_storage* offsets;
+    uint columns;
+
+    float
+    load(ulong row, uint column) const
+    {
+        const ulong index = row * columns + column;
+        const uint packed = values[index / 8];
+        const float q = float((packed >> ((column % 8) * 4)) & 15u);
+        return load_bf16(scales[index / 64]) * q + load_bf16(offsets[index / 64]);
+    }
+
+    float
+    dot(device const float* input, uint row, uint lane, uint simd_width) const
+    {
+        float accumulator = 0.0f;
+        const ulong base = ulong(row) * columns;
+        for (uint k = lane * 8; k < columns; k += simd_width * 8) {
+            uint packed = values[(base + k) / 8];
+            float product = 0.0f;
+            float sum = 0.0f;
+            for (uint i = 0; i < 8; ++i) {
+                const float x = input[k + i];
+                product += x * float(packed & 15u);
+                sum += x;
+                packed >>= 4;
+            }
+            accumulator += load_bf16(scales[(base + k) / 64]) * product
+                + load_bf16(offsets[(base + k) / 64]) * sum;
+        }
+        return simd_sum(accumulator);
+    }
+};
+
+static inline bf16_storage
+store_bf16(float value)
+{
+#if __METAL_VERSION__ >= 310
+    return bfloat(value);
+#else
+    uint bits = as_type<uint>(value);
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    return ushort(bits >> 16);
+#endif
+}
+
 #endif

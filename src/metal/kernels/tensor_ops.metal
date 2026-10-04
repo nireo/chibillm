@@ -1,12 +1,13 @@
 #include "common.metalh"
 
-kernel void
-embedding_bf16(device const int* token_ids [[buffer(0)]],
-               device const bf16_storage* weight [[buffer(1)]],
-               device float* output [[buffer(2)]],
-               constant uint& token_count [[buffer(3)]],
-               constant uint& hidden_size [[buffer(4)]],
-               uint2 position [[thread_position_in_grid]])
+template <typename Matrix>
+static inline void
+embedding_impl(device const int* token_ids,
+               Matrix weight,
+               device float* output,
+               constant uint& token_count,
+               constant uint& hidden_size,
+               uint2 position)
 {
     if (position.x >= hidden_size || position.y >= token_count) {
         return;
@@ -17,11 +18,36 @@ embedding_bf16(device const int* token_ids [[buffer(0)]],
     const ulong hidden_count = hidden_size;
     const ulong token = ulong(token_ids[token_position]);
 
-    const ulong weight_index = token * hidden_count + hidden_feature;
-    const float value = load_bf16(weight[weight_index]);
+    const float value = weight.load(token, uint(hidden_feature));
 
     const ulong output_index = token_position * hidden_count + hidden_feature;
     output[output_index] = value;
+}
+
+kernel void
+embedding_bf16(device const int* token_ids [[buffer(0)]],
+               device const bf16_storage* weight [[buffer(1)]],
+               device float* output [[buffer(2)]],
+               constant uint& token_count [[buffer(3)]],
+               constant uint& hidden_size [[buffer(4)]],
+               uint2 position [[thread_position_in_grid]])
+{
+    embedding_impl(token_ids, bf16_matrix { weight, hidden_size }, output, token_count, hidden_size,
+                   position);
+}
+
+kernel void
+embedding_q4(device const int* token_ids [[buffer(0)]],
+             device const uint* weight [[buffer(1)]],
+             device float* output [[buffer(2)]],
+             constant uint& token_count [[buffer(3)]],
+             constant uint& hidden_size [[buffer(4)]],
+             device const bf16_storage* scales [[buffer(5)]],
+             device const bf16_storage* offsets [[buffer(6)]],
+             uint2 position [[thread_position_in_grid]])
+{
+    embedding_impl(token_ids, q4_matrix { weight, scales, offsets, hidden_size }, output,
+                   token_count, hidden_size, position);
 }
 
 kernel void

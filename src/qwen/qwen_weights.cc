@@ -11,8 +11,9 @@ common_layer(std::size_t hidden, std::size_t intermediate)
         { "post_norm", { { "post_attention_layernorm.weight", { hidden } } } },
         { "gateup",
           { { "mlp.gate_proj.weight", { intermediate, hidden } },
-            { "mlp.up_proj.weight", { intermediate, hidden } } } },
-        { "down", { { "mlp.down_proj.weight", { hidden, intermediate } } } },
+            { "mlp.up_proj.weight", { intermediate, hidden } } },
+          weight_role::matrix },
+        { "down", { { "mlp.down_proj.weight", { hidden, intermediate } } }, weight_role::matrix },
     };
 }
 
@@ -25,8 +26,9 @@ full_attention(std::size_t hidden, std::size_t query, std::size_t kv, std::size_
         { "qkv",
           { { "self_attn.q_proj.weight", { (gated ? 2 : 1) * query, hidden } },
             { "self_attn.k_proj.weight", { kv, hidden } },
-            { "self_attn.v_proj.weight", { kv, hidden } } } },
-        { "output", { { "self_attn.o_proj.weight", { hidden, query } } } },
+            { "self_attn.v_proj.weight", { kv, hidden } } },
+          weight_role::matrix },
+        { "output", { { "self_attn.o_proj.weight", { hidden, query } } }, weight_role::matrix },
     };
 }
 
@@ -37,10 +39,16 @@ linear_attention(const qwen3_5_config& config)
     const auto qkv = 2 * config.linear_key_width() + config.linear_value_width();
     const auto heads = config.linear_value_head_count;
     return {
-        { "qkv", { { "linear_attn.in_proj_qkv.weight", { qkv, hidden } } } },
-        { "gate", { { "linear_attn.in_proj_z.weight", { config.linear_value_width(), hidden } } } },
-        { "decay", { { "linear_attn.in_proj_a.weight", { heads, hidden } } } },
-        { "rate", { { "linear_attn.in_proj_b.weight", { heads, hidden } } } },
+        { "qkv", { { "linear_attn.in_proj_qkv.weight", { qkv, hidden } } }, weight_role::matrix },
+        { "gate",
+          { { "linear_attn.in_proj_z.weight", { config.linear_value_width(), hidden } } },
+          weight_role::matrix },
+        { "decay",
+          { { "linear_attn.in_proj_a.weight", { heads, hidden } } },
+          weight_role::sensitive_matrix },
+        { "rate",
+          { { "linear_attn.in_proj_b.weight", { heads, hidden } } },
+          weight_role::sensitive_matrix },
         { "convolution",
           { { "linear_attn.conv1d.weight", { qkv, 1, config.linear_conv_kernel_dimension } } } },
         { "decay_log", { { "linear_attn.A_log", { heads }, safetensors_dtype::f32 } } },
@@ -50,7 +58,8 @@ linear_attention(const qwen3_5_config& config)
               { config.linear_value_head_dimension },
               safetensors_dtype::f32 } } },
         { "output",
-          { { "linear_attn.out_proj.weight", { hidden, config.linear_value_width() } } } },
+          { { "linear_attn.out_proj.weight", { hidden, config.linear_value_width() } } },
+          weight_role::matrix },
     };
 }
 
@@ -58,7 +67,7 @@ weight_layout
 globals(std::size_t vocabulary, std::size_t hidden)
 {
     weight_layout layout {
-        { "embedding", { { "embed_tokens.weight", { vocabulary, hidden } } } },
+        { "embedding", { { "embed_tokens.weight", { vocabulary, hidden } } }, weight_role::matrix },
         { "norm", { { "norm.weight", { hidden } } } },
     };
     return layout;
@@ -67,7 +76,7 @@ globals(std::size_t vocabulary, std::size_t hidden)
 weight_layout
 output_layout(std::size_t vocabulary, std::size_t hidden)
 {
-    return { { "output", { { "lm_head.weight", { vocabulary, hidden } } } } };
+    return { { "output", { { "lm_head.weight", { vocabulary, hidden } } }, weight_role::matrix } };
 }
 
 std::string
@@ -110,15 +119,16 @@ validate_qwen_weights(const safetensors_file& file, const qwen3_config& config)
 result<qwen_weights, weight_error>
 load_qwen_weights(const metal_context& context,
                   const safetensors_file& file,
-                  const qwen3_config& config)
+                  const qwen3_config& config,
+                  weight_quantization quantization)
 {
     CL_TRY(validate_qwen_weights(file, config));
-    auto global =
-        read_weights(context, file, "model.", globals(config.vocabulary_size, config.hidden_size));
+    auto global = read_weights(context, file, "model.",
+                               globals(config.vocabulary_size, config.hidden_size), quantization);
     if (!global)
         return fail(global.error());
-    auto output =
-        read_weights(context, file, "", output_layout(config.vocabulary_size, config.hidden_size));
+    auto output = read_weights(
+        context, file, "", output_layout(config.vocabulary_size, config.hidden_size), quantization);
     if (!output)
         return fail(output.error());
     std::vector<qwen_layer_weights> layers;
@@ -128,18 +138,19 @@ load_qwen_weights(const metal_context& context,
                                           config.kv_width(), config.head_dimension, false);
     for (std::size_t layer = 0; layer < config.layer_count; ++layer) {
         auto prefix = layer_prefix("model.", layer);
-        auto base = read_weights(context, file, prefix, common);
+        auto base = read_weights(context, file, prefix, common, quantization);
         if (!base)
             return fail(base.error());
-        auto mixer = read_weights(context, file, prefix, attention);
+        auto mixer = read_weights(context, file, prefix, attention, quantization);
         if (!mixer)
             return fail(mixer.error());
-        layers.push_back({ base->take("input_norm"), base->take("post_norm"),
-                           mixer->take("query_norm"), mixer->take("key_norm"), mixer->take("qkv"),
-                           mixer->take("output"), base->take("gateup"), base->take("down") });
+        layers.push_back({ base->take_tensor("input_norm"), base->take_tensor("post_norm"),
+                           mixer->take_tensor("query_norm"), mixer->take_tensor("key_norm"),
+                           mixer->take_matrix("qkv"), mixer->take_matrix("output"),
+                           base->take_matrix("gateup"), base->take_matrix("down") });
     }
-    return qwen_weights { global->take("embedding"), global->take("norm"), output->take("output"),
-                          std::move(layers) };
+    return qwen_weights { global->take_matrix("embedding"), global->take_tensor("norm"),
+                          output->take_matrix("output"), std::move(layers) };
 }
 
 result<void, weight_error>
@@ -163,11 +174,12 @@ validate_qwen3_5_weights(const safetensors_file& file, const qwen3_5_config& con
 result<qwen3_5_weights, weight_error>
 load_qwen3_5_weights(const metal_context& context,
                      const safetensors_file& file,
-                     const qwen3_5_config& config)
+                     const qwen3_5_config& config,
+                     weight_quantization quantization)
 {
     CL_TRY(validate_qwen3_5_weights(file, config));
     auto global = read_weights(context, file, "model.language_model.",
-                               globals(config.vocabulary_size, config.hidden_size));
+                               globals(config.vocabulary_size, config.hidden_size), quantization);
     if (!global)
         return fail(global.error());
     std::vector<qwen3_5_layer_weights> layers;
@@ -175,24 +187,28 @@ load_qwen3_5_weights(const metal_context& context,
     const auto common = common_layer(config.hidden_size, config.intermediate_size);
     for (std::size_t layer = 0; layer < config.layer_count; ++layer) {
         auto prefix = layer_prefix("model.language_model.", layer);
-        auto base = read_weights(context, file, prefix, common);
+        auto base = read_weights(context, file, prefix, common, quantization);
         if (!base)
             return fail(base.error());
-        auto mixer = read_weights(context, file, prefix, mixer_layout(config, layer));
+        auto mixer = read_weights(context, file, prefix, mixer_layout(config, layer), quantization);
         if (!mixer)
             return fail(mixer.error());
         qwen3_5_mixer_weights weights =
             config.layer_types[layer] == qwen3_5_layer_type::full_attention
             ? qwen3_5_mixer_weights(qwen3_5_full_attention_weights {
-                  mixer->take("query_norm"), mixer->take("key_norm"), mixer->take("qkv"),
-                  mixer->take("output") })
+                  mixer->take_tensor("query_norm"), mixer->take_tensor("key_norm"),
+                  mixer->take_matrix("qkv"), mixer->take_matrix("output") })
             : qwen3_5_mixer_weights(qwen3_5_linear_attention_weights {
-                  mixer->take("qkv"), mixer->take("gate"), mixer->take("decay"),
-                  mixer->take("rate"), mixer->take("convolution"), mixer->take("decay_log"),
-                  mixer->take("rate_bias"), mixer->take("norm"), mixer->take("output") });
-        layers.push_back({ base->take("input_norm"), base->take("post_norm"), base->take("gateup"),
-                           base->take("down"), std::move(weights) });
+                  mixer->take_matrix("qkv"), mixer->take_matrix("gate"),
+                  mixer->take_matrix("decay"), mixer->take_matrix("rate"),
+                  mixer->take_tensor("convolution"), mixer->take_tensor("decay_log"),
+                  mixer->take_tensor("rate_bias"), mixer->take_tensor("norm"),
+                  mixer->take_matrix("output") });
+        layers.push_back({ base->take_tensor("input_norm"), base->take_tensor("post_norm"),
+                           base->take_matrix("gateup"), base->take_matrix("down"),
+                           std::move(weights) });
     }
-    return qwen3_5_weights { global->take("embedding"), global->take("norm"), std::move(layers) };
+    return qwen3_5_weights { global->take_matrix("embedding"), global->take_tensor("norm"),
+                             std::move(layers) };
 }
 } // namespace chibillm

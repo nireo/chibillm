@@ -15,18 +15,18 @@ src_include = include_directories('src')
 
 python = import('python').find_installation('python3')
 fs = import('fs')
-metal_source = ''
+metal_source_parts = []
 foreach name : ['common.metalh', 'linear.metal', 'tensor_ops.metal', 'sampling.metal', 'attention.metal', 'deltanet.metal']
   # fs.read tracks each source so edits automatically regenerate the header.
   contents = fs.read('src/metal/kernels' / name)
   contents = contents.replace('#include "common.metalh"\n', '\n')
-  metal_source += '#line 1 "' + name + '"\n' + contents + '\n'
+  if contents.contains(')CHIBILLM_METAL"')
+    error('Metal source contains the C++ raw-string delimiter')
+  endif
+  metal_source_parts += 'R"CHIBILLM_METAL(' + '#line 1 "' + name + '"\n' + contents + '\n)CHIBILLM_METAL"'
 endforeach
-if metal_source.contains(')CHIBILLM_METAL"')
-  error('Metal source contains the C++ raw-string delimiter')
-endif
 kernel_config = configuration_data()
-kernel_config.set('METAL_KERNEL_SOURCE', metal_source)
+kernel_config.set('METAL_KERNEL_SOURCE', ',\n'.join(metal_source_parts))
 kernel_source = configure_file(
   input: 'src/metal/metal_kernel_source.h.in',
   output: 'metal_kernel_source.h',
@@ -84,6 +84,7 @@ chibillm_metal = static_library(
   [
     'src/metal/metal_context.mm',
     'src/metal/metal_kernels.mm',
+    'src/metal/metal_kernels_linear.mm',
     'src/metal/metal_kernels_attention.mm',
     'src/metal/metal_kernels_deltanet.mm',
     'src/tensor/deltanet.cc',
@@ -92,6 +93,7 @@ chibillm_metal = static_library(
     'src/model_format/weight_reader.cc',
     'src/tensor/tensor_ops.cc',
     'src/tensor/functions.cc',
+    'src/tensor/matrix.cc',
   ],
   include_directories: src_include,
   dependencies: metal_framework_dep,
@@ -186,6 +188,7 @@ foreach spec : [
   {'name': 'tensor', 'sources': ['tests/tensor_test.cc'], 'library': chibillm_metal},
   {'name': 'deltanet', 'sources': ['tests/deltanet_test.cc'], 'library': chibillm_metal},
   {'name': 'tensor ops', 'sources': ['tests/tensor_ops_test.cc'], 'library': chibillm_metal},
+  {'name': 'quantization', 'sources': ['tests/quantization_test.cc'], 'library': chibillm_metal},
 ]
   name = spec['name'] == 'unit' ? 'chibillm_tests' : 'chibillm_' + spec['name'].replace(' ', '_') + '_tests'
   target = executable(

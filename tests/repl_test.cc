@@ -367,3 +367,26 @@ TEST_CASE("CLI validates REPL-only JSONL output")
     args[2] = serve;
     CHECK_FALSE(chibillm::parse_cli_options(3, args).has_value());
 }
+
+TEST_CASE("CLI quantization is opt-in and rejects unsupported formats")
+{
+    char program[] = "chibillm";
+    char option[] = "--quantize";
+    char q4[] = "q4";
+    char none[] = "none";
+    char unsupported[] = "q8";
+    char* args[] = { program, option, q4 };
+    auto defaults = chibillm::parse_cli_options(1, args);
+    REQUIRE(defaults);
+    CHECK(defaults->quantization == chibillm::weight_quantization::none);
+    CHECK_FALSE(chibillm::parse_cli_options(2, args));
+    auto quantized = chibillm::parse_cli_options(3, args);
+    REQUIRE(quantized);
+    CHECK(quantized->quantization == chibillm::weight_quantization::q4);
+    args[2] = none;
+    REQUIRE(chibillm::parse_cli_options(3, args));
+    CHECK(chibillm::parse_cli_options(3, args)->quantization
+          == chibillm::weight_quantization::none);
+    args[2] = unsupported;
+    CHECK_FALSE(chibillm::parse_cli_options(3, args));
+}

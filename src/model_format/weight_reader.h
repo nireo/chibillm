@@ -1,8 +1,8 @@
 #pragma once
 
 #include "error.h"
-#include "metal/metal_tensor.h"
 #include "model_format/safetensors.h"
+#include "tensor/matrix.h"
 #include <unordered_map>
 
 namespace chibillm {
@@ -16,6 +16,7 @@ enum class weight_errc : std::uint8_t {
     tensor_creation_failed,
     metal_allocation_failed,
     tensor_read_failed,
+    quantization_failed,
 };
 
 [[nodiscard]] inline std::string_view
@@ -26,7 +27,7 @@ error_name(weight_errc code) noexcept
         "weight.tensor_shape_mismatch",  "weight.unexpected_tensor_count",
         "weight.tensor_count_overflow",  "weight.invalid_configuration",
         "weight.tensor_creation_failed", "weight.metal_allocation_failed",
-        "weight.tensor_read_failed",
+        "weight.tensor_read_failed",     "weight.quantization_failed",
     };
     const auto index = static_cast<std::size_t>(code);
     return index < names.size() ? names[index] : "weight.unknown_error";
@@ -40,30 +41,42 @@ struct tensor_spec {
     safetensors_dtype type = safetensors_dtype::bf16;
 };
 
+enum class weight_role : std::uint8_t {
+    tensor,
+    matrix,
+    sensitive_matrix
+};
+
 struct weight_group {
     std::string name;
     std::vector<tensor_spec> tensors;
+    weight_role role = weight_role::tensor;
 };
 
 using weight_layout = std::vector<weight_group>;
 
 class weight_bundle {
 public:
-    metal_tensor take(const std::string& name);
+    metal_tensor take_tensor(const std::string& name);
+    matrix_weight take_matrix(const std::string& name);
 
 private:
     friend result<weight_bundle, weight_error> read_weights(const metal_context&,
                                                             const safetensors_file&,
                                                             std::string_view,
-                                                            const weight_layout&);
+                                                            const weight_layout&,
+                                                            weight_quantization);
     std::unordered_map<std::string, metal_tensor> tensors_;
+    std::unordered_map<std::string, matrix_weight> matrices_;
 };
 
 result<void, weight_error> validate_weights(const safetensors_file& file,
                                             std::string_view prefix,
                                             const weight_layout& layout);
-result<weight_bundle, weight_error> read_weights(const metal_context& context,
-                                                 const safetensors_file& file,
-                                                 std::string_view prefix,
-                                                 const weight_layout& layout);
+result<weight_bundle, weight_error>
+read_weights(const metal_context& context,
+             const safetensors_file& file,
+             std::string_view prefix,
+             const weight_layout& layout,
+             weight_quantization quantization = weight_quantization::none);
 } // namespace chibillm

@@ -72,7 +72,7 @@ result<std::vector<token_id>, model_runner_error>
 finish_greedy(compute_pass& pass,
               const metal_context& context,
               const metal_tensor& norm,
-              const metal_tensor& vocabulary,
+              matrix_view vocabulary,
               float epsilon,
               const metal_tensor& hidden_states,
               std::span<const std::size_t> logits_indices,
@@ -102,7 +102,8 @@ qwen_model_runner::make(const std::filesystem::path& model_directory,
                         std::string_view kernel_source,
                         std::size_t kv_block_count,
                         std::size_t kv_block_size,
-                        std::string model_id)
+                        std::string model_id,
+                        weight_quantization quantization)
 {
     if (kv_block_count == 0
         || kv_block_size == 0
@@ -132,7 +133,7 @@ qwen_model_runner::make(const std::filesystem::path& model_directory,
         .kv_head_count = config->kv_head_count,
         .head_dimension = config->head_dimension,
     };
-    auto weights = load_qwen_weights(*context, *file, *config);
+    auto weights = load_qwen_weights(*context, *file, *config, quantization);
     if (!weights) {
         return fail(qwen_model_runner_errc::weights_load_failed, weights.error(), "weights");
     }
@@ -255,7 +256,8 @@ qwen3_5_model_runner::make(const std::filesystem::path& model_directory,
                            std::string_view kernel_source,
                            std::size_t kv_block_count,
                            std::size_t kv_block_size,
-                           std::string model_id)
+                           std::string model_id,
+                           weight_quantization quantization)
 {
     if (!kv_block_count
         || !kv_block_size
@@ -277,7 +279,7 @@ qwen3_5_model_runner::make(const std::filesystem::path& model_directory,
     if (!context) {
         return fail(qwen_model_runner_errc::metal_context_creation_failed, context.error());
     }
-    auto weights = load_qwen3_5_weights(*context, *file, *config);
+    auto weights = load_qwen3_5_weights(*context, *file, *config, quantization);
     if (!weights) {
         return fail(qwen_model_runner_errc::weights_load_failed, weights.error(), "weights");
     }

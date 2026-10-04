@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "seq.h"
+#include "tensor/matrix.h"
 #include "tensor/tensor_ops.h"
 
 namespace chibillm {
@@ -16,21 +17,21 @@ class prepared_attention_batch;
 // remain available in tensor_ops.h, attention.h, and deltanet.h for in-place
 // execution and reuse. Both forms enqueue work without adding synchronization.
 [[nodiscard]] result<metal_tensor, tensor_op_error>
-linear(const metal_context& context, const metal_tensor& input, const metal_tensor& weight);
+linear(const metal_context& context, const metal_tensor& input, matrix_view weight);
 [[nodiscard]] result<metal_tensor, tensor_op_error> linear_add(const metal_context& context,
                                                                const metal_tensor& input,
-                                                               const metal_tensor& weight,
+                                                               matrix_view weight,
                                                                const metal_tensor& residual);
 [[nodiscard]] result<std::array<metal_tensor, 2>, tensor_op_error>
 linear_split(const metal_context& context,
              const metal_tensor& input,
-             const metal_tensor& packed_weight,
+             matrix_view packed_weight,
              std::size_t first_width,
              std::size_t second_width);
 [[nodiscard]] result<std::array<metal_tensor, 3>, tensor_op_error>
 linear_split(const metal_context& context,
              const metal_tensor& input,
-             const metal_tensor& packed_weight,
+             matrix_view packed_weight,
              std::size_t first_width,
              std::size_t second_width,
              std::size_t third_width);
@@ -67,22 +68,21 @@ paged_attention(const metal_context& context,
 
 result<metal_tensor, tensor_op_error> normalized_swiglu(const metal_context& context,
                                                         const metal_tensor& norm,
-                                                        const metal_tensor& gateup,
-                                                        const metal_tensor& down,
+                                                        matrix_view gateup,
+                                                        matrix_view down,
                                                         float epsilon,
                                                         const metal_tensor& hidden_states,
                                                         bool zero_centered = false);
 
-[[nodiscard]] result<metal_tensor, tensor_op_error> embed_tokens(const metal_context& context,
-                                                                 const metal_tensor& weight,
-                                                                 std::span<const token_id> tokens);
+[[nodiscard]] result<metal_tensor, tensor_op_error>
+embed_tokens(const metal_context& context, matrix_view weight, std::span<const token_id> tokens);
 
 // Encodes row gather, final norm, vocabulary projection, and argmax into the
 // current Metal command buffer. Only the small token-ID tensor is returned.
 [[nodiscard]] result<metal_tensor, tensor_op_error>
 encode_greedy(const metal_context& context,
               const metal_tensor& norm_weight,
-              const metal_tensor& vocabulary_weight,
+              matrix_view vocabulary_weight,
               float epsilon,
               const metal_tensor& hidden_states,
               std::span<const std::size_t> logits_indices,

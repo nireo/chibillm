@@ -271,6 +271,16 @@ metal_context::make(std::string_view kernel_source)
                       make_compute_pipeline(device, library, @"linear_split_bf16"));
         CL_TRY_ASSIGN(implementation->linear_split_bf16_decode_pipeline,
                       make_compute_pipeline(device, library, @"linear_split_bf16_decode"));
+        CL_TRY_ASSIGN(implementation->embedding_q4_pipeline,
+                      make_compute_pipeline(device, library, @"embedding_q4"));
+        CL_TRY_ASSIGN(implementation->linear_add_q4_decode_pipeline,
+                      make_compute_pipeline(device, library, @"linear_add_q4_decode"));
+        CL_TRY_ASSIGN(implementation->linear_split_q4_decode_pipeline,
+                      make_compute_pipeline(device, library, @"linear_split_q4_decode"));
+        CL_TRY_ASSIGN(implementation->linear_q4_partial_argmax_pipeline,
+                      make_compute_pipeline(device, library, @"linear_q4_partial_argmax"));
+        CL_TRY_ASSIGN(implementation->expand_q4_bf16_pipeline,
+                      make_compute_pipeline(device, library, @"expand_q4_bf16"));
         CL_TRY_ASSIGN(implementation->embedding_bf16_pipeline,
                       make_compute_pipeline(device, library, @"embedding_bf16"));
         CL_TRY_ASSIGN(implementation->rms_norm_bf16_pipeline,

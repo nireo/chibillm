@@ -65,7 +65,7 @@ run_application(const cli_options& settings)
         model_id = "chibillm-qwen";
     }
     auto runner = load_model(model_directory, metal_kernel_source, model_capacity_blocks,
-                             kv_block_size, std::move(model_id));
+                             kv_block_size, std::move(model_id), settings.quantization);
     if (!runner) {
         std::cerr
             << (runner.error() == model_load_errc::unsupported_architecture

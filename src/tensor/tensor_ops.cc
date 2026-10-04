@@ -69,19 +69,21 @@ upload_u32(const metal_context& context, std::span<const std::uint32_t> values)
 result<void, tensor_op_error>
 linear_add(const metal_context& context,
            const metal_tensor& input,
-           const metal_tensor& weight,
+           matrix_view weight,
            const metal_tensor& residual,
            metal_tensor& output)
 {
+    if (weight.shape().rank() != 2)
+        return fail(tensor_op_errc::invalid_rank);
     const auto& input_shape = input.descriptor().shape();
-    const auto& weight_shape = weight.descriptor().shape();
+    const auto& weight_shape = weight.shape();
     const auto& residual_shape = residual.descriptor().shape();
     const auto& output_shape = output.descriptor().shape();
 
-    CL_TRY(validate_tensor_layouts({ { input, 2, dtype::f32 },
-                                     { weight, 2, dtype::bf16 },
-                                     { residual, 2, dtype::f32 },
-                                     { output, 2, dtype::f32 } }));
+    CL_TRY(validate_tensor_layouts(
+        { { input, 2, dtype::f32 }, { residual, 2, dtype::f32 }, { output, 2, dtype::f32 } }));
+    if (!weight.supported())
+        return fail(tensor_op_errc::unsupported_dtype);
 
     const auto rows = input_shape.dimensions()[0];
     const auto input_features = input_shape.dimensions()[1];
@@ -97,40 +99,29 @@ linear_add(const metal_context& context,
         return fail(tensor_op_errc::output_shape_mismatch);
     }
 
-    if (rows != 1) {
-        const std::array<metal_buffer*, 3> output_buffers {
-            &output.buffer(),
-            &output.buffer(),
-            &output.buffer(),
-        };
-        const std::array<std::size_t, 3> widths { output_features, 0, 0 };
-        const auto dispatched = metal_kernels(context).dispatch_linear_split_bf16(
-            input.buffer(), weight.buffer(), output_buffers, rows, input_features, widths);
-        if (!dispatched) {
-            return fail(tensor_op_errc::backend_failure, dispatched.error());
-        }
-        return add(context, residual, output, output);
-    }
-
-    const auto dispatched = metal_kernels(context).dispatch_linear_add_bf16(
-        input.buffer(), weight.buffer(), residual.buffer(), output.buffer(), input_features,
-        output_features);
-    if (!dispatched) {
+    const std::array<metal_buffer*, 3> output_buffers { &output.buffer(), &output.buffer(),
+                                                        &output.buffer() };
+    const std::array<std::size_t, 3> widths { output_features, 0, 0 };
+    const auto dispatched = metal_kernels(context).dispatch_projection(
+        input.buffer(), weight, output_buffers, rows, widths, &residual.buffer());
+    if (!dispatched)
         return fail(tensor_op_errc::backend_failure, dispatched.error());
-    }
     return {};
 }
 
 result<void, tensor_op_error>
 linear_split(const metal_context& context,
              const metal_tensor& input,
-             const metal_tensor& packed_weight,
+             matrix_view packed_weight,
              std::initializer_list<metal_tensor*> outputs)
 {
+    if (packed_weight.shape().rank() != 2)
+        return fail(tensor_op_errc::invalid_rank);
     const auto& input_shape = input.descriptor().shape();
-    const auto& weight_shape = packed_weight.descriptor().shape();
-    CL_TRY(
-        validate_tensor_layouts({ { input, 2, dtype::f32 }, { packed_weight, 2, dtype::bf16 } }));
+    const auto& weight_shape = packed_weight.shape();
+    CL_TRY(validate_tensor_layouts({ { input, 2, dtype::f32 } }));
+    if (!packed_weight.supported())
+        return fail(tensor_op_errc::unsupported_dtype);
     if (outputs.size() == 0 || outputs.size() > 3) {
         return fail(tensor_op_errc::output_shape_mismatch);
     }
@@ -168,8 +159,8 @@ linear_split(const metal_context& context,
         return fail(tensor_op_errc::inner_dimension_mismatch);
     }
 
-    const auto dispatched = metal_kernels(context).dispatch_linear_split_bf16(
-        input.buffer(), packed_weight.buffer(), output_buffers, rows, input_features, widths);
+    const auto dispatched = metal_kernels(context).dispatch_projection(
+        input.buffer(), packed_weight, output_buffers, rows, widths);
     if (!dispatched) {
         return fail(tensor_op_errc::backend_failure, dispatched.error());
     }
@@ -180,15 +171,18 @@ linear_split(const metal_context& context,
 result<void, tensor_op_error>
 embedding_lookup(const metal_context& context,
                  const metal_tensor& token_ids,
-                 const metal_tensor& weight,
+                 matrix_view weight,
                  metal_tensor& output)
 {
+    if (weight.shape().rank() != 2)
+        return fail(tensor_op_errc::invalid_rank);
     const auto& token_shape = token_ids.descriptor().shape();
-    const auto& weight_shape = weight.descriptor().shape();
+    const auto& weight_shape = weight.shape();
     const auto& output_shape = output.descriptor().shape();
 
-    CL_TRY(validate_tensor_layouts(
-        { { token_ids, 1, dtype::i32 }, { weight, 2, dtype::bf16 }, { output, 2, dtype::f32 } }));
+    CL_TRY(validate_tensor_layouts({ { token_ids, 1, dtype::i32 }, { output, 2, dtype::f32 } }));
+    if (!weight.supported())
+        return fail(tensor_op_errc::unsupported_dtype);
 
     const auto token_count = token_shape.dimensions()[0];
     const auto vocabulary_size = weight_shape.dimensions()[0];
@@ -209,8 +203,8 @@ embedding_lookup(const metal_context& context,
         }
     }
 
-    const auto dispatched = metal_kernels(context).dispatch_embedding_bf16(
-        token_ids.buffer(), weight.buffer(), output.buffer(), token_count, hidden_size);
+    const auto dispatched = metal_kernels(context).dispatch_embedding(token_ids.buffer(), weight,
+                                                                      output.buffer(), token_count);
     if (!dispatched) {
         return fail(tensor_op_errc::backend_failure, dispatched.error());
     }

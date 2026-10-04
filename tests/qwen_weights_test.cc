@@ -414,11 +414,11 @@ TEST_CASE("Qwen3.5 weights load linear and full-attention layers separately")
     const auto& linear = std::get<qwen3_5_linear_attention_weights>(weights->layers[0].mixer);
     CHECK(linear.decay_log.descriptor().type() == chibillm::dtype::f32);
     CHECK(linear.norm.descriptor().type() == chibillm::dtype::f32);
-    CHECK(std::ranges::equal(linear.qkv_projection.descriptor().shape().dimensions(),
+    CHECK(std::ranges::equal(linear.qkv_projection.shape().dimensions(),
                              std::vector<std::size_t> { 6, config.hidden_size }));
 
     const auto& full = std::get<qwen3_5_full_attention_weights>(weights->layers[1].mixer);
-    CHECK(std::ranges::equal(full.qkv_packed.descriptor().shape().dimensions(),
+    CHECK(std::ranges::equal(full.qkv_packed.shape().dimensions(),
                              std::vector<std::size_t> { 12, config.hidden_size }));
 }
 
@@ -450,14 +450,12 @@ TEST_CASE("Qwen weights are loaded into resident Metal tensors")
     REQUIRE(weights.has_value());
     CHECK(weights->layers.size() == config.layer_count);
     const std::vector<std::size_t> embedding_shape { config.vocabulary_size, config.hidden_size };
-    CHECK(std::ranges::equal(weights->token_embedding.descriptor().shape().dimensions(),
-                             embedding_shape));
+    CHECK(std::ranges::equal(weights->token_embedding.shape().dimensions(), embedding_shape));
     const std::vector<std::size_t> qkv_shape { config.query_width() + 2 * config.kv_width(),
                                                config.hidden_size };
-    CHECK(std::ranges::equal(weights->layers[0].qkv_packed.descriptor().shape().dimensions(),
-                             qkv_shape));
+    CHECK(std::ranges::equal(weights->layers[0].qkv_packed.shape().dimensions(), qkv_shape));
 
-    const auto embedding = weights->token_embedding.buffer().bytes();
+    const auto embedding = weights->token_embedding.dense()->buffer().bytes();
     REQUIRE_FALSE(embedding.empty());
     CHECK(std::all_of(embedding.begin(), embedding.end(),
                       [](std::byte byte) { return byte == std::byte { 1 }; }));
@@ -484,7 +482,7 @@ TEST_CASE("Qwen token embedding produces hidden-state rows")
                 bf16::from_float(static_cast<float>(token * 10 + feature)).bits());
         }
     }
-    std::memcpy(weights->token_embedding.buffer().bytes().data(), embedding_bits.data(),
+    std::memcpy(weights->token_embedding.dense()->buffer().bytes().data(), embedding_bits.data(),
                 embedding_bits.size() * sizeof(std::uint16_t));
 
     const std::vector<chibillm::token_id> tokens { 2, 0 };
@@ -677,7 +675,13 @@ TEST_CASE("Qwen3.5 official checkpoint generates consistently across batching an
         MESSAGE("Qwen3.5 model is not installed; skipping local generation validation");
         return;
     }
-    auto loaded = chibillm::load_model(directory, kernel_source(), 16, 16, "qwen3.5");
+    auto quantization = chibillm::weight_quantization::none;
+    SUBCASE("BF16") {}
+    SUBCASE("Q4")
+    {
+        quantization = chibillm::weight_quantization::q4;
+    }
+    auto loaded = chibillm::load_model(directory, kernel_source(), 16, 16, "qwen3.5", quantization);
     REQUIRE(loaded.has_value());
     auto& runner = **loaded;
     const std::vector<chibillm::chat_message> first_chat {
@@ -986,4 +990,62 @@ TEST_CASE("Qwen3.5 full attention matches CPU for prefill and cached decode")
             }
         }
     }
+}
+
+TEST_CASE("Qwen loaders quantize packed matrices and keep sensitive hybrid weights dense")
+{
+    const auto& context = test_context();
+    auto c = test_config();
+    c.hidden_size = 64;
+    c.intermediate_size = 128;
+    c.vocabulary_size = 128;
+    c.head_dimension = 32;
+    auto source = write_weights(expected_tensors(c), "chibillm_qwen_q4.safetensors");
+    auto file = safetensors_file::open(source.path());
+    REQUIRE(file);
+    auto dense = load_qwen_weights(context, *file, c);
+    auto quantized = load_qwen_weights(context, *file, c, chibillm::weight_quantization::q4);
+    REQUIRE(dense);
+    REQUIRE(quantized);
+    CHECK(chibillm::matrix_view(quantized->token_embedding).quantized());
+    CHECK(chibillm::matrix_view(quantized->output).quantized());
+    CHECK(quantized->token_embedding.size_bytes() * 32 == dense->token_embedding.size_bytes() * 9);
+    CHECK(chibillm::matrix_view(quantized->layers[0].qkv_packed).quantized());
+    CHECK(chibillm::matrix_view(quantized->layers[0].gateup_packed).quantized());
+    CHECK(chibillm::matrix_view(quantized->layers[0].mlp_down).quantized());
+    CHECK(quantized->layers[0].input_norm.descriptor().type() == chibillm::dtype::bf16);
+
+    auto h = qwen3_5_test_config();
+    h.hidden_size = 64;
+    h.intermediate_size = 128;
+    h.vocabulary_size = 128;
+    h.head_dimension = 32;
+    h.linear_key_head_count = 2;
+    h.linear_key_head_dimension = 32;
+    h.linear_value_head_count = 4;
+    h.linear_value_head_dimension = 16;
+    auto hybrid_source =
+        write_weights(expected_qwen3_5_tensors(h), "chibillm_hybrid_q4.safetensors");
+    auto hybrid_file = safetensors_file::open(hybrid_source.path());
+    REQUIRE(hybrid_file);
+    auto hybrid = load_qwen3_5_weights(context, *hybrid_file, h, chibillm::weight_quantization::q4);
+    REQUIRE(hybrid);
+    const auto& linear = std::get<qwen3_5_linear_attention_weights>(hybrid->layers[0].mixer);
+    CHECK(chibillm::matrix_view(linear.qkv_projection).quantized());
+    CHECK(chibillm::matrix_view(linear.gate_projection).quantized());
+    CHECK(linear.decay_projection.dense());
+    CHECK(linear.learning_rate_projection.dense());
+    CHECK(linear.convolution.descriptor().shape().rank() == 3);
+    CHECK(linear.norm.descriptor().type() == chibillm::dtype::f32);
+    const auto& full = std::get<qwen3_5_full_attention_weights>(hybrid->layers[1].mixer);
+    CHECK(chibillm::matrix_view(full.qkv_packed).quantized());
+
+    auto tiny = test_config();
+    auto tiny_source = write_weights(expected_tensors(tiny), "chibillm_tiny_q4.safetensors");
+    auto tiny_file = safetensors_file::open(tiny_source.path());
+    REQUIRE(tiny_file);
+    auto small = load_qwen_weights(context, *tiny_file, tiny, chibillm::weight_quantization::q4);
+    REQUIRE(small);
+    CHECK(small->token_embedding.dense());
+    CHECK(small->layers[0].qkv_packed.dense());
 }

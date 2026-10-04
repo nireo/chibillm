@@ -8,6 +8,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -120,6 +121,13 @@ struct metal_context::implementation {
     id<MTLComputePipelineState> linear_split_bf16_pipeline;
     id<MTLComputePipelineState> linear_split_bf16_decode_pipeline;
     id<MTLComputePipelineState> embedding_bf16_pipeline;
+    id<MTLComputePipelineState> embedding_q4_pipeline;
+    id<MTLComputePipelineState> linear_add_q4_decode_pipeline;
+    id<MTLComputePipelineState> linear_split_q4_decode_pipeline;
+    id<MTLComputePipelineState> linear_q4_partial_argmax_pipeline;
+    id<MTLComputePipelineState> expand_q4_bf16_pipeline;
+    // GPU-only writes; reused in dispatch order, independently of activation recycling.
+    std::optional<metal_buffer> projection_scratch;
     id<MTLComputePipelineState> rms_norm_bf16_pipeline;
     id<MTLComputePipelineState> causal_conv1d_silu_pipeline;
     id<MTLComputePipelineState> gated_delta_rule_pipeline;

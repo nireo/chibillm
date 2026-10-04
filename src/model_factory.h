@@ -2,6 +2,7 @@
 
 #include "error.h"
 #include "model_runner.h"
+#include "tensor/weight_format.h"
 #include <filesystem>
 
 namespace chibillm {
@@ -29,5 +30,6 @@ load_model(const std::filesystem::path& directory,
            std::string_view kernel_source,
            std::size_t block_count,
            std::size_t block_size,
-           std::string id);
+           std::string id,
+           weight_quantization quantization = weight_quantization::none);
 } // namespace chibillm

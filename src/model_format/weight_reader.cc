@@ -4,9 +4,17 @@
 
 namespace chibillm {
 metal_tensor
-weight_bundle::take(const std::string& name)
+weight_bundle::take_tensor(const std::string& name)
 {
     auto node = tensors_.extract(name);
+    assert(!node.empty());
+    return std::move(node.mapped());
+}
+
+matrix_weight
+weight_bundle::take_matrix(const std::string& name)
+{
+    auto node = matrices_.extract(name);
     assert(!node.empty());
     return std::move(node.mapped());
 }
@@ -18,6 +26,9 @@ validate_weights(const safetensors_file& file, std::string_view prefix, const we
         if (group.tensors.empty())
             return fail(weight_errc::invalid_configuration);
         for (const auto& spec : group.tensors) {
+            if (group.role != weight_role::tensor
+                && (spec.shape.size() != 2 || spec.type != safetensors_dtype::bf16))
+                return fail(weight_errc::invalid_configuration, group.name);
             const auto name = std::string(prefix) + spec.name;
             const auto* tensor = file.find(name);
             if (!tensor)
@@ -35,7 +46,8 @@ result<weight_bundle, weight_error>
 read_weights(const metal_context& context,
              const safetensors_file& file,
              std::string_view prefix,
-             const weight_layout& layout)
+             const weight_layout& layout,
+             weight_quantization quantization)
 {
     CL_TRY(validate_weights(file, prefix, layout));
     weight_bundle bundle;
@@ -79,7 +91,24 @@ read_weights(const metal_context& context,
                 return fail(weight_errc::tensor_read_failed, read.error(), name);
             offset += size;
         }
-        bundle.tensors_.emplace(group.name, std::move(*tensor));
+        if (group.role != weight_role::tensor) {
+            // Small or unaligned matrices stay dense. Sensitive recurrent control
+            // projections explicitly opt out in the model's weight layout.
+            if (quantization == weight_quantization::q4
+                && group.role == weight_role::matrix
+                && tensor->descriptor().shape().dimensions()[0] >= 64
+                && tensor->descriptor().shape().dimensions()[1] % quantized_matrix::group_size
+                    == 0) {
+                auto packed = quantized_matrix::quantize(context, *tensor);
+                if (!packed)
+                    return fail(weight_errc::quantization_failed, packed.error(), group.name);
+                bundle.matrices_.emplace(group.name, std::move(*packed));
+            } else {
+                bundle.matrices_.emplace(group.name, std::move(*tensor));
+            }
+        } else {
+            bundle.tensors_.emplace(group.name, std::move(*tensor));
+        }
     }
     return bundle;
 }

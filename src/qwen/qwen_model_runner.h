@@ -53,7 +53,8 @@ public:
          std::string_view kernel_source,
          std::size_t kv_block_count,
          std::size_t kv_block_size,
-         std::string model_id = "chibillm-qwen");
+         std::string model_id = "chibillm-qwen",
+         weight_quantization quantization = weight_quantization::none);
 
     qwen_model_runner(const qwen_model_runner&) = delete;
     qwen_model_runner& operator=(const qwen_model_runner&) = delete;
@@ -101,7 +102,8 @@ public:
          std::string_view kernel_source,
          std::size_t kv_block_count,
          std::size_t kv_block_size,
-         std::string model_id = "chibillm-qwen3.5");
+         std::string model_id = "chibillm-qwen3.5",
+         weight_quantization quantization = weight_quantization::none);
 
     qwen3_5_model_runner(const qwen3_5_model_runner&) = delete;
     qwen3_5_model_runner& operator=(const qwen3_5_model_runner&) = delete;

@@ -14,6 +14,7 @@
 #include "metal/metal_context.h"
 #include "metal/metal_tensor.h"
 #include "metal_kernel_source.h"
+#include "tensor/matrix.h"
 #include "tensor/types.h"
 
 namespace metal_test {
@@ -74,6 +75,13 @@ write_bf16(chibillm::metal_tensor& tensor, const std::vector<float>& values)
     }
 
     std::memcpy(tensor.buffer().bytes().data(), bits.data(), tensor.buffer().size_bytes());
+}
+
+inline void
+write_bf16(chibillm::matrix_weight& matrix, const std::vector<float>& values)
+{
+    REQUIRE(matrix.dense());
+    write_bf16(*matrix.dense(), values);
 }
 
 inline void
