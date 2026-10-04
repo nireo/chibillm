@@ -7,15 +7,15 @@ mode=${1:-format}
 
 case "$mode" in
 format)
-    find "$project_root/src" "$project_root/tests" "$project_root/shaders" \
+    find "$project_root/src" "$project_root/tests" \
         -type f \
-        \( -name '*.h' -o -name '*.cc' -o -name '*.cpp' -o -name '*.mm' -o -name '*.metal' \) \
+        \( -name '*.h' -o -name '*.cc' -o -name '*.cpp' -o -name '*.mm' -o -name '*.metal' -o -name '*.metalh' \) \
         -exec clang-format -i {} +
     ;;
 check)
-    find "$project_root/src" "$project_root/tests" "$project_root/shaders" \
+    find "$project_root/src" "$project_root/tests" \
         -type f \
-        \( -name '*.h' -o -name '*.cc' -o -name '*.cpp' -o -name '*.mm' -o -name '*.metal' \) \
+        \( -name '*.h' -o -name '*.cc' -o -name '*.cpp' -o -name '*.mm' -o -name '*.metal' -o -name '*.metalh' \) \
         -exec clang-format --dry-run --Werror {} +
     ;;
 *)

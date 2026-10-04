@@ -99,7 +99,7 @@ finish_greedy(compute_pass& pass,
 
 result<qwen_model_runner, qwen_model_runner_error>
 qwen_model_runner::make(const std::filesystem::path& model_directory,
-                        std::string_view shader_source,
+                        std::string_view kernel_source,
                         std::size_t kv_block_count,
                         std::size_t kv_block_size,
                         std::string model_id)
@@ -121,7 +121,7 @@ qwen_model_runner::make(const std::filesystem::path& model_directory,
     if (!file) {
         return fail(qwen_model_runner_errc::weights_open_failed, file.error(), "safetensors");
     }
-    auto context = metal_context::make(shader_source);
+    auto context = metal_context::make(kernel_source);
     if (!context) {
         return fail(qwen_model_runner_errc::metal_context_creation_failed, context.error());
     }
@@ -252,7 +252,7 @@ qwen_model_runner::execute(const model_batch& batch, model_state& state)
 
 result<qwen3_5_model_runner, qwen_model_runner_error>
 qwen3_5_model_runner::make(const std::filesystem::path& model_directory,
-                           std::string_view shader_source,
+                           std::string_view kernel_source,
                            std::size_t kv_block_count,
                            std::size_t kv_block_size,
                            std::string model_id)
@@ -273,7 +273,7 @@ qwen3_5_model_runner::make(const std::filesystem::path& model_directory,
     if (!file) {
         return fail(qwen_model_runner_errc::weights_open_failed, file.error(), "safetensors");
     }
-    auto context = metal_context::make(shader_source);
+    auto context = metal_context::make(kernel_source);
     if (!context) {
         return fail(qwen_model_runner_errc::metal_context_creation_failed, context.error());
     }

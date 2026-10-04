@@ -236,7 +236,7 @@ TEST_CASE("rms norm normalizes full rows and repeated groups")
 
 TEST_CASE("head normalization and RoPE can reuse their input in one compute pass")
 {
-    auto made = metal_context::make(load_shader_source());
+    auto made = metal_context::make(kernel_source());
     REQUIRE(made);
     auto& context = *made;
     constexpr std::size_t head_dimension = 256;
@@ -296,7 +296,7 @@ TEST_CASE("zero-centered rms norm preserves FP32 offsets for rows and head group
 
 TEST_CASE("zero-centered normalization reaches MLP and greedy output")
 {
-    auto made = metal_context::make(load_shader_source());
+    auto made = metal_context::make(kernel_source());
     REQUIRE(made.has_value());
     auto& context = *made;
 
@@ -1100,7 +1100,7 @@ TEST_CASE("paged attention validates inputs and metadata")
 
 TEST_CASE("allocating helpers compose with temporary tensors in one compute pass")
 {
-    auto made = metal_context::make(load_shader_source());
+    auto made = metal_context::make(kernel_source());
     REQUIRE(made.has_value());
     auto& context = *made;
     for (const auto rows : { 1U, 3U }) {

@@ -50,7 +50,7 @@ class qwen_model_runner final : public model_runner {
 public:
     [[nodiscard]] static result<qwen_model_runner, qwen_model_runner_error>
     make(const std::filesystem::path& model_directory,
-         std::string_view shader_source,
+         std::string_view kernel_source,
          std::size_t kv_block_count,
          std::size_t kv_block_size,
          std::string model_id = "chibillm-qwen");
@@ -98,7 +98,7 @@ class qwen3_5_model_runner final : public model_runner {
 public:
     [[nodiscard]] static result<qwen3_5_model_runner, qwen_model_runner_error>
     make(const std::filesystem::path& model_directory,
-         std::string_view shader_source,
+         std::string_view kernel_source,
          std::size_t kv_block_count,
          std::size_t kv_block_size,
          std::string model_id = "chibillm-qwen3.5");

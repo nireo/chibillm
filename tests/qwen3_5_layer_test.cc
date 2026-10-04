@@ -462,7 +462,7 @@ snapshot_linear(const qwen3_5_model_state& state, const qwen3_5_config& config)
 
 TEST_CASE("Qwen3.5 hybrid layers match a CPU decoder with grouped heads and compact KV layers")
 {
-    auto made = metal_context::make(load_shader_source());
+    auto made = metal_context::make(kernel_source());
     REQUIRE(made);
     auto& context = *made;
     const auto config = small_config();
@@ -490,7 +490,7 @@ TEST_CASE("Qwen3.5 hybrid layers match a CPU decoder with grouped heads and comp
 
 TEST_CASE("Qwen3.5 hybrid execution can be aborted and retried after partial GPU work")
 {
-    auto made = metal_context::make(load_shader_source());
+    auto made = metal_context::make(kernel_source());
     REQUIRE(made);
     auto& context = *made;
     const auto config = small_config();
@@ -537,7 +537,7 @@ TEST_CASE("Qwen3.5 hybrid execution can be aborted and retried after partial GPU
 
 TEST_CASE("Qwen3.5 hybrid layers reject invalid routing before mutating state")
 {
-    auto made = metal_context::make(load_shader_source());
+    auto made = metal_context::make(kernel_source());
     REQUIRE(made);
     auto& context = *made;
     const auto config = small_config();

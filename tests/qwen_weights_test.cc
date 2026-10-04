@@ -548,7 +548,7 @@ TEST_CASE("Qwen model runner executes a flattened multi-sequence batch")
     auto weights_file =
         write_weights(expected_tensors(config), "chibillm_qwen_runner_model/model.safetensors");
 
-    auto runner = qwen_model_runner::make(model_directory.path(), load_shader_source(), 3, 2);
+    auto runner = qwen_model_runner::make(model_directory.path(), kernel_source(), 3, 2);
     REQUIRE(runner.has_value());
     CHECK(runner->config().vocabulary_size == config.vocabulary_size);
 
@@ -619,14 +619,14 @@ TEST_CASE("Qwen3.5 factory loads a sole shard and generates with tied zero-cente
     }
     temporary_file weights((directory.path() / "model-00001-of-00001.safetensors").string(), header,
                            data);
-    auto invalid_shader =
-        chibillm::load_model(directory.path(), "invalid Metal shader", 8, 2, "tiny-hybrid");
-    REQUIRE_FALSE(invalid_shader.has_value());
-    CHECK(invalid_shader.error() == chibillm::model_load_errc::load_failed);
-    CHECK(chibillm::describe_error(invalid_shader.error())
-              .find("metal.shader_library_creation_failed")
+    auto invalid_kernel =
+        chibillm::load_model(directory.path(), "invalid Metal kernel", 8, 2, "tiny-hybrid");
+    REQUIRE_FALSE(invalid_kernel.has_value());
+    CHECK(invalid_kernel.error() == chibillm::model_load_errc::load_failed);
+    CHECK(chibillm::describe_error(invalid_kernel.error())
+              .find("metal.kernel_library_creation_failed")
           != std::string::npos);
-    auto loaded = chibillm::load_model(directory.path(), load_shader_source(), 8, 2, "tiny-hybrid");
+    auto loaded = chibillm::load_model(directory.path(), kernel_source(), 8, 2, "tiny-hybrid");
     REQUIRE(loaded.has_value());
     auto& runner = **loaded;
     REQUIRE(dynamic_cast<chibillm::qwen3_5_model_runner*>(&runner) != nullptr);
@@ -677,7 +677,7 @@ TEST_CASE("Qwen3.5 official checkpoint generates consistently across batching an
         MESSAGE("Qwen3.5 model is not installed; skipping local generation validation");
         return;
     }
-    auto loaded = chibillm::load_model(directory, load_shader_source(), 16, 16, "qwen3.5");
+    auto loaded = chibillm::load_model(directory, kernel_source(), 16, 16, "qwen3.5");
     REQUIRE(loaded.has_value());
     auto& runner = **loaded;
     const std::vector<chibillm::chat_message> first_chat {
@@ -836,7 +836,7 @@ TEST_CASE("Qwen3.5 full attention matches CPU for prefill and cached decode")
     auto file = write_weights(expected_qwen3_5_tensors(config), "qwen3_5_attention.safetensors");
     auto safetensors = safetensors_file::open(file.path());
     REQUIRE(safetensors.has_value());
-    auto made = metal_context::make(load_shader_source());
+    auto made = metal_context::make(kernel_source());
     REQUIRE(made.has_value());
     auto& context = *made;
     auto weights = load_qwen3_5_weights(context, *safetensors, config);

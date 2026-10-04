@@ -16,10 +16,10 @@ namespace chibillm {
 
 class metal_kernels;
 
-// owns the metal device, queue, shader library, and compute pipelines.
+// owns the metal device, queue, kernel library, and compute pipelines.
 class metal_context {
 public:
-    [[nodiscard]] static result<metal_context, metal_error> make(std::string_view shader_source);
+    [[nodiscard]] static result<metal_context, metal_error> make(std::string_view kernel_source);
 
     metal_context(const metal_context&) = delete;
     metal_context& operator=(const metal_context&) = delete;

@@ -5,34 +5,30 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
-#include <iterator>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include "metal/metal_context.h"
 #include "metal/metal_tensor.h"
+#include "metal_kernel_source.h"
 #include "tensor/types.h"
 
 namespace metal_test {
 
-inline std::string
-load_shader_source()
+inline std::string_view
+kernel_source()
 {
-    std::ifstream input(CHIBILLM_SHADER_PATH);
-    return {
-        std::istreambuf_iterator<char>(input),
-        std::istreambuf_iterator<char>(),
-    };
+    return chibillm::metal_kernel_source;
 }
 
 inline const chibillm::metal_context&
 test_context()
 {
     static const auto context = [] {
-        auto result = chibillm::metal_context::make(load_shader_source());
+        auto result = chibillm::metal_context::make(kernel_source());
         if (!result) {
             throw std::runtime_error("failed to create metal context: " + result.error().message);
         }

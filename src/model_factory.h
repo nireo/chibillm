@@ -26,7 +26,7 @@ error_name(model_load_errc code) noexcept
 using model_load_error = error<model_load_errc>;
 result<std::unique_ptr<model_runner>, model_load_error>
 load_model(const std::filesystem::path& directory,
-           std::string_view shaders,
+           std::string_view kernel_source,
            std::size_t block_count,
            std::size_t block_size,
            std::string id);

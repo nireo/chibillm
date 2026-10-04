@@ -111,7 +111,7 @@ struct metal_context::implementation {
 
     id<MTLDevice> device;
     id<MTLCommandQueue> command_queue;
-    id<MTLLibrary> shader_library;
+    id<MTLLibrary> kernel_library;
     id<MTLComputePipelineState> linear_add_bf16_decode_pipeline;
     id<MTLComputePipelineState> linear_bf16_tensorops_pipeline;
     id<MTLComputePipelineState> linear_split_bf16_pipeline;

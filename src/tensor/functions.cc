@@ -327,9 +327,9 @@ encode_greedy(const metal_context& context,
         if (index >= hidden_row_count || index > std::numeric_limits<std::uint32_t>::max()) {
             return fail(tensor_op_errc::logits_index_out_of_range);
         }
-        const auto shader_index = static_cast<std::uint32_t>(index);
-        std::memcpy(index_bytes.data() + row * sizeof(shader_index), &shader_index,
-                    sizeof(shader_index));
+        const auto kernel_index = static_cast<std::uint32_t>(index);
+        std::memcpy(index_bytes.data() + row * sizeof(kernel_index), &kernel_index,
+                    sizeof(kernel_index));
     }
 
     auto normalized = allocate_tensor(context, dtype::f32, { logits_indices.size(), hidden_size });

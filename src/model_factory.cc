@@ -6,7 +6,7 @@
 namespace chibillm {
 result<std::unique_ptr<model_runner>, model_load_error>
 load_model(const std::filesystem::path& directory,
-           std::string_view shaders,
+           std::string_view kernel_source,
            std::size_t block_count,
            std::size_t block_size,
            std::string id)
@@ -23,15 +23,15 @@ load_model(const std::filesystem::path& directory,
     }
 
     if (config["model_type"] == "qwen3") {
-        auto runner =
-            qwen_model_runner::make(directory, shaders, block_count, block_size, std::move(id));
+        auto runner = qwen_model_runner::make(directory, kernel_source, block_count, block_size,
+                                              std::move(id));
         if (!runner)
             return fail(model_load_errc::load_failed, runner.error());
         return std::make_unique<qwen_model_runner>(std::move(*runner));
     }
     if (config["model_type"] == "qwen3_5") {
-        auto runner =
-            qwen3_5_model_runner::make(directory, shaders, block_count, block_size, std::move(id));
+        auto runner = qwen3_5_model_runner::make(directory, kernel_source, block_count, block_size,
+                                                 std::move(id));
         if (!runner)
             return fail(model_load_errc::load_failed, runner.error());
         return std::make_unique<qwen3_5_model_runner>(std::move(*runner));

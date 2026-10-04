@@ -231,7 +231,7 @@ TEST_CASE(
 
 TEST_CASE("DeltaNet chunkwise prefill matches CPU and sequential GPU including continuation")
 {
-    auto made = metal_context::make(load_shader_source());
+    auto made = metal_context::make(kernel_source());
     REQUIRE(made);
     auto& context = *made;
     for (const std::size_t kd : { 3, 128 }) {
@@ -303,7 +303,7 @@ TEST_CASE("DeltaNet chunkwise prefill matches CPU and sequential GPU including c
 
 TEST_CASE("DeltaNet chunkwise prefill composes across independent states and scratch reuse")
 {
-    auto made = metal_context::make(load_shader_source());
+    auto made = metal_context::make(kernel_source());
     REQUIRE(made);
     auto& context = *made;
     constexpr std::size_t rows = 160, kh = 1, vh = 2, kd = 7, vd = 9;
@@ -341,7 +341,7 @@ TEST_CASE("DeltaNet chunkwise prefill composes across independent states and scr
 
 TEST_CASE("DeltaNet kernels compose within one compute pass with separate sequence states")
 {
-    auto made = metal_context::make(load_shader_source());
+    auto made = metal_context::make(kernel_source());
     REQUIRE(made);
     auto& context = *made;
     constexpr std::size_t rows = 3, width = 8;
@@ -399,7 +399,7 @@ TEST_CASE("DeltaNet kernels compose within one compute pass with separate sequen
 
 TEST_CASE("DeltaNet batch chunks match standalone sequences in one compute pass")
 {
-    auto made = metal_context::make(load_shader_source());
+    auto made = metal_context::make(kernel_source());
     REQUIRE(made);
     auto& context = *made;
     constexpr std::size_t rows = 8, kh = 2, vh = 4, kd = 3, vd = 5, kernel = 4;
@@ -477,7 +477,7 @@ TEST_CASE("DeltaNet batch chunks match standalone sequences in one compute pass"
 
 TEST_CASE("DeltaNet rejects empty, out-of-bounds, and overflow chunks without mutation")
 {
-    auto made = metal_context::make(load_shader_source());
+    auto made = metal_context::make(kernel_source());
     REQUIRE(made);
     auto& context = *made;
     constexpr std::size_t rows = 4, width = 8, vh = 2, kd = 2, vd = 2, kernel = 4;
@@ -538,7 +538,7 @@ TEST_CASE("DeltaNet rejects empty, out-of-bounds, and overflow chunks without mu
 
 TEST_CASE("DeltaNet raw dispatch bounds-checks every token buffer")
 {
-    auto made = metal_context::make(load_shader_source());
+    auto made = metal_context::make(kernel_source());
     REQUIRE(made);
     auto& context = *made;
     constexpr std::size_t rows = 4, width = 8, vh = 2, kd = 2, vd = 2, kernel = 4;

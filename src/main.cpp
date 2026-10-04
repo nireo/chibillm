@@ -4,27 +4,17 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <iterator>
 #include <string>
 #include <utility>
 
 #include "cli_options.h"
+#include "metal_kernel_source.h"
 #include "model_factory.h"
 #include "repl.h"
 #include "server.h"
 
 namespace chibillm {
 namespace {
-
-std::string
-load_text(const std::filesystem::path& path)
-{
-    std::ifstream input(path, std::ios::binary);
-    if (!input) {
-        return {};
-    }
-    return { std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>() };
-}
 
 int
 run_server(model_runner& runner, scheduler_config config, std::size_t max_tokens)
@@ -48,7 +38,7 @@ run_server(model_runner& runner, scheduler_config config, std::size_t max_tokens
 }
 
 int
-run_application(const cli_options& settings, const std::filesystem::path& shader_path)
+run_application(const cli_options& settings)
 {
     std::ofstream metrics_file;
     if (!settings.metrics_jsonl.empty()) {
@@ -61,17 +51,12 @@ run_application(const cli_options& settings, const std::filesystem::path& shader
     constexpr auto kv_block_size = cli_options::kv_block_size;
     const auto& model_directory = settings.model_directory;
     const auto requested_blocks = settings.context_length / kv_block_size;
-    const auto shader_source = load_text(shader_path);
-    if (shader_source.empty()) {
-        std::cerr << "failed to load Metal shaders\n";
-        return 1;
-    }
     const auto load_started = std::chrono::steady_clock::now();
     auto model_id = model_directory.lexically_normal().filename().string();
     if (model_id.empty()) {
         model_id = "chibillm-qwen";
     }
-    auto runner = load_model(model_directory, shader_source, requested_blocks, kv_block_size,
+    auto runner = load_model(model_directory, metal_kernel_source, requested_blocks, kv_block_size,
                              std::move(model_id));
     if (!runner) {
         std::cerr
@@ -136,5 +121,5 @@ main(int argc, char** argv)
         chibillm::print_usage(std::cout);
         return 0;
     }
-    return chibillm::run_application(*settings, CHIBILLM_SHADER_PATH);
+    return chibillm::run_application(*settings);
 }

@@ -61,8 +61,8 @@ make_compute_pipeline(id<MTLDevice> device, id<MTLLibrary> library, NSString* na
     const std::string function_name = utf8_name == nullptr ? "unknown" : utf8_name;
     id<MTLFunction> function = [library newFunctionWithName:name];
     if (function == nil) {
-        return fail(make_error(metal_errc::shader_function_not_found,
-                               "the Metal shader library does not contain " + function_name));
+        return fail(make_error(metal_errc::kernel_function_not_found,
+                               "the Metal kernel library does not contain " + function_name));
     }
 
     NSError* error = nil;
@@ -192,11 +192,11 @@ metal_buffer::bytes() const noexcept
 }
 
 result<metal_context, metal_error>
-metal_context::make(std::string_view shader_source)
+metal_context::make(std::string_view kernel_source)
 {
     @autoreleasepool {
-        if (shader_source.empty()) {
-            return fail(make_error(metal_errc::invalid_input, "shader source is empty"));
+        if (kernel_source.empty()) {
+            return fail(make_error(metal_errc::invalid_input, "kernel source is empty"));
         }
 
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -210,11 +210,11 @@ metal_context::make(std::string_view shader_source)
                                    "failed to create the Metal command queue"));
         }
 
-        NSString* source = [[NSString alloc] initWithBytes:shader_source.data()
-                                                    length:shader_source.size()
+        NSString* source = [[NSString alloc] initWithBytes:kernel_source.data()
+                                                    length:kernel_source.size()
                                                   encoding:NSUTF8StringEncoding];
         if (source == nil) {
-            return fail(make_error(metal_errc::invalid_input, "shader source is not valid UTF-8"));
+            return fail(make_error(metal_errc::invalid_input, "kernel source is not valid UTF-8"));
         }
 
         NSError* library_error = nil;
@@ -235,11 +235,11 @@ metal_context::make(std::string_view shader_source)
         }
         if (library == nil) {
             const char* error_message = library_error.localizedDescription.UTF8String;
-            std::fprintf(stderr, "[metal] failed to compile legacy shader library: %s\n",
+            std::fprintf(stderr, "[metal] failed to compile legacy kernel library: %s\n",
                          error_message == nullptr ? "unknown compilation error" : error_message);
             return fail(make_error(
-                metal_errc::shader_library_creation_failed,
-                message_from_error(library_error, "failed to compile the Metal shader library")));
+                metal_errc::kernel_library_creation_failed,
+                message_from_error(library_error, "failed to compile the Metal kernel library")));
         }
 
         auto implementation = std::make_unique<metal_context::implementation>();
@@ -326,7 +326,7 @@ metal_context::make(std::string_view shader_source)
         const char* device_name = device.name.UTF8String;
         implementation->device = device;
         implementation->command_queue = command_queue;
-        implementation->shader_library = library;
+        implementation->kernel_library = library;
         implementation->device_name = device_name == nullptr ? "unknown Metal device" : device_name;
         implementation->chunkwise_delta_enabled =
             !environment_flag("CHIBILLM_DISABLE_CHUNKWISE_DELTA");
@@ -340,7 +340,7 @@ metal_context::make(std::string_view shader_source)
             !environment_flag("CHIBILLM_DISABLE_SIMD_ATTENTION");
 
         std::fprintf(stderr,
-                     "[metal] device=%s shaders=%s tensorops=%s flash-attention=%s profile=%s "
+                     "[metal] device=%s language=%s tensorops=%s flash-attention=%s profile=%s "
                      "pass-profile=%s\n",
                      implementation->device_name.c_str(), compiled_metal4 ? "Metal 4" : "legacy",
                      implementation->tensorops_enabled ? "enabled" : "disabled",

@@ -13,6 +13,26 @@ add_project_arguments('-fobjc-arc', language: 'objcpp')
 
 src_include = include_directories('src')
 
+python = import('python').find_installation('python3')
+fs = import('fs')
+metal_source = ''
+foreach name : ['common.metalh', 'linear.metal', 'tensor_ops.metal', 'sampling.metal', 'attention.metal', 'deltanet.metal']
+  # fs.read tracks each source so edits automatically regenerate the header.
+  contents = fs.read('src/metal/kernels' / name)
+  contents = contents.replace('#include "common.metalh"\n', '\n')
+  metal_source += '#line 1 "' + name + '"\n' + contents + '\n'
+endforeach
+if metal_source.contains(')CHIBILLM_METAL"')
+  error('Metal source contains the C++ raw-string delimiter')
+endif
+kernel_config = configuration_data()
+kernel_config.set('METAL_KERNEL_SOURCE', metal_source)
+kernel_source = configure_file(
+  input: 'src/metal/metal_kernel_source.h.in',
+  output: 'metal_kernel_source.h',
+  configuration: kernel_config,
+)
+
 metal_framework_dep = dependency(
   'appleframeworks',
   modules: [
@@ -63,7 +83,11 @@ chibillm_metal = static_library(
   'chibillm_metal',
   [
     'src/metal/metal_context.mm',
-    'src/metal/metal_kernels.mm',
+    'src/metal/metal_kernels_linear.mm',
+    'src/metal/metal_kernels_tensor_ops.mm',
+    'src/metal/metal_kernels_sampling.mm',
+    'src/metal/metal_kernels_attention.mm',
+    'src/metal/metal_kernels_deltanet.mm',
     'src/tensor/deltanet.cc',
     'src/tensor/attention.cc',
     'src/metal/metal_kv_cache.cc',
@@ -124,15 +148,9 @@ executable(
     'src/cli_options.cc',
     'src/repl.cc',
     'src/generation_metrics.cc',
+    kernel_source,
   ],
   include_directories: src_include,
-  cpp_args: [
-    '-DCHIBILLM_SHADER_PATH="' + join_paths(
-      meson.project_source_root(),
-      'shaders',
-      'tensor_ops.metal',
-    ) + '"',
-  ],
   dependencies: [
     cpp_httplib_dep,
     nlohmann_json_dep,
@@ -145,11 +163,9 @@ executable(
   install: true,
 )
 
-python = import('python').find_installation('python3')
 test('chibillm benchmark tests', python, args: [meson.project_source_root() / 'tests/benchmark_test.py'])
 
 test_args = [
-  '-DCHIBILLM_SHADER_PATH="' + meson.project_source_root() / 'shaders/tensor_ops.metal' + '"',
   '-DQWEN3_CONFIG_FIXTURE_PATH="' + meson.project_source_root() / 'tests/fixtures/qwen3_0_6b_config.json' + '"',
   '-DQWEN3_5_CONFIG_FIXTURE_PATH="' + meson.project_source_root() / 'tests/fixtures/qwen3_5_0_8b_config.json' + '"',
   '-DQWEN3_5_MODEL_PATH="' + meson.project_source_root() / 'qwen3_5_model' + '"',
@@ -175,7 +191,7 @@ foreach spec : [
 ]
   name = spec['name'] == 'unit' ? 'chibillm_tests' : 'chibillm_' + spec['name'].replace(' ', '_') + '_tests'
   target = executable(
-    name, spec['sources'],
+    name, spec['sources'] + [kernel_source],
     include_directories: [src_include, include_directories('tests')],
     dependencies: [doctest_dep] + spec.get('deps', []),
     cpp_args: test_args,

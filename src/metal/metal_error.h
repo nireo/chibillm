@@ -10,8 +10,8 @@ namespace chibillm {
 enum class metal_errc : std::uint8_t {
     no_device,
     command_queue_creation_failed,
-    shader_library_creation_failed,
-    shader_function_not_found,
+    kernel_library_creation_failed,
+    kernel_function_not_found,
     pipeline_creation_failed,
     buffer_creation_failed,
     command_buffer_creation_failed,
@@ -26,8 +26,8 @@ error_name(metal_errc code) noexcept
     static constexpr std::array names {
         "metal.no_device",
         "metal.command_queue_creation_failed",
-        "metal.shader_library_creation_failed",
-        "metal.shader_function_not_found",
+        "metal.kernel_library_creation_failed",
+        "metal.kernel_function_not_found",
         "metal.pipeline_creation_failed",
         "metal.buffer_creation_failed",
         "metal.command_buffer_creation_failed",

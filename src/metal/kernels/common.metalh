@@ -1,0 +1,67 @@
+#ifndef CHIBILLM_KERNEL_COMMON
+#define CHIBILLM_KERNEL_COMMON
+
+#include <metal_stdlib>
+
+using namespace metal;
+
+#if __METAL_VERSION__ >= 310
+using bf16_storage = bfloat;
+using bf16x4_storage = bfloat4;
+
+static inline float
+load_bf16(bf16_storage value)
+{
+    return float(value);
+}
+
+static inline float4
+load_bf16x4(bf16x4_storage value)
+{
+    return float4(value);
+}
+#else
+using bf16_storage = ushort;
+using bf16x4_storage = ushort4;
+
+static inline float
+load_bf16(bf16_storage value)
+{
+    return as_type<float>(uint(value) << 16);
+}
+
+static inline float4
+load_bf16x4(bf16x4_storage value)
+{
+    return as_type<float4>(uint4(value) << 16);
+}
+#endif
+
+static inline float
+linear_bf16_decode_dot(device const float* input,
+                       device const bf16_storage* weight,
+                       uint input_features,
+                       uint weight_row,
+                       uint lane,
+                       uint simd_width)
+{
+    float accumulator = 0.0F;
+    const ulong weight_base = ulong(weight_row) * ulong(input_features);
+    for (uint k = lane * 4; k + 3 < input_features; k += 4 * simd_width) {
+        const float4 input_values = { input[k], input[k + 1], input[k + 2], input[k + 3] };
+        const bf16x4_storage packed_values = { weight[weight_base + ulong(k)],
+                                               weight[weight_base + ulong(k + 1)],
+                                               weight[weight_base + ulong(k + 2)],
+                                               weight[weight_base + ulong(k + 3)] };
+        const float4 weight_values = load_bf16x4(packed_values);
+        accumulator += dot(input_values, weight_values);
+    }
+    const uint vectorized_features = input_features & ~3u;
+    for (uint k = vectorized_features + lane; k < input_features; k += simd_width) {
+        const float value = load_bf16(weight[weight_base + ulong(k)]);
+        accumulator += input[k] * value;
+    }
+    return simd_sum(accumulator);
+}
+
+#endif
