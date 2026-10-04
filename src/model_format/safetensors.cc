@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -250,7 +251,7 @@ safetensors_file::open(const std::filesystem::path& path)
 
     const auto data_start = sizeof(std::uint64_t) + header_size;
     const auto data_size = file_size - data_start;
-    std::unordered_map<std::string, safetensor_info> tensors;
+    std::unordered_map<std::string, tensor_entry> tensors;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     tensors.reserve(parsed.size());
     ranges.reserve(parsed.size());
@@ -269,7 +270,7 @@ safetensors_file::open(const std::filesystem::path& path)
         }
 
         ranges.emplace_back(info->data_offset, info->data_offset + info->byte_count);
-        tensors.emplace(name, std::move(*info));
+        tensors.emplace(name, tensor_entry { std::move(*info) });
     }
 
     std::sort(ranges.begin(), ranges.end());
@@ -298,6 +299,60 @@ safetensors_file::open_model(const std::filesystem::path& directory)
     }
     if (canonical_exists) {
         return open(canonical);
+    }
+
+    const auto index_path = directory / "model.safetensors.index.json";
+    const auto index_exists = std::filesystem::exists(index_path, error);
+    if (error)
+        return fail(safetensors_errc::file_open_failed);
+    if (index_exists) {
+        const auto index_size = std::filesystem::file_size(index_path, error);
+        if (error)
+            return fail(safetensors_errc::file_open_failed);
+        if (!index_size || index_size > max_header_size)
+            return fail(safetensors_errc::invalid_checkpoint_index);
+        std::ifstream input(index_path);
+        if (!input)
+            return fail(safetensors_errc::file_open_failed);
+        const auto index = json::parse(input, nullptr, false);
+        if (!index.is_object())
+            return fail(safetensors_errc::invalid_checkpoint_index);
+        const auto map = index.find("weight_map");
+        if (map == index.end() || !map->is_object() || map->empty())
+            return fail(safetensors_errc::invalid_checkpoint_index);
+
+        safetensors_file checkpoint;
+        checkpoint.tensors_.reserve(map->size());
+        std::unordered_set<std::string> loaded_files;
+        for (const auto& value : *map) {
+            if (!value.is_string())
+                return fail(safetensors_errc::invalid_checkpoint_index);
+            const auto& filename = value.get_ref<const std::string&>();
+            const std::filesystem::path relative(filename);
+            if (relative.empty()
+                || relative.has_parent_path()
+                || relative.extension() != ".safetensors")
+                return fail(safetensors_errc::invalid_checkpoint_index);
+            if (loaded_files.contains(filename))
+                continue;
+            auto shard = open(directory / relative);
+            if (!shard)
+                return fail(shard.error());
+            const auto file_index = checkpoint.files_.size();
+            checkpoint.files_.push_back(std::move(shard->files_.front()));
+            loaded_files.insert(filename);
+            for (auto& [tensor_name, entry] : shard->tensors_) {
+                const auto expected = map->find(tensor_name);
+                if (expected == map->end() || *expected != filename)
+                    return fail(safetensors_errc::invalid_checkpoint_index);
+                entry.file_index = file_index;
+                if (!checkpoint.tensors_.emplace(tensor_name, std::move(entry)).second)
+                    return fail(safetensors_errc::invalid_checkpoint_index);
+            }
+        }
+        if (checkpoint.tensors_.size() != map->size())
+            return fail(safetensors_errc::invalid_checkpoint_index);
+        return checkpoint;
     }
 
     std::filesystem::directory_iterator current(directory, error);
@@ -333,9 +388,8 @@ safetensors_file::open_model(const std::filesystem::path& directory)
 
 safetensors_file::safetensors_file(std::filesystem::path path,
                                    std::uint64_t data_start,
-                                   std::unordered_map<std::string, safetensor_info> tensors)
-    : path_(std::move(path))
-    , data_start_(data_start)
+                                   std::unordered_map<std::string, tensor_entry> tensors)
+    : files_ { { std::move(path), data_start } }
     , tensors_(std::move(tensors))
 {}
 
@@ -343,7 +397,7 @@ const safetensor_info*
 safetensors_file::find(std::string_view name) const
 {
     const auto found = tensors_.find(std::string(name));
-    return found == tensors_.end() ? nullptr : &found->second;
+    return found == tensors_.end() ? nullptr : &found->second.info;
 }
 
 std::size_t
@@ -355,10 +409,11 @@ safetensors_file::tensor_count() const noexcept
 result<void, safetensors_errc>
 safetensors_file::read(std::string_view name, std::span<std::byte> destination) const
 {
-    const auto* tensor = find(name);
-    if (tensor == nullptr) {
+    const auto found = tensors_.find(std::string(name));
+    if (found == tensors_.end()) {
         return fail(safetensors_errc::tensor_not_found);
     }
+    const auto* tensor = &found->second.info;
     if (tensor->byte_count != destination.size()) {
         return fail(safetensors_errc::destination_size_mismatch);
     }
@@ -366,14 +421,15 @@ safetensors_file::read(std::string_view name, std::span<std::byte> destination) 
         return {};
     }
 
-    const auto absolute_offset = data_start_ + tensor->data_offset;
+    const auto& file = files_[found->second.file_index];
+    const auto absolute_offset = file.data_start + tensor->data_offset;
     if (absolute_offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())
         || destination.size()
             > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
         return fail(safetensors_errc::file_read_failed);
     }
 
-    std::ifstream input(path_, std::ios::binary);
+    std::ifstream input(file.path, std::ios::binary);
     if (!input) {
         return fail(safetensors_errc::file_open_failed);
     }

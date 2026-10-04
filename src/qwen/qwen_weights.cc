@@ -100,6 +100,7 @@ mixer_layout(const qwen3_5_config& config, std::size_t layer, bool converted = f
 
 struct checkpoint_layout {
     std::string_view prefix;
+    std::string_view output_prefix;
     bool converted;
 };
 
@@ -127,7 +128,8 @@ qwen3_5_layout(const safetensors_file& file, const qwen3_5_config& config)
                                               config.linear_conv_kernel_dimension, 1 };
         break;
     }
-    return { prefix, converted };
+    const auto output_prefix = prefix == "language_model.model." ? "language_model." : "";
+    return { prefix, output_prefix, converted };
 }
 
 std::size_t
@@ -221,13 +223,15 @@ load_qwen_weights(const metal_context& context,
 result<void, weight_error>
 validate_qwen3_5_weights(const safetensors_file& file, const qwen3_5_config& config)
 {
-    if (config.layer_types.size() != config.layer_count
-        || !config.tie_word_embeddings
-        || !config.attention_output_gate)
+    if (config.layer_types.size() != config.layer_count || !config.attention_output_gate)
         return fail(weight_errc::invalid_configuration);
     const auto source = qwen3_5_layout(file, config);
     CL_TRY(
         validate_weights(file, source.prefix, globals(config.vocabulary_size, config.hidden_size)));
+    if (!config.tie_word_embeddings
+        || file.find(std::string(source.output_prefix) + "lm_head.weight"))
+        CL_TRY(validate_weights(file, source.output_prefix,
+                                output_layout(config.vocabulary_size, config.hidden_size)));
     const auto common = common_layer(config.hidden_size, config.intermediate_size);
     for (std::size_t layer = 0; layer < config.layer_count; ++layer) {
         auto prefix = layer_prefix(source.prefix, layer);
@@ -249,6 +253,15 @@ load_qwen3_5_weights(const metal_context& context,
                                globals(config.vocabulary_size, config.hidden_size), quantization);
     if (!global)
         return fail(global.error());
+    std::optional<matrix_weight> output;
+    if (file.find(std::string(source.output_prefix) + "lm_head.weight")) {
+        auto loaded =
+            read_weights(context, file, source.output_prefix,
+                         output_layout(config.vocabulary_size, config.hidden_size), quantization);
+        if (!loaded)
+            return fail(loaded.error());
+        output = loaded->take_matrix("output");
+    }
     std::vector<qwen3_5_layer_weights> layers;
     layers.reserve(config.layer_count);
     const auto common = common_layer(config.hidden_size, config.intermediate_size);
@@ -308,6 +321,6 @@ load_qwen3_5_weights(const metal_context& context,
                            std::move(weights), !source.converted });
     }
     return qwen3_5_weights { global->take_matrix("embedding"), global->take_tensor("norm"),
-                             std::move(layers), !source.converted };
+                             std::move(layers), !source.converted, std::move(output) };
 }
 } // namespace chibillm

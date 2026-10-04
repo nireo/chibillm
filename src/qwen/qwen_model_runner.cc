@@ -372,7 +372,7 @@ qwen3_5_model_runner::execute(const model_batch& batch, model_state& state)
         run_qwen3_5_layers(context_, config_, weights_, std::move(*hidden), batch, *hybrid);
     if (!output)
         return fail(model_runner_errc::backend_failure, output.error(), "layers");
-    return finish_greedy(pass, context_, weights_.final_norm, weights_.token_embedding,
+    return finish_greedy(pass, context_, weights_.final_norm, weights_.vocabulary(),
                          config_.rms_epsilon, *output, metadata->logits_indices,
                          weights_.zero_centered_norm);
 }

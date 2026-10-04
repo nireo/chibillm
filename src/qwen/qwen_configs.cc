@@ -356,7 +356,9 @@ parse_qwen3_5_object(const json& object)
     qwen3_5_config config {};
     CL_TRY(parse_common_geometry(*text, config));
     CL_TRY_ASSIGN(config.eos_token_id, required_token_id(*text, "eos_token_id"));
-    CL_TRY_ASSIGN(config.tie_word_embeddings, required_bool(*text, "tie_word_embeddings"));
+    CL_TRY_ASSIGN(config.tie_word_embeddings,
+                  required_bool(text->contains("tie_word_embeddings") ? *text : object,
+                                "tie_word_embeddings"));
     CL_TRY_ASSIGN(config.full_attention_interval, required_size(*text, "full_attention_interval"));
     CL_TRY_ASSIGN(config.linear_conv_kernel_dimension,
                   required_size(*text, "linear_conv_kernel_dim"));

@@ -3,6 +3,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
@@ -92,6 +93,7 @@ TEST_CASE("safetensors model resolution prefers the canonical file")
                          nlohmann::json::object(), {});
     temporary_file second((directory.path() / "second.safetensors").string(),
                           nlohmann::json::object(), {});
+    std::ofstream(directory.path() / "model.safetensors.index.json") << "invalid unused index";
 
     auto opened = safetensors_file::open_model(directory.path());
     REQUIRE(opened.has_value());
@@ -109,7 +111,13 @@ TEST_CASE("safetensors model resolution opens a sole noncanonical shard")
     temporary_file file(
         (directory.path() / "model.safetensors-00001-of-00001.safetensors").string(), header, data);
     REQUIRE(std::filesystem::create_directory(directory.path() / "ignored.safetensors"));
-    std::ofstream(directory.path() / "model.safetensors.index.json") << "{}";
+    SUBCASE("without an index") {}
+    SUBCASE("with an index")
+    {
+        std::ofstream(directory.path() / "model.safetensors.index.json")
+            << nlohmann::json { { "weight_map",
+                                  { { "weight", file.path().filename().string() } } } };
+    }
 
     auto opened = safetensors_file::open_model(directory.path());
     REQUIRE(opened.has_value());
@@ -156,6 +164,103 @@ TEST_CASE("safetensors model resolution rejects missing checkpoints")
     auto opened = safetensors_file::open_model(path);
     REQUIRE_FALSE(opened.has_value());
     CHECK(opened.error() == safetensors_errc::file_open_failed);
+}
+
+TEST_CASE("safetensors reads indexed shards without combining their data")
+{
+    temporary_directory directory("chibillm_safetensors_model_indexed");
+    nlohmann::json first_header, second_header;
+    std::vector<std::byte> first_data, second_data;
+    safetensors_test::add_tensor(first_header, first_data, "first", "BF16", { 2 });
+    safetensors_test::add_tensor(second_header, second_data, "second", "U32", { 3 });
+    std::fill(first_data.begin(), first_data.end(), std::byte { 0x12 });
+    std::fill(second_data.begin(), second_data.end(), std::byte { 0x34 });
+    temporary_file first((directory.path() / "first.safetensors").string(), first_header,
+                         first_data);
+    temporary_file second((directory.path() / "second.safetensors").string(), second_header,
+                          second_data);
+    temporary_file unused((directory.path() / "unused.safetensors").string(),
+                          nlohmann::json::object(), {});
+    nlohmann::json map { { "first", "first.safetensors" }, { "second", "second.safetensors" } };
+    auto expected = safetensors_errc::invalid_checkpoint_index;
+    bool valid = false;
+    SUBCASE("valid index ignores unrelated files")
+    {
+        valid = true;
+    }
+    SUBCASE("tensor assigned to the wrong shard")
+    {
+        map["first"] = "second.safetensors";
+    }
+    SUBCASE("missing indexed tensor")
+    {
+        map["missing"] = "first.safetensors";
+    }
+    SUBCASE("unindexed tensor")
+    {
+        map.erase("second");
+        map["missing"] = "second.safetensors";
+    }
+    SUBCASE("duplicate tensor across shards")
+    {
+        std::filesystem::copy_file(first.path(), second.path(),
+                                   std::filesystem::copy_options::overwrite_existing);
+    }
+    SUBCASE("missing shard")
+    {
+        map["second"] = "missing.safetensors";
+        expected = safetensors_errc::file_open_failed;
+    }
+    SUBCASE("path outside model directory")
+    {
+        map["second"] = "../second.safetensors";
+    }
+    SUBCASE("absolute shard path")
+    {
+        map["second"] = second.path().string();
+    }
+    SUBCASE("non-string shard")
+    {
+        map["second"] = 3;
+    }
+    SUBCASE("empty map")
+    {
+        map = nlohmann::json::object();
+    }
+    SUBCASE("non-object map")
+    {
+        map = nlohmann::json::array();
+    }
+    nlohmann::json index { { "weight_map", map } };
+    SUBCASE("missing map")
+    {
+        index.erase("weight_map");
+    }
+    SUBCASE("invalid JSON")
+    {
+        std::ofstream(directory.path() / "model.safetensors.index.json") << "{";
+        CHECK(safetensors_file::open_model(directory.path()).error() == expected);
+        return;
+    }
+    std::ofstream(directory.path() / "model.safetensors.index.json") << index;
+    auto checkpoint = safetensors_file::open_model(directory.path());
+    if (!valid) {
+        REQUIRE_FALSE(checkpoint);
+        CHECK(checkpoint.error() == expected);
+        return;
+    }
+    REQUIRE(checkpoint);
+    CHECK(checkpoint->tensor_count() == 2);
+    REQUIRE(checkpoint->find("second"));
+    CHECK(checkpoint->find("second")->shape == std::vector<std::size_t> { 3 });
+    std::vector<std::byte> actual(first_data.size());
+    REQUIRE(checkpoint->read("first", actual));
+    CHECK(actual == first_data);
+    actual.resize(second_data.size());
+    REQUIRE(checkpoint->read("second", actual));
+    CHECK(actual == second_data);
+    CHECK(checkpoint->read("first", actual).error() == safetensors_errc::destination_size_mismatch);
+    CHECK(checkpoint->read("missing", actual).error() == safetensors_errc::tensor_not_found);
 }
 
 TEST_CASE("safetensors model resolution returns filesystem errors")

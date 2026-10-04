@@ -52,6 +52,7 @@ enum class safetensors_errc : std::uint8_t {
     tensor_not_found,
     destination_size_mismatch,
     ambiguous_checkpoint,
+    invalid_checkpoint_index,
 };
 
 [[nodiscard]] inline std::string_view
@@ -63,7 +64,7 @@ error_name(safetensors_errc code) noexcept
         "safetensors.invalid_tensor_metadata", "safetensors.unsupported_dtype",
         "safetensors.tensor_size_overflow",    "safetensors.invalid_data_layout",
         "safetensors.tensor_not_found",        "safetensors.destination_size_mismatch",
-        "safetensors.ambiguous_checkpoint",
+        "safetensors.ambiguous_checkpoint",    "safetensors.invalid_checkpoint_index",
     };
     const auto index = static_cast<std::size_t>(code);
     return index < names.size() ? names[index] : "safetensors.unknown_error";
@@ -74,8 +75,8 @@ public:
     [[nodiscard]] static result<safetensors_file, safetensors_errc>
     open(const std::filesystem::path& path);
 
-    // Prefer model.safetensors when present; otherwise open the sole regular
-    // *.safetensors file directly in directory. No index parsing or shard merging.
+    // Prefer model.safetensors, then shards named by model.safetensors.index.json,
+    // then the sole regular *.safetensors file directly in the directory.
     // Missing directories/files and filesystem errors return file_open_failed;
     // multiple fallback candidates return ambiguous_checkpoint. Preserve open() errors.
     [[nodiscard]] static result<safetensors_file, safetensors_errc>
@@ -88,13 +89,23 @@ public:
                                                       std::span<std::byte> destination) const;
 
 private:
+    struct source_file {
+        std::filesystem::path path;
+        std::uint64_t data_start;
+    };
+
+    struct tensor_entry {
+        safetensor_info info;
+        std::size_t file_index = 0;
+    };
+
+    safetensors_file() = default;
     safetensors_file(std::filesystem::path path,
                      std::uint64_t data_start,
-                     std::unordered_map<std::string, safetensor_info> tensors);
+                     std::unordered_map<std::string, tensor_entry> tensors);
 
-    std::filesystem::path path_;
-    std::uint64_t data_start_;
-    std::unordered_map<std::string, safetensor_info> tensors_;
+    std::vector<source_file> files_;
+    std::unordered_map<std::string, tensor_entry> tensors_;
 };
 
 } // namespace chibillm

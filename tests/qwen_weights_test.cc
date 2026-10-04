@@ -152,6 +152,9 @@ expected_qwen3_5_tensors(const qwen3_5_config& config)
           { config.vocabulary_size, config.hidden_size } },
         { "model.language_model.norm.weight", "BF16", { config.hidden_size } },
     };
+    if (!config.tie_word_embeddings)
+        tensors.push_back(
+            { "lm_head.weight", "BF16", { config.vocabulary_size, config.hidden_size } });
 
     const auto add = [&](std::size_t layer, std::string suffix, std::string dtype,
                          std::vector<std::size_t> shape) {
@@ -254,8 +257,11 @@ write_mlx_weights(std::vector<tensor_spec> tensors,
                              : -float(4 + (seed + row + group) % 4) / 2048.0F;
         };
         if (converted) {
-            spec.name.replace(0, std::string("model.language_model.").size(),
-                              "language_model.model.");
+            if (spec.name == "lm_head.weight")
+                spec.name = "language_model.lm_head.weight";
+            else
+                spec.name.replace(0, std::string("model.language_model.").size(),
+                                  "language_model.model.");
             if (spec.name.ends_with("conv1d.weight"))
                 std::swap(spec.shape[1], spec.shape[2]);
             if (spec.name.ends_with("linear_attn.norm.weight"))
@@ -423,6 +429,7 @@ write_config(const std::filesystem::path& path, const qwen3_5_config& config)
         { "rms_norm_eps", config.rms_epsilon },
         { "eos_token_id", config.eos_token_id },
         { "full_attention_interval", config.full_attention_interval },
+        { "tie_word_embeddings", config.tie_word_embeddings },
         { "layer_types", { "linear_attention", "full_attention" } },
         { "linear_conv_kernel_dim", config.linear_conv_kernel_dimension },
         { "linear_key_head_dim", config.linear_key_head_dimension },
@@ -433,6 +440,7 @@ write_config(const std::filesystem::path& path, const qwen3_5_config& config)
     text["rope_parameters"]["rope_theta"] = config.rope_theta;
     text["rope_parameters"]["partial_rotary_factor"] = config.partial_rotary_factor;
     text["rope_parameters"]["mrope_section"] = config.mrope_sections;
+    json["tie_word_embeddings"] = config.tie_word_embeddings;
     std::ofstream(path) << json;
 }
 
@@ -536,6 +544,31 @@ TEST_CASE("Qwen3.5 weights load linear and full-attention layers separately")
     const auto& full = std::get<qwen3_5_full_attention_weights>(weights->layers[1].mixer);
     CHECK(std::ranges::equal(full.qkv_packed.shape().dimensions(),
                              std::vector<std::size_t> { 12, config.hidden_size }));
+}
+
+TEST_CASE("Qwen3.5 requires a valid separate output when embeddings are untied")
+{
+    auto config = qwen3_5_test_config();
+    config.tie_word_embeddings = false;
+    auto tensors = expected_qwen3_5_tensors(config);
+    auto expected = weight_errc::missing_tensor;
+    SUBCASE("missing output")
+    {
+        std::erase_if(tensors, [](const auto& spec) { return spec.name == "lm_head.weight"; });
+    }
+    SUBCASE("wrong output shape")
+    {
+        auto found = std::ranges::find_if(
+            tensors, [](const auto& spec) { return spec.name == "lm_head.weight"; });
+        found->shape[0] += 1;
+        expected = weight_errc::tensor_shape_mismatch;
+    }
+    auto source = write_weights(std::move(tensors), "chibillm_hybrid_invalid_output.safetensors");
+    auto file = safetensors_file::open(source.path());
+    REQUIRE(file);
+    const auto validated = validate_qwen3_5_weights(*file, config);
+    REQUIRE_FALSE(validated);
+    CHECK(validated.error() == expected);
 }
 
 TEST_CASE("Qwen3.5 official 0.8B checkpoint matches the weight schema")
@@ -713,18 +746,35 @@ TEST_CASE("Qwen model runner executes a flattened multi-sequence batch")
     CHECK(rejected.error() == chibillm::model_runner_errc::inconsistent_batch);
 }
 
-TEST_CASE("Qwen3.5 factory loads a sole shard and generates with tied zero-centered output")
+TEST_CASE("Qwen3.5 factory generates with tied or sharded separate output")
 {
     auto config = qwen3_5_test_config();
     config.head_dimension = 8;
     config.mrope_sections = { 2, 1, 1 };
+    SUBCASE("sole shard with tied output") {}
+    SUBCASE("indexed shards with separate output and top-level config")
+    {
+        config.tie_word_embeddings = false;
+    }
+    const chibillm::token_id expected_token = config.tie_word_embeddings ? 4 : 6;
     temporary_model_directory directory;
     write_config(directory.path() / "config.json", config);
+    if (!config.tie_word_embeddings) {
+        std::ifstream input(directory.path() / "config.json");
+        auto json = nlohmann::json::parse(input);
+        json["text_config"].erase("tie_word_embeddings");
+        std::ofstream(directory.path() / "config.json") << json;
+    }
     write_tokenizer(directory.path());
     nlohmann::json header;
     std::vector<std::byte> data;
-    for (const auto& spec : expected_qwen3_5_tensors(config))
-        safetensors_test::add_tensor(header, data, spec.name, spec.dtype, spec.shape);
+    nlohmann::json output_header;
+    std::vector<std::byte> output_data;
+    for (const auto& spec : expected_qwen3_5_tensors(config)) {
+        const bool output = spec.name == "lm_head.weight";
+        safetensors_test::add_tensor(output ? output_header : header, output ? output_data : data,
+                                     spec.name, spec.dtype, spec.shape);
+    }
     // Zero mixers preserve the embeddings. Token 4 wins the tied projection;
     // forgetting the +1 in the final RMSNorm instead yields token 0.
     for (std::size_t token = 0; token < config.vocabulary_size; ++token) {
@@ -734,6 +784,24 @@ TEST_CASE("Qwen3.5 factory loads a sole shard and generates with tied zero-cente
     }
     temporary_file weights((directory.path() / "model-00001-of-00001.safetensors").string(), header,
                            data);
+    std::optional<temporary_file> output_shard;
+    if (!config.tie_word_embeddings) {
+        for (std::size_t token = 0; token < config.vocabulary_size; ++token) {
+            const auto value =
+                bf16::from_float(token == static_cast<std::size_t>(expected_token) ? 3.0F : 1.0F)
+                    .bits();
+            std::memcpy(output_data.data() + token * config.hidden_size * sizeof(value), &value,
+                        sizeof(value));
+        }
+        output_shard.emplace((directory.path() / "output.safetensors").string(), output_header,
+                             output_data);
+        nlohmann::json map = nlohmann::json::object();
+        for (const auto& spec : expected_qwen3_5_tensors(config))
+            map[spec.name] = spec.name == "lm_head.weight" ? "output.safetensors"
+                                                           : "model-00001-of-00001.safetensors";
+        std::ofstream(directory.path() / "model.safetensors.index.json")
+            << nlohmann::json { { "weight_map", map } };
+    }
     auto invalid_kernel =
         chibillm::load_model(directory.path(), "invalid Metal kernel", 8, 2, "tiny-hybrid");
     REQUIRE_FALSE(invalid_kernel.has_value());
@@ -777,9 +845,11 @@ TEST_CASE("Qwen3.5 factory loads a sole shard and generates with tied zero-cente
             const auto* sequence = engine->find_sequence(id);
             REQUIRE(sequence != nullptr);
             CHECK(std::ranges::equal(sequence->completion_tokens(),
-                                     std::vector<chibillm::token_id> { 4, 4, 4 }));
+                                     std::vector<chibillm::token_id> {
+                                         expected_token, expected_token, expected_token }));
             CHECK(sequence->reason() == chibillm::finish_reason::len_limit);
-            CHECK(runner.decode(sequence->completion_tokens()).value() == "eee");
+            CHECK(runner.decode(sequence->completion_tokens()).value()
+                  == (config.tie_word_embeddings ? "eee" : "ggg"));
             REQUIRE(engine->remove(id).has_value());
         }
     }
@@ -1322,6 +1392,15 @@ TEST_CASE("MLX Qwen3.5 converted weights match an independent dense checkpoint")
         bits = 8;
         c.linear_conv_kernel_dimension = 1;
     }
+    SUBCASE("Q4 separate output")
+    {
+        c.tie_word_embeddings = false;
+    }
+    SUBCASE("Q8 separate output")
+    {
+        bits = 8;
+        c.tie_word_embeddings = false;
+    }
     c.hidden_size = 64;
     c.intermediate_size = 128;
     c.vocabulary_size = 128;
@@ -1346,6 +1425,11 @@ TEST_CASE("MLX Qwen3.5 converted weights match an independent dense checkpoint")
     REQUIRE(packed);
     REQUIRE(dense);
     CHECK(chibillm::matrix_view(packed->token_embedding).quantized()->bits() == bits);
+    CHECK(packed->output.has_value() == !c.tie_word_embeddings);
+    CHECK(dense->output.has_value() == !c.tie_word_embeddings);
+    check_packed_rows(
+        *file, packed->vocabulary(),
+        { c.tie_word_embeddings ? "language_model.model.embed_tokens" : "language_model.lm_head" });
     CHECK_FALSE(packed->zero_centered_norm);
     CHECK(dense->zero_centered_norm);
     for (const auto& layer : packed->layers)

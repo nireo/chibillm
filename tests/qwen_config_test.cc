@@ -1,5 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
+#include <nlohmann/json.hpp>
 
 #include <array>
 #include <cstddef>
@@ -190,4 +191,28 @@ TEST_CASE("Qwen3 and Qwen3.5 parsers remain architecture-specific")
 
     CHECK(parse_qwen3_config(qwen3_5_json).error() == qwen_config_errc::unsupported_model_type);
     CHECK(parse_qwen3_5_config(valid_config()).error() == qwen_config_errc::unsupported_model_type);
+}
+
+TEST_CASE("Qwen3.5 reads tied embeddings from text config or the top level")
+{
+    std::ifstream input(QWEN3_5_CONFIG_FIXTURE_PATH);
+    auto config = nlohmann::json::parse(input);
+    config["text_config"].erase("tie_word_embeddings");
+    config["tie_word_embeddings"] = false;
+    auto parsed = parse_qwen3_5_config(config.dump());
+    REQUIRE(parsed);
+    CHECK_FALSE(parsed->tie_word_embeddings);
+
+    config["text_config"]["tie_word_embeddings"] = true;
+    parsed = parse_qwen3_5_config(config.dump());
+    REQUIRE(parsed);
+    CHECK(parsed->tie_word_embeddings);
+
+    config["text_config"]["tie_word_embeddings"] = "invalid";
+    CHECK(parse_qwen3_5_config(config.dump()).error() == qwen_config_errc::invalid_field);
+    config["text_config"].erase("tie_word_embeddings");
+    config["tie_word_embeddings"] = "invalid";
+    CHECK(parse_qwen3_5_config(config.dump()).error() == qwen_config_errc::invalid_field);
+    config.erase("tie_word_embeddings");
+    CHECK(parse_qwen3_5_config(config.dump()).error() == qwen_config_errc::missing_field);
 }

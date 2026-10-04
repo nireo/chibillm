@@ -78,6 +78,13 @@ struct qwen3_5_weights {
     metal_tensor final_norm;
     std::vector<qwen3_5_layer_weights> layers;
     bool zero_centered_norm = true;
+    std::optional<matrix_weight> output {};
+
+    [[nodiscard]] matrix_view
+    vocabulary() const noexcept
+    {
+        return output ? matrix_view(*output) : matrix_view(token_embedding);
+    }
 };
 
 [[nodiscard]] result<void, weight_error> validate_qwen_weights(const safetensors_file& weights,
