@@ -83,9 +83,7 @@ chibillm_metal = static_library(
   'chibillm_metal',
   [
     'src/metal/metal_context.mm',
-    'src/metal/metal_kernels_linear.mm',
-    'src/metal/metal_kernels_tensor_ops.mm',
-    'src/metal/metal_kernels_sampling.mm',
+    'src/metal/metal_kernels.mm',
     'src/metal/metal_kernels_attention.mm',
     'src/metal/metal_kernels_deltanet.mm',
     'src/tensor/deltanet.cc',

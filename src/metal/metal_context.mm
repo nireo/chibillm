@@ -1,6 +1,5 @@
 #include "metal/metal_context.h"
 #include "metal/metal_context_internal.h"
-#include "metal/metal_error.h"
 #include <Metal/Metal.h>
 
 #include <algorithm>

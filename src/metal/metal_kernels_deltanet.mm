@@ -1,4 +1,4 @@
-#include "metal/metal_dispatch_internal.h"
+#include "metal/metal_context_internal.h"
 #include "metal/metal_kernels.h"
 
 #include <algorithm>

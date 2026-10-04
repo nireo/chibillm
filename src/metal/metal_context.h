@@ -3,18 +3,85 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <initializer_list>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 
-#include "metal/metal_buffer.h"
-#include "metal/metal_error.h"
+#include "error.h"
 #include "result.h"
 
 namespace chibillm {
 
+enum class metal_errc : std::uint8_t {
+    no_device,
+    command_queue_creation_failed,
+    kernel_library_creation_failed,
+    kernel_function_not_found,
+    pipeline_creation_failed,
+    buffer_creation_failed,
+    command_buffer_creation_failed,
+    command_encoder_creation_failed,
+    invalid_input,
+    execution_failed,
+};
+
+[[nodiscard]] inline std::string_view
+error_name(metal_errc code) noexcept
+{
+    static constexpr std::array names {
+        "metal.no_device",
+        "metal.command_queue_creation_failed",
+        "metal.kernel_library_creation_failed",
+        "metal.kernel_function_not_found",
+        "metal.pipeline_creation_failed",
+        "metal.buffer_creation_failed",
+        "metal.command_buffer_creation_failed",
+        "metal.command_encoder_creation_failed",
+        "metal.invalid_input",
+        "metal.execution_failed",
+    };
+    const auto index = static_cast<std::size_t>(code);
+    return index < names.size() ? names[index] : "metal.unknown_error";
+}
+
+struct metal_error {
+    metal_errc code;
+    std::string message;
+};
+
+[[nodiscard]] inline std::string
+describe_error(const metal_error& value)
+{
+    return describe_error(value.code) + ": " + value.message;
+}
+
+class metal_context;
 class metal_kernels;
+
+// owns one cpu-visible metal buffer.
+class metal_buffer {
+public:
+    metal_buffer(const metal_buffer&) = delete;
+    metal_buffer& operator=(const metal_buffer&) = delete;
+    metal_buffer(metal_buffer&&) noexcept;
+    metal_buffer& operator=(metal_buffer&&) noexcept;
+    ~metal_buffer();
+
+    [[nodiscard]] std::size_t size_bytes() const noexcept;
+    [[nodiscard]] std::span<std::byte> bytes() noexcept;
+    [[nodiscard]] std::span<const std::byte> bytes() const noexcept;
+
+private:
+    friend class metal_context;
+    friend class metal_kernels;
+
+    struct implementation;
+
+    explicit metal_buffer(std::unique_ptr<implementation> implementation) noexcept;
+
+    std::unique_ptr<implementation> implementation_;
+};
 
 // owns the metal device, queue, kernel library, and compute pipelines.
 class metal_context {

@@ -6,9 +6,7 @@
 #include <utility>
 #include <vector>
 
-#include "metal/metal_buffer.h"
 #include "metal/metal_context.h"
-#include "metal/metal_error.h"
 #include "result.h"
 #include "tensor/types.h"
 
