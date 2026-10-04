@@ -116,7 +116,7 @@ request_body(bool stream = false)
 {
     return json({ { "model", "test-model" },
                   { "messages", json::array({ { { "role", "user" }, { "content", "hi" } } }) },
-                  { "max_completion_tokens", 2 },
+                  { "max_completion_tokens", 3 },
                   { "stream", stream } })
         .dump();
 }
@@ -183,9 +183,9 @@ TEST_CASE("OpenAI server batches concurrent requests and returns compatible chat
     CHECK(second_response->status == 200);
     const auto completion = json::parse(first_response->body);
     CHECK(completion["object"] == "chat.completion");
-    CHECK(completion["choices"][0]["message"]["content"] == "**");
+    CHECK(completion["choices"][0]["message"]["content"] == "***");
     CHECK(completion["choices"][0]["finish_reason"] == "length");
-    CHECK(completion["usage"]["total_tokens"] == 3);
+    CHECK(completion["usage"]["total_tokens"] == 4);
     CHECK(runner.largest_batch() == 2);
 
     REQUIRE(stream_response);
@@ -251,7 +251,7 @@ TEST_CASE("HTTP and SSE errors retain generation causes and allow the next reque
                 CHECK(failed->body.ends_with("data: [DONE]\n\n"));
             REQUIRE(recovered);
             CHECK(recovered->status == 200);
-            CHECK(json::parse(recovered->body)["choices"][0]["message"]["content"] == "**");
+            CHECK(json::parse(recovered->body)["choices"][0]["message"]["content"] == "***");
         }
     }
 }

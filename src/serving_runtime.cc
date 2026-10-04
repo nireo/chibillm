@@ -1,4 +1,5 @@
 #include "serving_runtime.h"
+#include <algorithm>
 #include <chrono>
 #include <deque>
 #include <thread>
@@ -7,8 +8,7 @@
 namespace chibillm {
 struct prepared_request {
     std::shared_ptr<request_state> state;
-    std::vector<token_id> prompt;
-    std::size_t max_completion_tokens;
+    seq sequence;
 };
 
 struct serving_runtime::implementation {
@@ -38,7 +38,7 @@ public:
     }
 
     result<std::shared_ptr<request_state>, generation_error>
-    submit(generation_request request)
+    enqueue(generation_request request)
     {
         auto state =
             std::make_shared<request_state>(next_id_.fetch_add(1, std::memory_order_relaxed),
@@ -47,6 +47,9 @@ public:
                                                 .count());
         {
             std::lock_guard lock(mutex_);
+            if (stopping_)
+                return fail(generation_error { .kind = generation_errc::execution_failure,
+                                               .message = "The server is shutting down." });
             if (outstanding_ >= config_.max_pending_requests) {
                 return fail(generation_error {
                     .kind = generation_errc::queue_full,
@@ -58,12 +61,6 @@ public:
             submissions_.push_back({ std::move(request), state });
         }
         changed_.notify_one();
-
-        std::unique_lock lock(state->mutex);
-        state->changed.wait(lock, [&] { return state->status != request_status::submitted; });
-        if (state->error) {
-            return fail(*state->error);
-        }
         return state;
     }
 
@@ -109,54 +106,80 @@ private:
     void
     drain_submissions()
     {
-        std::deque<submission> submissions;
+        // Bound preparation between model steps; do not tokenize a whole burst at once.
+        std::optional<submission> next;
         {
             std::lock_guard lock(mutex_);
-            submissions.swap(submissions_);
+            if (submissions_.empty())
+                return;
+            next.emplace(std::move(submissions_.front()));
+            submissions_.pop_front();
         }
 
-        for (auto& submission : submissions) {
-            auto prompt = runner_.encode_chat(submission.request.messages);
-            if (!prompt) {
-                finish_error(submission.state,
-                             { .kind = generation_errc::invalid_input,
-                               .message = "The messages could not be encoded: "
-                                   + describe_error(prompt.error()),
-                               .param = "messages",
-                               .code = std::string(error_name(prompt.error().code)) });
-                continue;
-            }
-            if (prompt->size() >= runner_.info().max_context_tokens
-                || submission.request.max_completion_tokens
-                    > runner_.info().max_context_tokens - prompt->size()) {
-                finish_error(
-                    submission.state,
-                    { .kind = generation_errc::invalid_input,
-                      .message =
-                          "The requested prompt and completion exceed the model context window.",
-                      .param = "max_completion_tokens",
-                      .code = "context_length_exceeded" });
-                continue;
-            }
-
-            auto decoder = runner_.make_decoder();
-            if (!decoder) {
-                finish_error(
-                    submission.state,
-                    { .kind = generation_errc::execution_failure,
-                      .message = "Decoder setup failed: decoder creation returned null." });
-                continue;
-            }
-            {
-                std::lock_guard lock(submission.state->mutex);
-                submission.state->decoder = std::move(decoder);
-                submission.state->prompt_tokens = prompt->size();
-                submission.state->status = request_status::ready;
-            }
-            submission.state->changed.notify_all();
-            pending_.push_back(
-                { submission.state, std::move(*prompt), submission.request.max_completion_tokens });
+        auto& submission = *next;
+        const auto context_limit =
+            std::min(runner_.info().max_context_tokens,
+                     config_.max_context_tokens.value_or(runner_.info().max_context_tokens));
+        if (submission.state->cancelled.load(std::memory_order_relaxed)) {
+            finish_cancelled(submission.state);
+            return;
         }
+        auto prompt = runner_.encode_chat(submission.request.messages);
+        if (!prompt) {
+            finish_error(
+                submission.state,
+                { .kind = generation_errc::invalid_input,
+                  .message = "The messages could not be encoded: " + describe_error(prompt.error()),
+                  .param = "messages",
+                  .code = std::string(error_name(prompt.error().code)) });
+            return;
+        }
+        if (prompt->size() >= context_limit
+            || submission.request.max_completion_tokens > context_limit - prompt->size()) {
+            finish_error(
+                submission.state,
+                { .kind = generation_errc::invalid_input,
+                  .message = "The requested prompt and completion exceed the model context window.",
+                  .param = "max_completion_tokens",
+                  .code = "context_length_exceeded" });
+            return;
+        }
+
+        auto sequence = seq::make(submission.state->id, std::move(*prompt),
+                                  { .max_new_tokens = submission.request.max_completion_tokens });
+        if (!sequence) {
+            finish_error(
+                submission.state,
+                { .kind = generation_errc::invalid_input,
+                  .message = "Sequence creation failed: " + describe_error(sequence.error()),
+                  .param = "max_completion_tokens" });
+            return;
+        }
+        if (!engine_.fits_cache(*sequence)) {
+            finish_error(
+                submission.state,
+                { .kind = generation_errc::invalid_input,
+                  .message = "The prompt and completion cannot fit in the server KV cache.",
+                  .param = "max_completion_tokens",
+                  .code = "cache_capacity_exceeded" });
+            return;
+        }
+
+        auto decoder = runner_.make_decoder();
+        if (!decoder) {
+            finish_error(submission.state,
+                         { .kind = generation_errc::execution_failure,
+                           .message = "Decoder setup failed: decoder creation returned null." });
+            return;
+        }
+        {
+            std::lock_guard lock(submission.state->mutex);
+            submission.state->decoder = std::move(decoder);
+            submission.state->prompt_tokens = sequence->prompt_token_count();
+            submission.state->status = request_status::ready;
+        }
+        submission.state->changed.notify_all();
+        pending_.push_back({ submission.state, std::move(*sequence) });
     }
 
     void
@@ -216,22 +239,11 @@ private:
     void
     admit_requests()
     {
-        while (active_.size() < config_.scheduler.max_sequences && !pending_.empty()) {
-            auto request = std::move(pending_.front());
-            pending_.pop_front();
-            auto sequence = seq::make(request.state->id, std::move(request.prompt),
-                                      {
-                                          .max_new_tokens = request.max_completion_tokens,
-                                          .ignore_eos = false,
-                                      });
-            if (!sequence) {
-                finish_error(
-                    request.state,
-                    { .kind = generation_errc::execution_failure,
-                      .message = "Sequence creation failed: " + describe_error(sequence.error()) });
-                continue;
-            }
-            auto added = engine_.add(std::move(*sequence));
+        while (!pending_.empty()) {
+            auto& request = pending_.front();
+            auto added = engine_.try_add(request.sequence);
+            if (added && *added == admission_result::deferred)
+                break; // FIFO: later requests do not bypass the oldest pending request.
             if (!added) {
                 finish_error(request.state,
                              {
@@ -239,9 +251,16 @@ private:
                                  .message = "The request could not be admitted: "
                                      + describe_error(added.error()),
                              });
-                continue;
+            } else if (*added == admission_result::too_large) {
+                finish_error(request.state,
+                             { .kind = generation_errc::invalid_input,
+                               .message = "The request exceeds the server KV cache capacity.",
+                               .param = "max_completion_tokens",
+                               .code = "cache_capacity_exceeded" });
+            } else {
+                active_.emplace(request.state->id, request.state);
             }
-            active_.emplace(request.state->id, std::move(request.state));
+            pending_.pop_front();
         }
     }
 
@@ -354,7 +373,15 @@ private:
                 break;
             }
         }
-        drain_submissions();
+        std::deque<submission> submissions;
+        {
+            std::lock_guard lock(mutex_);
+            submissions.swap(submissions_);
+        }
+        for (const auto& submission : submissions)
+            finish_error(submission.state,
+                         { .kind = generation_errc::execution_failure,
+                           .message = "The server is shutting down." });
         fail_all("The server is shutting down.");
     }
 
@@ -391,7 +418,21 @@ serving_runtime::~serving_runtime() = default;
 result<std::shared_ptr<request_state>, generation_error>
 serving_runtime::submit(generation_request request)
 {
-    return implementation_->submit(std::move(request));
+    auto submitted = enqueue(std::move(request));
+    if (!submitted)
+        return fail(submitted.error());
+    auto state = *submitted;
+    std::unique_lock lock(state->mutex);
+    state->changed.wait(lock, [&] { return state->status != request_status::submitted; });
+    if (state->error)
+        return fail(*state->error);
+    return state;
+}
+
+result<std::shared_ptr<request_state>, generation_error>
+serving_runtime::enqueue(generation_request request)
+{
+    return implementation_->enqueue(std::move(request));
 }
 
 void

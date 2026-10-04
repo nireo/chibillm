@@ -35,6 +35,7 @@ struct sequence_resources {
 class model_state {
 public:
     virtual ~model_state() = default;
+    // Ensure capacity for at least token_count tokens; smaller retries keep existing capacity.
     virtual result<void, state_error> reserve(seq_id id, std::size_t token_count) = 0;
     virtual void release(seq_id id) noexcept = 0;
 

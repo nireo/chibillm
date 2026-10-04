@@ -39,7 +39,7 @@ TEST_CASE("model batch builds chunked prefill and subsequent decode batches")
     auto config = test_config();
     config.max_batch_tokens = 2;
     auto engine = scheduler::make(config, 99);
-    auto sequence = seq::make(1, { 10, 20, 30 }, generation_params {});
+    auto sequence = seq::make(1, { 10, 20, 30 }, generation_params { .max_new_tokens = 4 });
     REQUIRE(engine.has_value());
     REQUIRE(sequence.has_value());
     REQUIRE(engine->add(std::move(*sequence)).has_value());
@@ -60,7 +60,7 @@ TEST_CASE("model batch builds chunked prefill and subsequent decode batches")
     CHECK(first_batch->items[0].token_offset == 0);
     CHECK(first_batch->items[0].token_count == 2);
     CHECK_FALSE(first_batch->items[0].logits_index.has_value());
-    CHECK(first_batch->items[0].block_table.size() == 2);
+    CHECK(first_batch->items[0].block_table.size() == 1);
 
     const auto* unchanged = engine->find_sequence(1);
     REQUIRE(unchanged != nullptr);
@@ -104,8 +104,8 @@ TEST_CASE("ragged prefill is flattened in scheduled order")
     config.max_sequences = 2;
     config.max_batch_tokens = 3;
     auto engine = scheduler::make(config, 99);
-    auto first = seq::make(1, { 10, 11 }, generation_params {});
-    auto second = seq::make(2, { 20, 21 }, generation_params {});
+    auto first = seq::make(1, { 10, 11 }, generation_params { .max_new_tokens = 4 });
+    auto second = seq::make(2, { 20, 21 }, generation_params { .max_new_tokens = 4 });
     REQUIRE(engine.has_value());
     REQUIRE(first.has_value());
     REQUIRE(second.has_value());
@@ -149,7 +149,7 @@ TEST_CASE("model batch rejects invalid scheduled batches")
 
     SUBCASE("reservation mismatch and duplicate ids")
     {
-        auto sequence = seq::make(1, { 10 }, generation_params {});
+        auto sequence = seq::make(1, { 10 }, generation_params { .max_new_tokens = 4 });
         REQUIRE(sequence.has_value());
         REQUIRE(engine->add(std::move(*sequence)).has_value());
 

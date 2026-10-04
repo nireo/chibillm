@@ -11,6 +11,7 @@ namespace chibillm {
 struct serving_config {
     scheduler_config scheduler { .kv_block_count = 64 };
     std::size_t max_pending_requests { 64 };
+    std::optional<std::size_t> max_context_tokens;
 };
 enum class generation_errc {
     invalid_input,
@@ -60,6 +61,8 @@ public:
     static result<std::unique_ptr<serving_runtime>, inference_engine_error> make(model_runner&,
                                                                                  serving_config);
     ~serving_runtime();
+    // Queue without waiting; preparation and completion are reported through request_state.
+    result<std::shared_ptr<request_state>, generation_error> enqueue(generation_request);
     result<std::shared_ptr<request_state>, generation_error> submit(generation_request);
     void cancel(const std::shared_ptr<request_state>&) noexcept;
 

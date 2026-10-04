@@ -236,6 +236,28 @@ TEST_CASE("CLI defaults to Qwen3.5 and accepts an explicit model directory")
     CHECK(settings->model_directory == "qwen_model");
 }
 
+TEST_CASE("CLI separates the server cache pool from per-request context")
+{
+    char program[] = "chibillm";
+    char serve[] = "--serve";
+    char cache[] = "--kv-cache-tokens";
+    char capacity[] = "131072";
+    char invalid[] = "17";
+    char* args[] = { program, serve, cache, capacity };
+    auto settings = chibillm::parse_cli_options(4, args);
+    REQUIRE(settings);
+    CHECK(settings->context_length == 32768);
+    CHECK(settings->kv_cache_tokens == 131072);
+    CHECK_FALSE(chibillm::parse_cli_options(3, args));
+    args[3] = invalid;
+    CHECK_FALSE(chibillm::parse_cli_options(4, args));
+    char* repl_args[] = { program, cache, capacity };
+    CHECK_FALSE(chibillm::parse_cli_options(3, repl_args));
+    char* default_args[] = { program };
+    REQUIRE(chibillm::parse_cli_options(1, default_args));
+    CHECK_FALSE(chibillm::parse_cli_options(1, default_args)->kv_cache_tokens);
+}
+
 TEST_CASE("CLI accepts efficient REPL display controls")
 {
     char program[] = "chibillm";

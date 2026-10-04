@@ -9,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 #include "block_manager.h"
@@ -30,6 +31,14 @@ struct scheduler_config {
     std::size_t max_batch_tokens { 128 };
     std::size_t kv_block_count { 256 };
     std::size_t kv_block_size { 16 };
+    // Applied only when other sequences compete for inference time.
+    std::size_t prefill_chunk_tokens { 64 };
+};
+
+enum class admission_result : std::uint8_t {
+    admitted,
+    deferred,
+    too_large,
 };
 
 struct sequence_update {
@@ -72,6 +81,9 @@ enum class scheduler_errc : std::uint8_t {
 
     block_manager_failure,
     sequence_failure,
+    invalid_prefill_chunk_tokens,
+    admission_deferred,
+    sequence_exceeds_cache_capacity,
 };
 
 [[nodiscard]] inline std::string_view
@@ -85,7 +97,8 @@ error_name(scheduler_errc code) noexcept
         "scheduler.no_batch_in_flight",       "scheduler.batch_id_mismatch",
         "scheduler.result_count_mismatch",    "scheduler.no_runnable_sequences",
         "scheduler.cache_capacity_exhausted", "scheduler.block_manager_failure",
-        "scheduler.sequence_failure",
+        "scheduler.sequence_failure",         "scheduler.invalid_prefill_chunk_tokens",
+        "scheduler.admission_deferred",       "scheduler.sequence_exceeds_cache_capacity",
     };
     const auto index = static_cast<std::size_t>(code);
     return index < names.size() ? names[index] : "scheduler.unknown_error";
@@ -128,7 +141,13 @@ public:
         return *state_;
     }
 
-    // accepts a pristine waiting sequence.
+    [[nodiscard]] bool fits_cache(const seq& sequence) const noexcept;
+
+    // Only admitted moves the pristine sequence; pressure leaves it with the caller.
+    // Admission, like cancellation, is valid only between model batches.
+    [[nodiscard]] result<admission_result, scheduler_error> try_add(seq& sequence);
+
+    // Strict admission for callers that do not maintain a pending queue.
     [[nodiscard]] result<void, scheduler_error> add(seq sequence);
 
     // returns one prefill or decode reservation.
@@ -157,6 +176,15 @@ private:
     void rollback_reservations(const scheduled_batch& batch) noexcept;
 
     void assert_invariants() const noexcept;
+
+    // Unvisited members of a decode round are the first remaining entries in running_.
+    struct prefill_turn {};
+
+    struct decode_round {
+        std::size_t remaining;
+    };
+
+    std::variant<prefill_turn, decode_round> turn_ { prefill_turn {} };
 
     scheduler_config config_;
     token_id eos_token_;

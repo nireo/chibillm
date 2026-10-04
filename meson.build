@@ -175,7 +175,7 @@ foreach spec : [
   {'name': 'scheduler', 'sources': ['tests/scheduler_test.cc'], 'library': chibillm_core},
   {'name': 'model batch', 'sources': ['tests/model_batch_test.cc'], 'library': chibillm_core},
   {'name': 'inference engine', 'sources': ['tests/inference_engine_test.cc', 'tests/fake_model_runner.cc'], 'library': chibillm_core},
-  {'name': 'server', 'sources': ['tests/server_test.cc'], 'library': chibillm_server, 'deps': [cpp_httplib_dep, nlohmann_json_dep]},
+  {'name': 'server', 'sources': ['tests/server_test.cc', 'tests/serving_runtime_test.cc'], 'library': chibillm_server, 'deps': [cpp_httplib_dep, nlohmann_json_dep]},
   {'name': 'qwen hybrid state', 'sources': ['tests/qwen3_5_model_state_test.cc'], 'library': chibillm_qwen},
   {'name': 'qwen hybrid layers', 'sources': ['tests/qwen3_5_layer_test.cc'], 'library': chibillm_qwen},
   {'name': 'qwen config', 'sources': ['tests/qwen_config_test.cc'], 'library': chibillm_qwen, 'deps': [nlohmann_json_dep]},

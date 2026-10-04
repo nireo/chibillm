@@ -153,7 +153,7 @@ TEST_CASE("runner failures abort the scheduler reservation")
                             inference_engine_errc expected, std::string_view detail) {
         stub_model_runner runner(std::move(response));
         auto engine = inference_engine::make(test_config(), runner);
-        auto sequence = seq::make(1, { 10 }, generation_params {});
+        auto sequence = seq::make(1, { 10 }, generation_params { .max_new_tokens = 4 });
         REQUIRE(engine.has_value());
         REQUIRE(sequence.has_value());
         REQUIRE(engine->add(std::move(*sequence)).has_value());

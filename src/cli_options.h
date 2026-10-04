@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <iosfwd>
+#include <optional>
 #include <string>
 
 #include "result.h"
@@ -16,6 +17,7 @@ struct cli_options {
     std::filesystem::path metrics_jsonl;
     std::size_t context_length { 32768 };
     std::size_t max_tokens { 8192 };
+    std::optional<std::size_t> kv_cache_tokens;
     bool serve { false };
     bool stream { true };
     bool progress { true };

@@ -17,13 +17,17 @@ namespace chibillm {
 namespace {
 
 int
-run_server(model_runner& runner, scheduler_config config, std::size_t max_tokens)
+run_server(model_runner& runner,
+           scheduler_config config,
+           std::size_t max_tokens,
+           std::size_t context_length)
 {
-    auto server = openai_server::make(runner,
-                                      {
-                                          .runtime = { .scheduler = config },
-                                          .default_max_completion_tokens = max_tokens,
-                                      });
+    auto server = openai_server::make(
+        runner,
+        {
+            .runtime = { .scheduler = config, .max_context_tokens = context_length },
+            .default_max_completion_tokens = max_tokens,
+        });
     if (!server) {
         std::cerr << "failed to start the HTTP server: " << describe_error(server.error()) << '\n';
         return 1;
@@ -50,14 +54,18 @@ run_application(const cli_options& settings)
     }
     constexpr auto kv_block_size = cli_options::kv_block_size;
     const auto& model_directory = settings.model_directory;
-    const auto requested_blocks = settings.context_length / kv_block_size;
+    const auto requested_blocks =
+        settings.kv_cache_tokens.value_or(settings.context_length) / kv_block_size;
+    // Loading records an upper bound; make_state allocates the actual shared pool below.
+    const auto model_capacity_blocks =
+        std::max(requested_blocks, settings.context_length / kv_block_size);
     const auto load_started = std::chrono::steady_clock::now();
     auto model_id = model_directory.lexically_normal().filename().string();
     if (model_id.empty()) {
         model_id = "chibillm-qwen";
     }
-    auto runner = load_model(model_directory, metal_kernel_source, requested_blocks, kv_block_size,
-                             std::move(model_id));
+    auto runner = load_model(model_directory, metal_kernel_source, model_capacity_blocks,
+                             kv_block_size, std::move(model_id));
     if (!runner) {
         std::cerr
             << (runner.error() == model_load_errc::unsupported_architecture
@@ -69,12 +77,15 @@ run_application(const cli_options& settings)
             << '\n';
         return 1;
     }
-    const auto context_length = (*runner)->info().max_context_tokens;
+    const auto context_length =
+        std::min(settings.context_length, (*runner)->info().max_context_tokens);
     if (context_length < 2) {
         std::cerr << "model context is too small for generation\n";
         return 1;
     }
-    const auto kv_block_count = (context_length + kv_block_size - 1) / kv_block_size;
+    const auto kv_block_count = settings.kv_cache_tokens
+        ? requested_blocks
+        : (context_length + kv_block_size - 1) / kv_block_size;
     // A single chat can use larger matmul batches; serving keeps shorter
     // reservations so concurrent requests can take turns.
     const scheduler_config config {
@@ -99,7 +110,7 @@ run_application(const cli_options& settings)
         << max_tokens
         << " tok\n";
     if (settings.serve)
-        return run_server(**runner, config, max_tokens);
+        return run_server(**runner, config, max_tokens, context_length);
 
     return run_repl(**runner, config, settings.max_tokens, settings.stream, settings.progress,
                     metrics_file.is_open() ? &metrics_file : nullptr);

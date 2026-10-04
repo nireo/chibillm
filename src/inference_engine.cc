@@ -55,6 +55,21 @@ inference_engine::add(seq sequence)
     return {};
 }
 
+bool
+inference_engine::fits_cache(const seq& sequence) const noexcept
+{
+    return scheduler_.fits_cache(sequence);
+}
+
+result<admission_result, inference_engine_error>
+inference_engine::try_add(seq& sequence)
+{
+    auto admitted = scheduler_.try_add(sequence);
+    if (!admitted)
+        return fail(inference_engine_errc::sequence_add_failed, admitted.error());
+    return *admitted;
+}
+
 result<std::vector<sequence_update>, inference_engine_error>
 inference_engine::step()
 {

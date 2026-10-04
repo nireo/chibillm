@@ -7,6 +7,7 @@
 #include "tensor/deltanet.h"
 
 #include <algorithm>
+#include <array>
 #include <limits>
 
 using namespace chibillm;
@@ -184,7 +185,9 @@ TEST_CASE("hybrid reservations grow without resetting and release returns both m
     CHECK(state->resources(3).blocks.empty());
     CHECK(state->reserve(1, 5).error() == state_errc::capacity_exhausted);
     CHECK(state->resources(1).blocks.size() == 2);
-    CHECK(state->reserve(1, 1).error() == state_errc::invalid_reservation);
+    REQUIRE(state->reserve(1, 1)); // A smaller retry retains pages and recurrent memory.
+    CHECK(state->resources(1).blocks.size() == 2);
+    check_value(first->recurrent, 4);
     state->release(1);
     state->release(1);
     CHECK_FALSE(state->committed_tokens(1));
@@ -365,6 +368,44 @@ TEST_CASE(
     REQUIRE(engine->abort(scheduled->id)); // Abort before begin_execution is valid.
     REQUIRE(engine->cancel(1));
     CHECK(state->sequence_count() == 0);
+}
+
+TEST_CASE("hybrid state retries a smaller prompt chunk after another request arrives")
+{
+    const auto& context = test_context();
+    auto storage = make_state(context);
+    auto* state = storage.get();
+    auto engine = scheduler::make({ .max_sequences = 2,
+                                    .max_batch_tokens = 4,
+                                    .kv_block_count = 8,
+                                    .kv_block_size = 2,
+                                    .prefill_chunk_tokens = 1 },
+                                  99, std::move(storage));
+    REQUIRE(engine);
+    auto first = seq::make(1, { 1, 2, 3, 4, 5 }, { .max_new_tokens = 2 });
+    REQUIRE(first);
+    REQUIRE(engine->add(std::move(*first)));
+    auto scheduled = engine->schedule();
+    REQUIRE(scheduled);
+    auto batch = build_model_batch(*scheduled, *engine);
+    REQUIRE(batch);
+    REQUIRE(engine->begin_execution(*batch));
+    execute(context, *state, *batch);
+    REQUIRE(engine->abort(scheduled->id));
+    auto newcomer = seq::make(2, { 1 }, { .max_new_tokens = 1 });
+    REQUIRE(newcomer);
+    REQUIRE(engine->add(std::move(*newcomer)));
+    scheduled = engine->schedule();
+    REQUIRE(scheduled);
+    CHECK(scheduled->items[0].token_count == 1);
+    check_value(state->linear_state(1, 0)->recurrent, 0);
+    batch = build_model_batch(*scheduled, *engine);
+    REQUIRE(batch);
+    REQUIRE(engine->begin_execution(*batch));
+    execute(context, *state, *batch);
+    REQUIRE(engine->complete(scheduled->id, std::array<token_id, 1> { 42 }));
+    CHECK(state->committed_tokens(1) == 1);
+    CHECK_FALSE(state->committed_tokens(2));
 }
 
 TEST_CASE("hybrid geometry rejects zero, non-hybrid, and overflowing state layouts")

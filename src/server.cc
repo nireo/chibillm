@@ -273,6 +273,7 @@ openai_server::make(model_runner& runner, server_config config)
         || config.runtime.scheduler.max_batch_tokens == 0
         || config.runtime.scheduler.kv_block_count == 0
         || config.runtime.scheduler.kv_block_size == 0
+        || (config.runtime.max_context_tokens && *config.runtime.max_context_tokens == 0)
         || config.default_max_completion_tokens == 0) {
         return fail(server_errc::invalid_config);
     }

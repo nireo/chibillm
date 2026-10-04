@@ -36,15 +36,12 @@ block_manager::reserve(seq_id id, std::size_t tokens)
         return fail(state_errc::invalid_reservation);
     const auto required = 1 + (tokens - 1) / block_size_;
     const auto existing = resources(id).blocks.size();
-    if (required < existing)
-        return fail(state_errc::invalid_reservation);
+    if (required <= existing)
+        return {};
 
     const auto additional = required - existing;
     if (additional > free_.size())
         return fail(state_errc::capacity_exhausted);
-    if (!additional)
-        return {};
-
     auto& table = tables_[id];
     table.reserve(required);
     for (std::size_t i = 0; i < additional; ++i) {

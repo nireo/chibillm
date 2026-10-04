@@ -11,6 +11,8 @@ print_usage(std::ostream& output)
 {
     output << "Usage: chibillm [--serve] [--context-length N] [--max-tokens N] [model-directory]\n"
               "  --context-length N  Prompt + output capacity (default: 32768; multiple of 16)\n"
+              "  --kv-cache-tokens N Shared server KV capacity (default: context length; multiple "
+              "of 16)\n"
               "  --max-tokens N      Reply limit / server default (default: 8192)\n"
               "  --serve             Start the HTTP server on 127.0.0.1:8000\n"
               "  --no-stream         Print REPL replies only when complete\n"
@@ -40,7 +42,9 @@ parse_cli_options(int argc, char** argv)
             settings.metrics_jsonl = argv[i];
         } else if (arg == "--serve") {
             settings.serve = true;
-        } else if (arg == "--context-length" || arg == "--max-tokens") {
+        } else if (arg == "--context-length"
+                   || arg == "--max-tokens"
+                   || arg == "--kv-cache-tokens") {
             std::size_t value = 0;
             if (++i >= argc)
                 return fail("missing value for " + std::string(arg));
@@ -49,12 +53,14 @@ parse_cli_options(int argc, char** argv)
             if (parsed.ec != std::errc {}
                 || parsed.ptr != text.data() + text.size()
                 || value == 0
-                || (arg == "--context-length" && value % cli_options::kv_block_size != 0)) {
+                || (arg != "--max-tokens" && value % cli_options::kv_block_size != 0)) {
                 return fail(
                     "invalid token limit for " + std::string(arg) + ": " + std::string(text));
             }
             if (arg == "--context-length")
                 settings.context_length = value;
+            else if (arg == "--kv-cache-tokens")
+                settings.kv_cache_tokens = value;
             else
                 settings.max_tokens = value;
         } else if (arg.starts_with('-') || has_directory) {
@@ -66,6 +72,8 @@ parse_cli_options(int argc, char** argv)
     }
     if (settings.serve && !settings.metrics_jsonl.empty())
         return fail("--metrics-jsonl currently supports REPL mode only");
+    if (settings.kv_cache_tokens && !settings.serve)
+        return fail("--kv-cache-tokens requires --serve");
     return settings;
 }
 

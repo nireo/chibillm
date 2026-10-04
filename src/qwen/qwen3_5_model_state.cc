@@ -136,8 +136,8 @@ qwen3_5_model_state::reserve(seq_id id, std::size_t tokens)
 
     auto found = sequences_.find(id);
     const bool exists = found != sequences_.end();
-    if (exists && tokens < found->second.reserved_tokens)
-        return fail(state_errc::invalid_reservation);
+    if (exists && tokens <= found->second.reserved_tokens)
+        return {};
 
     const auto required = 1 + (tokens - 1) / pages_.block_size();
     const auto existing = pages_.resources(id).blocks.size();

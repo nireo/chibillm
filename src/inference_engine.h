@@ -61,6 +61,8 @@ public:
     [[nodiscard]] const seq* find_sequence(seq_id id) const noexcept;
 
     [[nodiscard]] result<void, inference_engine_error> add(seq sequence);
+    [[nodiscard]] bool fits_cache(const seq& sequence) const noexcept;
+    [[nodiscard]] result<admission_result, inference_engine_error> try_add(seq& sequence);
     [[nodiscard]] result<std::vector<sequence_update>, inference_engine_error> step();
     [[nodiscard]] result<void, inference_engine_error> cancel(seq_id id);
     [[nodiscard]] result<void, inference_engine_error> remove(seq_id id);
