@@ -286,7 +286,7 @@ validate_quantization(const json& object)
         std::size_t bits, group;
         CL_TRY_ASSIGN(bits, required_size(*found, "bits"));
         CL_TRY_ASSIGN(group, required_size(*found, "group_size"));
-        if (bits != 4 || group != 64)
+        if ((bits != 4 && bits != 8) || group != 64)
             return fail(qwen_config_errc::unsupported_configuration);
         if (found->contains("mode"))
             CL_TRY(require_string_value(*found, "mode", "affine"));

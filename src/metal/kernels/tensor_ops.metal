@@ -37,16 +37,16 @@ embedding_bf16(device const int* token_ids [[buffer(0)]],
 }
 
 kernel void
-embedding_q4(device const int* token_ids [[buffer(0)]],
-             device const uint* weight [[buffer(1)]],
-             device float* output [[buffer(2)]],
-             constant uint& token_count [[buffer(3)]],
-             constant uint& hidden_size [[buffer(4)]],
-             device const bf16_storage* scales [[buffer(5)]],
-             device const bf16_storage* offsets [[buffer(6)]],
-             uint2 position [[thread_position_in_grid]])
+embedding_affine(device const int* token_ids [[buffer(0)]],
+                 device const uint* weight [[buffer(1)]],
+                 device float* output [[buffer(2)]],
+                 constant uint& token_count [[buffer(3)]],
+                 constant uint& hidden_size [[buffer(4)]],
+                 device const bf16_storage* scales [[buffer(5)]],
+                 device const bf16_storage* offsets [[buffer(6)]],
+                 uint2 position [[thread_position_in_grid]])
 {
-    embedding_impl(token_ids, q4_matrix { weight, scales, offsets, hidden_size }, output,
+    embedding_impl(token_ids, affine_matrix { weight, scales, offsets, hidden_size }, output,
                    token_count, hidden_size, position);
 }
 

@@ -44,8 +44,8 @@ metal_kernels::dispatch_projection(const metal_buffer& input,
             dense = &*scratch;
             const auto columns = static_cast<std::uint32_t>(input_features);
             CL_TRY(implementation_->dispatch(
-                "expand_q4_bf16", [&](id<MTLComputeCommandEncoder> encoder) {
-                    const auto pipeline = implementation_->expand_q4_bf16_pipeline;
+                "expand_affine_bf16", [&](id<MTLComputeCommandEncoder> encoder) {
+                    const auto pipeline = implementation_->affine[quantized->bits() == 8].expand;
                     [encoder setComputePipelineState:pipeline];
                     bind_buffers(encoder, 0, quantized->packed().buffer().implementation_->buffer,
                                  quantized->scales().buffer().implementation_->buffer,
@@ -69,8 +69,8 @@ metal_kernels::dispatch_projection(const metal_buffer& input,
             return {};
         }
 
-        const auto pipeline = residual ? implementation_->linear_add_q4_decode_pipeline
-                                       : implementation_->linear_split_q4_decode_pipeline;
+        const auto& pipelines = implementation_->affine[quantized->bits() == 8];
+        const auto pipeline = residual ? pipelines.linear_add : pipelines.linear_split;
         const auto simd_width = static_cast<std::size_t>(pipeline.threadExecutionWidth);
         auto threads = std::min(std::size_t(64),
                                 static_cast<std::size_t>(pipeline.maxTotalThreadsPerThreadgroup));
@@ -83,7 +83,7 @@ metal_kernels::dispatch_projection(const metal_buffer& input,
         const auto group_outputs = static_cast<std::uint32_t>(outputs_per_group);
         const auto lanes = static_cast<std::uint32_t>(simd_width);
         return implementation_->dispatch(
-            residual ? "linear_q4_add" : "linear_q4_split",
+            residual ? "linear_affine_add" : "linear_affine_split",
             [&](id<MTLComputeCommandEncoder> encoder) {
                 [encoder setComputePipelineState:pipeline];
                 bind_buffers(encoder, 0, input.implementation_->buffer,
@@ -278,7 +278,7 @@ metal_kernels::dispatch_embedding(const metal_buffer& token_ids,
         const auto kernel_token_count = static_cast<std::uint32_t>(token_count);
         const auto kernel_hidden_size = static_cast<std::uint32_t>(hidden_size);
 
-        const auto pipeline = quantized ? implementation_->embedding_q4_pipeline
+        const auto pipeline = quantized ? implementation_->affine[quantized->bits() == 8].embedding
                                         : implementation_->embedding_bf16_pipeline;
         return implementation_->dispatch("embedding", [&](id<MTLComputeCommandEncoder> encoder) {
             [encoder setComputePipelineState:pipeline];
@@ -327,7 +327,7 @@ metal_kernels::dispatch_greedy_vocabulary(const metal_buffer& hidden_states,
         constexpr std::size_t thread_count = 256;
         constexpr auto outputs_per_threadgroup = greedy_argmax_outputs_per_threadgroup;
         const auto projection_pipeline = quantized
-            ? implementation_->linear_q4_partial_argmax_pipeline
+            ? implementation_->affine[quantized->bits() == 8].partial_argmax
             : implementation_->linear_bf16_partial_argmax_pipeline;
         const auto simd_width = static_cast<std::size_t>(projection_pipeline.threadExecutionWidth);
         const auto simdgroup_count = thread_count / simd_width;

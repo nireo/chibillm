@@ -87,23 +87,24 @@ linear_add_bf16_decode(device const float* input [[buffer(0)]],
 }
 
 kernel void
-linear_add_q4_decode(device const float* input [[buffer(0)]],
-                     device const uint* weight [[buffer(1)]],
-                     device const float* residual [[buffer(2)]],
-                     device float* output [[buffer(3)]],
-                     constant uint& input_features [[buffer(4)]],
-                     constant uint& output_features [[buffer(5)]],
-                     constant uint& outputs_per_threadgroup [[buffer(6)]],
-                     constant uint& simd_width [[buffer(7)]],
-                     uint lane [[thread_index_in_simdgroup]],
-                     uint simdgroup [[simdgroup_index_in_threadgroup]],
-                     device const bf16_storage* scales [[buffer(8)]],
-                     device const bf16_storage* offsets [[buffer(9)]],
-                     uint3 threadgroup_position [[threadgroup_position_in_grid]])
+linear_add_affine_decode(device const float* input [[buffer(0)]],
+                         device const uint* weight [[buffer(1)]],
+                         device const float* residual [[buffer(2)]],
+                         device float* output [[buffer(3)]],
+                         constant uint& input_features [[buffer(4)]],
+                         constant uint& output_features [[buffer(5)]],
+                         constant uint& outputs_per_threadgroup [[buffer(6)]],
+                         constant uint& simd_width [[buffer(7)]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint simdgroup [[simdgroup_index_in_threadgroup]],
+                         device const bf16_storage* scales [[buffer(8)]],
+                         device const bf16_storage* offsets [[buffer(9)]],
+                         uint3 threadgroup_position [[threadgroup_position_in_grid]])
 {
-    linear_add_decode_impl(input, q4_matrix { weight, scales, offsets, input_features }, residual,
-                           output, input_features, output_features, outputs_per_threadgroup,
-                           simd_width, lane, simdgroup, threadgroup_position);
+    linear_add_decode_impl(input, affine_matrix { weight, scales, offsets, input_features },
+                           residual, output, input_features, output_features,
+                           outputs_per_threadgroup, simd_width, lane, simdgroup,
+                           threadgroup_position);
 }
 
 template <typename Matrix>
@@ -233,39 +234,39 @@ linear_split_bf16_decode(device const float* input [[buffer(0)]],
 }
 
 kernel void
-linear_split_q4_decode(device const float* input [[buffer(0)]],
-                       device const uint* weight [[buffer(1)]],
-                       device float* output_a [[buffer(2)]],
-                       device float* output_b [[buffer(3)]],
-                       device float* output_c [[buffer(4)]],
-                       constant uint& input_features [[buffer(5)]],
-                       constant uint& width_a [[buffer(6)]],
-                       constant uint& width_b [[buffer(7)]],
-                       constant uint& width_c [[buffer(8)]],
-                       constant uint& outputs_per_threadgroup [[buffer(9)]],
-                       constant uint& simd_width [[buffer(10)]],
-                       uint lane [[thread_index_in_simdgroup]],
-                       uint simdgroup [[simdgroup_index_in_threadgroup]],
-                       device const bf16_storage* scales [[buffer(11)]],
-                       device const bf16_storage* offsets [[buffer(12)]],
-                       uint3 threadgroup_position [[threadgroup_position_in_grid]])
+linear_split_affine_decode(device const float* input [[buffer(0)]],
+                           device const uint* weight [[buffer(1)]],
+                           device float* output_a [[buffer(2)]],
+                           device float* output_b [[buffer(3)]],
+                           device float* output_c [[buffer(4)]],
+                           constant uint& input_features [[buffer(5)]],
+                           constant uint& width_a [[buffer(6)]],
+                           constant uint& width_b [[buffer(7)]],
+                           constant uint& width_c [[buffer(8)]],
+                           constant uint& outputs_per_threadgroup [[buffer(9)]],
+                           constant uint& simd_width [[buffer(10)]],
+                           uint lane [[thread_index_in_simdgroup]],
+                           uint simdgroup [[simdgroup_index_in_threadgroup]],
+                           device const bf16_storage* scales [[buffer(11)]],
+                           device const bf16_storage* offsets [[buffer(12)]],
+                           uint3 threadgroup_position [[threadgroup_position_in_grid]])
 {
-    linear_split_decode_impl(input, q4_matrix { weight, scales, offsets, input_features }, output_a,
-                             output_b, output_c, input_features, width_a, width_b, width_c,
-                             outputs_per_threadgroup, simd_width, lane, simdgroup,
+    linear_split_decode_impl(input, affine_matrix { weight, scales, offsets, input_features },
+                             output_a, output_b, output_c, input_features, width_a, width_b,
+                             width_c, outputs_per_threadgroup, simd_width, lane, simdgroup,
                              threadgroup_position);
 }
 
 kernel void
-expand_q4_bf16(device const uint* packed [[buffer(0)]],
-               device const bf16_storage* scales [[buffer(1)]],
-               device const bf16_storage* offsets [[buffer(2)]],
-               device bf16_storage* output [[buffer(3)]],
-               constant uint& columns [[buffer(4)]],
-               uint2 position [[thread_position_in_grid]])
+expand_affine_bf16(device const uint* packed [[buffer(0)]],
+                   device const bf16_storage* scales [[buffer(1)]],
+                   device const bf16_storage* offsets [[buffer(2)]],
+                   device bf16_storage* output [[buffer(3)]],
+                   constant uint& columns [[buffer(4)]],
+                   uint2 position [[thread_position_in_grid]])
 {
     if (position.x < columns) {
-        const q4_matrix weight { packed, scales, offsets, columns };
+        const affine_matrix weight { packed, scales, offsets, columns };
         output[ulong(position.y) * columns + position.x] =
             store_bf16(weight.load(position.y, position.x));
     }

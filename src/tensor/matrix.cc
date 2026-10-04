@@ -10,10 +10,12 @@ result<quantized_matrix, matrix_error>
 quantized_matrix::from_packed(tensor_shape shape,
                               metal_tensor packed,
                               metal_tensor scales,
-                              metal_tensor offsets)
+                              metal_tensor offsets,
+                              std::uint32_t bits)
 {
-    if (shape.rank() != 2 || shape.dimensions()[1] % group_size != 0)
+    if ((bits != 4 && bits != 8) || shape.rank() != 2 || shape.dimensions()[1] % group_size != 0)
         return fail(matrix_errc::invalid_layout);
+    const auto values_per_word = 32 / bits;
     const auto rows = shape.dimensions()[0], columns = shape.dimensions()[1];
     const auto matches = [](const metal_tensor& tensor, dtype type, std::size_t n, std::size_t k) {
         const auto& descriptor = tensor.descriptor();
@@ -36,12 +38,13 @@ quantized_matrix::from_packed(tensor_shape shape,
         }
     }
     return quantized_matrix(std::move(shape), std::move(packed), std::move(scales),
-                            std::move(offsets));
+                            std::move(offsets), bits);
 }
 
 result<quantized_matrix, matrix_error>
 quantized_matrix::quantize(const metal_context& context, const metal_tensor& source)
 {
+    constexpr std::size_t values_per_word = 8;
     const auto& shape = source.descriptor().shape();
     if (shape.rank() != 2
         || source.descriptor().type() != dtype::bf16

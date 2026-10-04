@@ -104,28 +104,28 @@ linear_bf16_partial_argmax(device const float* input [[buffer(0)]],
 }
 
 kernel void
-linear_q4_partial_argmax(device const float* input [[buffer(0)]],
-                         device const uint* weight [[buffer(1)]],
-                         device argmax_pair* partials [[buffer(2)]],
-                         constant uint& hidden_size [[buffer(3)]],
-                         constant uint& vocabulary_size [[buffer(4)]],
-                         constant uint& partial_count [[buffer(5)]],
-                         constant uint& outputs_per_simdgroup [[buffer(6)]],
-                         constant uint& simd_width [[buffer(7)]],
-                         uint thread_index [[thread_index_in_threadgroup]],
-                         uint lane [[thread_index_in_simdgroup]],
-                         uint simdgroup [[simdgroup_index_in_threadgroup]],
-                         uint3 threadgroup_position [[threadgroup_position_in_grid]],
-                         device const bf16_storage* scales [[buffer(8)]],
-                         device const bf16_storage* offsets [[buffer(9)]],
-                         uint simdgroups_per_threadgroup [[simdgroups_per_threadgroup]])
+linear_affine_partial_argmax(device const float* input [[buffer(0)]],
+                             device const uint* weight [[buffer(1)]],
+                             device argmax_pair* partials [[buffer(2)]],
+                             constant uint& hidden_size [[buffer(3)]],
+                             constant uint& vocabulary_size [[buffer(4)]],
+                             constant uint& partial_count [[buffer(5)]],
+                             constant uint& outputs_per_simdgroup [[buffer(6)]],
+                             constant uint& simd_width [[buffer(7)]],
+                             uint thread_index [[thread_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint simdgroup [[simdgroup_index_in_threadgroup]],
+                             uint3 threadgroup_position [[threadgroup_position_in_grid]],
+                             device const bf16_storage* scales [[buffer(8)]],
+                             device const bf16_storage* offsets [[buffer(9)]],
+                             uint simdgroups_per_threadgroup [[simdgroups_per_threadgroup]])
 {
     threadgroup float simd_scores[32];
     threadgroup uint simd_indices[32];
-    linear_partial_argmax_impl(input, q4_matrix { weight, scales, offsets, hidden_size }, partials,
-                               hidden_size, vocabulary_size, partial_count, outputs_per_simdgroup,
-                               simd_width, thread_index, lane, simdgroup, threadgroup_position,
-                               simdgroups_per_threadgroup, simd_scores, simd_indices);
+    linear_partial_argmax_impl(
+        input, affine_matrix { weight, scales, offsets, hidden_size }, partials, hidden_size,
+        vocabulary_size, partial_count, outputs_per_simdgroup, simd_width, thread_index, lane,
+        simdgroup, threadgroup_position, simdgroups_per_threadgroup, simd_scores, simd_indices);
 }
 
 kernel void

@@ -223,7 +223,8 @@ temporary_file
 write_mlx_weights(std::vector<tensor_spec> tensors,
                   std::string filename,
                   bool converted = false,
-                  bool dense_reference = false)
+                  bool dense_reference = false,
+                  std::uint32_t bits = 4)
 {
     nlohmann::json header;
     std::vector<std::byte> data;
@@ -245,10 +246,12 @@ write_mlx_weights(std::vector<tensor_spec> tensors,
         const auto logical = spec.shape;
         const bool matrix = spec.dtype == "BF16" && logical.size() == 2 && logical[1] % 64 == 0;
         const auto scale = [&](std::size_t row, std::size_t group) {
-            return float(1 + (seed + row + group) % 3) / 2048.0F;
+            const auto exponent = (seed + row + group) % 3;
+            return (bits == 8 ? float(1u << exponent) : float(1 + exponent)) / 2048.0F;
         };
         const auto offset = [&](std::size_t row, std::size_t group) {
-            return -float(4 + (seed + row + group) % 4) / 2048.0F;
+            return bits == 8 ? -128.0F * scale(row, group)
+                             : -float(4 + (seed + row + group) % 4) / 2048.0F;
         };
         if (converted) {
             spec.name.replace(0, std::string("model.language_model.").size(),
@@ -260,16 +263,19 @@ write_mlx_weights(std::vector<tensor_spec> tensors,
         }
         if (matrix && !dense_reference) {
             spec.dtype = "U32";
-            spec.shape[1] /= 8;
+            const auto per_word = 32 / bits;
+            spec.shape[1] /= per_word;
             const auto begin = data.size();
             safetensors_test::add_tensor(header, data, spec.name, spec.dtype, spec.shape);
             for (std::size_t row = 0; row < logical[0]; ++row)
-                for (std::size_t word = 0; word < logical[1] / 8; ++word) {
+                for (std::size_t word = 0; word < logical[1] / per_word; ++word) {
                     std::uint32_t packed = 0;
-                    for (std::size_t i = 0; i < 8; ++i)
-                        packed |= std::uint32_t((seed + row * 3 + word * 8 + i) % 16) << (4 * i);
+                    for (std::size_t i = 0; i < per_word; ++i)
+                        packed |=
+                            std::uint32_t((seed + row * 3 + word * per_word + i) % (1u << bits))
+                            << (bits * i);
                     std::memcpy(
-                        data.data() + begin + (row * logical[1] / 8 + word) * sizeof(packed),
+                        data.data() + begin + (row * logical[1] / per_word + word) * sizeof(packed),
                         &packed, sizeof(packed));
                 }
             const auto prefix = spec.name.substr(0, spec.name.size() - 7);
@@ -295,7 +301,8 @@ write_mlx_weights(std::vector<tensor_spec> tensors,
                 for (std::size_t row = 0; row < logical[0]; ++row)
                     for (std::size_t column = 0; column < logical[1]; ++column)
                         values[row * logical[1] + column] =
-                            float((seed + row * 3 + column) % 16) * scale(row, column / 64)
+                            float((seed + row * 3 + column) % (1u << bits))
+                                * scale(row, column / 64)
                             + offset(row, column / 64);
             add_values(spec, values);
         }
@@ -796,6 +803,15 @@ TEST_CASE("Qwen3.5 official checkpoint generates consistently across batching an
         }
         directory = model;
     }
+    SUBCASE("MLX Q8")
+    {
+        const auto* model = std::getenv("CHIBILLM_MLX_Q8_MODEL_PATH");
+        if (!model) {
+            MESSAGE("Set CHIBILLM_MLX_Q8_MODEL_PATH to validate an MLX Q8 checkpoint");
+            return;
+        }
+        directory = model;
+    }
     if (!std::filesystem::exists(directory / "config.json")) {
         MESSAGE("Qwen3.5 model is not installed; skipping local generation validation");
         return;
@@ -845,6 +861,13 @@ TEST_CASE("Qwen3.5 official checkpoint generates consistently across batching an
             REQUIRE(sequence != nullptr);
             CHECK(sequence->reason() == chibillm::finish_reason::eos);
             const auto tokens = sequence->completion_tokens();
+            std::string token_ids;
+            for (const auto token : tokens)
+                token_ids += std::to_string(token) + " ";
+            CAPTURE(directory);
+            CAPTURE(budget);
+            CAPTURE(id);
+            CAPTURE(token_ids);
             auto decoded = runner.decode(tokens);
             REQUIRE(decoded.has_value());
             const auto start = decoded->find_first_not_of(" \r\n\t");
@@ -1169,7 +1192,7 @@ TEST_CASE("Qwen loaders quantize packed matrices and keep sensitive hybrid weigh
     CHECK(small->layers[0].qkv_packed.dense());
 }
 
-TEST_CASE("MLX Q4 weights retain packed bytes and fused projection row order")
+TEST_CASE("MLX Q4/Q8 weights retain packed bytes and fused projection row order")
 {
     const auto& context = test_context();
     auto c = test_config();
@@ -1177,16 +1200,27 @@ TEST_CASE("MLX Q4 weights retain packed bytes and fused projection row order")
     c.intermediate_size = 128;
     c.vocabulary_size = 128;
     c.head_dimension = 32;
-    bool tied = false;
-    SUBCASE("separate output") {}
-    SUBCASE("tied embedding output")
+    std::uint32_t bits = 4;
+    SUBCASE("Q4 separate output") {}
+    SUBCASE("Q8 separate output")
     {
+        bits = 8;
+    }
+    bool tied = false;
+    SUBCASE("Q4 tied embedding output")
+    {
+        tied = true;
+    }
+    SUBCASE("Q8 tied embedding output")
+    {
+        bits = 8;
         tied = true;
     }
     auto tensors = expected_tensors(c);
     if (tied)
         std::erase_if(tensors, [](const auto& tensor) { return tensor.name == "lm_head.weight"; });
-    auto source = write_mlx_weights(std::move(tensors), "chibillm_mlx_qwen3.safetensors");
+    auto source =
+        write_mlx_weights(std::move(tensors), "chibillm_mlx_qwen3.safetensors", false, false, bits);
     auto file = safetensors_file::open(source.path());
     REQUIRE(file);
     REQUIRE(validate_qwen_weights(*file, c));
@@ -1194,6 +1228,7 @@ TEST_CASE("MLX Q4 weights retain packed bytes and fused projection row order")
          { chibillm::weight_quantization::none, chibillm::weight_quantization::q4 }) {
         auto loaded = load_qwen_weights(context, *file, c, conversion);
         REQUIRE(loaded);
+        CHECK(chibillm::matrix_view(loaded->token_embedding).quantized()->bits() == bits);
         check_packed_rows(*file, loaded->token_embedding, { "model.embed_tokens" });
         CHECK(loaded->output.has_value() == !tied);
         check_packed_rows(*file, loaded->vocabulary(), { tied ? "model.embed_tokens" : "lm_head" });
@@ -1211,13 +1246,19 @@ TEST_CASE("MLX Q4 weights retain packed bytes and fused projection row order")
     }
 }
 
-TEST_CASE("MLX Q4 validation rejects incomplete metadata and incompatible fused layouts")
+TEST_CASE("MLX Q4/Q8 validation rejects incomplete metadata and incompatible fused layouts")
 {
+    std::uint32_t bits = 4;
+    SUBCASE("Q4") {}
+    SUBCASE("Q8")
+    {
+        bits = 8;
+    }
     const chibillm::weight_layout layout {
         { "projection", { { "proj.weight", { 2, 64 } } }, chibillm::weight_role::matrix },
     };
     const std::vector<tensor_spec> valid {
-        { "proj.weight", "U32", { 2, 8 } },
+        { "proj.weight", "U32", { 2, 64 / (32 / bits) } },
         { "proj.scales", "BF16", { 2, 1 } },
         { "proj.biases", "BF16", { 2, 1 } },
     };
@@ -1251,14 +1292,34 @@ TEST_CASE("MLX Q4 validation rejects incomplete metadata and incompatible fused 
     const auto result = chibillm::validate_weights(*file, "", fused);
     REQUIRE_FALSE(result);
     CHECK(result.error() == weight_errc::unsupported_dtype);
+    auto mixed_bits = valid;
+    mixed_bits.push_back({ "other.weight", "U32", { 2, bits == 4 ? 16U : 8U } });
+    mixed_bits.push_back({ "other.scales", "BF16", { 2, 1 } });
+    mixed_bits.push_back({ "other.biases", "BF16", { 2, 1 } });
+    auto mixed_source = write_weights(std::move(mixed_bits), "chibillm_mixed_mlx_bits.safetensors");
+    auto mixed_file = safetensors_file::open(mixed_source.path());
+    REQUIRE(mixed_file);
+    const auto bad_bits = chibillm::validate_weights(*mixed_file, "", fused);
+    REQUIRE_FALSE(bad_bits);
+    CHECK(bad_bits.error() == weight_errc::tensor_shape_mismatch);
 }
 
 TEST_CASE("MLX Qwen3.5 converted weights match an independent dense checkpoint")
 {
     auto c = qwen3_5_test_config();
-    SUBCASE("standard convolution") {}
-    SUBCASE("singleton convolution")
+    std::uint32_t bits = 4;
+    SUBCASE("Q4 standard convolution") {}
+    SUBCASE("Q4 singleton convolution")
     {
+        c.linear_conv_kernel_dimension = 1;
+    }
+    SUBCASE("Q8 standard convolution")
+    {
+        bits = 8;
+    }
+    SUBCASE("Q8 singleton convolution")
+    {
+        bits = 8;
         c.linear_conv_kernel_dimension = 1;
     }
     c.hidden_size = 64;
@@ -1269,10 +1330,10 @@ TEST_CASE("MLX Qwen3.5 converted weights match an independent dense checkpoint")
     c.linear_key_head_dimension = 32;
     c.linear_value_head_count = 4;
     c.linear_value_head_dimension = 16;
-    auto source =
-        write_mlx_weights(expected_qwen3_5_tensors(c), "chibillm_mlx_hybrid.safetensors", true);
+    auto source = write_mlx_weights(expected_qwen3_5_tensors(c), "chibillm_mlx_hybrid.safetensors",
+                                    true, false, bits);
     auto reference = write_mlx_weights(expected_qwen3_5_tensors(c),
-                                       "chibillm_mlx_hybrid_dense.safetensors", false, true);
+                                       "chibillm_mlx_hybrid_dense.safetensors", false, true, bits);
     auto file = safetensors_file::open(source.path());
     auto dense_file = safetensors_file::open(reference.path());
     REQUIRE(file);
@@ -1284,6 +1345,7 @@ TEST_CASE("MLX Qwen3.5 converted weights match an independent dense checkpoint")
     auto dense = load_qwen3_5_weights(context, *dense_file, c);
     REQUIRE(packed);
     REQUIRE(dense);
+    CHECK(chibillm::matrix_view(packed->token_embedding).quantized()->bits() == bits);
     CHECK_FALSE(packed->zero_centered_norm);
     CHECK(dense->zero_centered_norm);
     for (const auto& layer : packed->layers)

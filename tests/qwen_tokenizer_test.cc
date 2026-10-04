@@ -62,6 +62,25 @@ private:
     std::filesystem::path path_;
 };
 
+nlohmann::json
+serialized_tokenizer(const tokenizer_fixture& fixture)
+{
+    nlohmann::json vocab;
+    std::ifstream(fixture.path() / "vocab.json") >> vocab;
+    return {
+        { "model",
+          { { "type", "BPE" },
+            { "vocab", vocab },
+            { "merges",
+              { "H e", "He l", "Hel l", "Hell o", "w o", "wo r", "wor l", "worl d",
+                "Ġ world" } } } },
+        { "added_tokens",
+          { { { "id", 19 }, { "content", "<|im_start|>" }, { "special", true } },
+            { { "id", 20 }, { "content", "<|im_end|>" }, { "special", true } },
+            { { "id", 21 }, { "content", "<think>" }, { "special", false } } } },
+    };
+}
+
 } // namespace
 
 TEST_CASE("Qwen byte-level BPE encodes and decodes text")
@@ -120,4 +139,101 @@ TEST_CASE("Qwen tokenizer still rejects malformed merges")
     auto tokenizer = chibillm::qwen_tokenizer::load(fixture.path());
     REQUIRE_FALSE(tokenizer.has_value());
     CHECK(tokenizer.error() == chibillm::qwen_tokenizer_errc::invalid_merge);
+}
+
+TEST_CASE("Qwen tokenizer reads MLX chat tokens from tokenizer.json")
+{
+    tokenizer_fixture fixture;
+    std::ofstream(fixture.path() / "tokenizer.json") << serialized_tokenizer(fixture);
+    std::ofstream(fixture.path() / "tokenizer_config.json") << "{}";
+    auto tokenizer = chibillm::qwen_tokenizer::load(fixture.path());
+    REQUIRE(tokenizer);
+    const auto tokens = tokenizer->encode("<|im_start|>Hello<|im_end|><think>");
+    REQUIRE(tokens);
+    CHECK(*tokens == std::vector<chibillm::token_id> { 19, 8, 20, 21 });
+    CHECK(tokenizer->decode(*tokens).value() == "Hello<think>");
+}
+
+TEST_CASE("Qwen tokenizer reads BPE vocabulary and both merge layouts from tokenizer.json")
+{
+    tokenizer_fixture fixture;
+    auto serialized = serialized_tokenizer(fixture);
+    SUBCASE("string merges") {}
+    SUBCASE("pair merges")
+    {
+        for (auto& pair : serialized["model"]["merges"]) {
+            const auto line = pair.get<std::string>();
+            const auto space = line.find(' ');
+            pair = nlohmann::json::array({ line.substr(0, space), line.substr(space + 1) });
+        }
+    }
+    std::ofstream(fixture.path() / "tokenizer.json") << serialized;
+    std::ofstream(fixture.path() / "tokenizer_config.json") << "{}";
+    std::filesystem::remove(fixture.path() / "vocab.json");
+    std::filesystem::remove(fixture.path() / "merges.txt");
+    auto tokenizer = chibillm::qwen_tokenizer::load(fixture.path());
+    REQUIRE(tokenizer);
+    const auto tokens = tokenizer->encode("<|im_start|>Hello world!\n<|im_end|>");
+    REQUIRE(tokens);
+    CHECK(*tokens == std::vector<chibillm::token_id> { 19, 8, 17, 0, 18, 20 });
+    CHECK(tokenizer->decode(*tokens).value() == "Hello world!\n");
+}
+
+TEST_CASE("Qwen tokenizer rejects malformed serialized BPE data")
+{
+    tokenizer_fixture fixture;
+    auto serialized = serialized_tokenizer(fixture);
+    auto expected = chibillm::qwen_tokenizer_errc::invalid_vocabulary;
+    SUBCASE("unsupported model")
+    {
+        serialized["model"]["type"] = "WordPiece";
+    }
+    SUBCASE("invalid vocabulary")
+    {
+        serialized["model"]["vocab"] = "invalid";
+    }
+    SUBCASE("invalid added token ID")
+    {
+        serialized["added_tokens"][0]["id"] = -1;
+    }
+    SUBCASE("invalid special flag")
+    {
+        serialized["added_tokens"][0]["special"] = "true";
+    }
+    SUBCASE("duplicate added token IDs")
+    {
+        serialized["added_tokens"][1]["id"] = 19;
+    }
+    SUBCASE("invalid merge pair")
+    {
+        serialized["model"]["merges"][0] = nlohmann::json::array({ "H" });
+        expected = chibillm::qwen_tokenizer_errc::invalid_merge;
+    }
+    std::ofstream(fixture.path() / "tokenizer.json") << serialized;
+    std::ofstream(fixture.path() / "tokenizer_config.json") << "{}";
+    std::filesystem::remove(fixture.path() / "vocab.json");
+    std::filesystem::remove(fixture.path() / "merges.txt");
+    auto tokenizer = chibillm::qwen_tokenizer::load(fixture.path());
+    REQUIRE_FALSE(tokenizer);
+    CHECK(tokenizer.error() == expected);
+}
+
+TEST_CASE("Qwen tokenizer accepts byte-level BPE with no merge rules")
+{
+    tokenizer_fixture fixture;
+    SUBCASE("version header only")
+    {
+        std::ofstream(fixture.path() / "merges.txt") << "#version: 0.2\n";
+    }
+    SUBCASE("empty serialized merges")
+    {
+        auto serialized = serialized_tokenizer(fixture);
+        serialized["model"]["merges"] = nlohmann::json::array();
+        std::ofstream(fixture.path() / "tokenizer.json") << serialized;
+        std::ofstream(fixture.path() / "tokenizer_config.json") << "{}";
+        std::filesystem::remove(fixture.path() / "merges.txt");
+    }
+    auto tokenizer = chibillm::qwen_tokenizer::load(fixture.path());
+    REQUIRE(tokenizer);
+    CHECK(tokenizer->encode("Hello").value() == std::vector<chibillm::token_id> { 1, 2, 3, 3, 4 });
 }

@@ -30,17 +30,20 @@ validate_tensor(const safetensors_file& file,
 }
 
 result<quantized_matrix, weight_error>
-read_q4(const metal_context& context,
-        const safetensors_file& file,
-        std::string_view prefix,
-        const weight_group& group,
-        std::vector<std::size_t> dimensions)
+read_quantized(const metal_context& context,
+               const safetensors_file& file,
+               std::string_view prefix,
+               const weight_group& group,
+               std::vector<std::size_t> dimensions)
 {
     const auto rows = dimensions[0], columns = dimensions[1];
+    const auto words = file.find(std::string(prefix) + group.tensors.front().name)->shape[1];
+    const std::uint32_t bits = words == columns / 8 ? 4 : 8;
+    const auto values_per_word = 32 / bits;
     auto shape = tensor_shape::make(std::move(dimensions));
     if (!shape)
         return fail(weight_errc::tensor_creation_failed, shape.error(), group.name);
-    auto packed = metal_tensor::make(context, dtype::u32, { rows, columns / 8 });
+    auto packed = metal_tensor::make(context, dtype::u32, { rows, columns / values_per_word });
     auto scales = metal_tensor::make(context, dtype::bf16, { rows, columns / 64 });
     auto offsets = metal_tensor::make(context, dtype::bf16, { rows, columns / 64 });
     if (!packed)
@@ -53,7 +56,8 @@ read_q4(const metal_context& context,
     for (const auto& spec : group.tensors) {
         const auto name = std::string(prefix) + spec.name;
         for (const auto& [source, destination, byte_offset] :
-             { std::tuple { name, &*packed, row * columns / 8 * sizeof(std::uint32_t) },
+             { std::tuple { name, &*packed,
+                            row * columns / values_per_word * sizeof(std::uint32_t) },
                std::tuple { metadata_name(name, ".scales"), &*scales,
                             row * columns / 64 * sizeof(std::uint16_t) },
                std::tuple { metadata_name(name, ".biases"), &*offsets,
@@ -66,7 +70,7 @@ read_q4(const metal_context& context,
         row += spec.shape[0];
     }
     auto matrix = quantized_matrix::from_packed(std::move(*shape), std::move(*packed),
-                                                std::move(*scales), std::move(*offsets));
+                                                std::move(*scales), std::move(*offsets), bits);
     if (!matrix)
         return fail(weight_errc::quantization_failed, matrix.error(), group.name);
     return std::move(*matrix);
@@ -98,6 +102,7 @@ validate_weights(const safetensors_file& file, std::string_view prefix, const we
             return fail(weight_errc::invalid_configuration);
         const auto* first = file.find(std::string(prefix) + group.tensors.front().name);
         const bool packed = first && first->type == safetensors_dtype::u32;
+        std::size_t values_per_word = 0;
         for (const auto& spec : group.tensors) {
             if (group.role != weight_role::tensor
                 && (spec.shape.size() != 2 || spec.type != safetensors_dtype::bf16))
@@ -109,8 +114,18 @@ validate_weights(const safetensors_file& file, std::string_view prefix, const we
             if (packed && group.role != weight_role::tensor) {
                 if (!name.ends_with(".weight") || spec.shape[1] % 64 != 0)
                     return fail(weight_errc::invalid_configuration, name);
+                if (values_per_word == 0) {
+                    if (tensor->shape.size() != 2)
+                        return fail(weight_errc::tensor_shape_mismatch, name);
+                    if (tensor->shape[1] == spec.shape[1] / 8)
+                        values_per_word = 8;
+                    else if (tensor->shape[1] == spec.shape[1] / 4)
+                        values_per_word = 4;
+                    else
+                        return fail(weight_errc::tensor_shape_mismatch, name);
+                }
                 CL_TRY(validate_tensor(file, name, safetensors_dtype::u32,
-                                       { spec.shape[0], spec.shape[1] / 8 }));
+                                       { spec.shape[0], spec.shape[1] / values_per_word }));
                 for (const auto suffix : { ".scales", ".biases" })
                     CL_TRY(validate_tensor(file, metadata_name(name, suffix),
                                            safetensors_dtype::bf16,
@@ -163,7 +178,7 @@ read_weights(const metal_context& context,
         }
         if (group.role != weight_role::tensor
             && file.find(std::string(prefix) + first.name)->type == safetensors_dtype::u32) {
-            auto matrix = read_q4(context, file, prefix, group, std::move(shape));
+            auto matrix = read_quantized(context, file, prefix, group, std::move(shape));
             if (!matrix)
                 return fail(matrix.error());
             bundle.matrices_.emplace(group.name, std::move(*matrix));

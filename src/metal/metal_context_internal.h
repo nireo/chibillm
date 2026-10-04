@@ -2,6 +2,7 @@
 #include "metal/metal_context.h"
 #include <Metal/Metal.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <initializer_list>
@@ -121,11 +122,16 @@ struct metal_context::implementation {
     id<MTLComputePipelineState> linear_split_bf16_pipeline;
     id<MTLComputePipelineState> linear_split_bf16_decode_pipeline;
     id<MTLComputePipelineState> embedding_bf16_pipeline;
-    id<MTLComputePipelineState> embedding_q4_pipeline;
-    id<MTLComputePipelineState> linear_add_q4_decode_pipeline;
-    id<MTLComputePipelineState> linear_split_q4_decode_pipeline;
-    id<MTLComputePipelineState> linear_q4_partial_argmax_pipeline;
-    id<MTLComputePipelineState> expand_q4_bf16_pipeline;
+
+    struct affine_pipelines {
+        id<MTLComputePipelineState> embedding;
+        id<MTLComputePipelineState> linear_add;
+        id<MTLComputePipelineState> linear_split;
+        id<MTLComputePipelineState> partial_argmax;
+        id<MTLComputePipelineState> expand;
+    };
+
+    std::array<affine_pipelines, 2> affine; // Q4, Q8
     // GPU-only writes; reused in dispatch order, independently of activation recycling.
     std::optional<metal_buffer> projection_scratch;
     id<MTLComputePipelineState> rms_norm_bf16_pipeline;

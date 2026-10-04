@@ -22,22 +22,56 @@ decode(const quantized_matrix& matrix)
     const auto packed = matrix.packed().buffer().bytes();
     const auto scales = matrix.scales().buffer().bytes();
     const auto offsets = matrix.offsets().buffer().bytes();
+    const auto per_word = matrix.values_per_word();
+    const auto bits = matrix.bits();
     std::vector<float> values(matrix.shape().element_count());
     for (std::size_t i = 0; i < values.size(); ++i) {
         std::uint32_t word;
         std::uint16_t scale, offset;
-        std::memcpy(&word, packed.data() + (i / 8) * sizeof(word), sizeof(word));
+        std::memcpy(&word, packed.data() + (i / per_word) * sizeof(word), sizeof(word));
         std::memcpy(&scale, scales.data() + (i / 64) * sizeof(scale), sizeof(scale));
         std::memcpy(&offset, offsets.data() + (i / 64) * sizeof(offset), sizeof(offset));
-        values[i] = bf16::from_bits(scale).to_float() * ((word >> (4 * (i % 8))) & 15u)
+        values[i] = bf16::from_bits(scale).to_float()
+                * ((word >> (bits * (i % per_word))) & ((1u << bits) - 1u))
             + bf16::from_bits(offset).to_float();
     }
     return values;
 }
 
 quantized_matrix
-make_matrix(const metal_context& context, std::size_t outputs, std::size_t inputs, int seed = 0)
+make_matrix(const metal_context& context,
+            std::size_t outputs,
+            std::size_t inputs,
+            int seed = 0,
+            std::uint32_t bits = 4)
 {
+    if (bits == 8) {
+        auto packed = make_tensor(context, dtype::u32, { outputs, inputs / 4 });
+        auto scales = make_tensor(context, dtype::bf16, { outputs, inputs / 64 });
+        auto offsets = make_tensor(context, dtype::bf16, { outputs, inputs / 64 });
+        std::vector<std::uint32_t> words(outputs * inputs / 4);
+        std::vector<float> scale_values(outputs * inputs / 64), offset_values(scale_values.size());
+        for (std::size_t o = 0; o < outputs; ++o) {
+            for (std::size_t word = 0; word < inputs / 4; ++word)
+                for (std::size_t i = 0; i < 4; ++i)
+                    words[o * inputs / 4 + word] |=
+                        std::uint32_t((o * 7 + (word * 4 + i) * 3 + seed) % 256) << (i * 8);
+            for (std::size_t group = 0; group < inputs / 64; ++group) {
+                const auto index = o * inputs / 64 + group;
+                scale_values[index] = (o + group) % 2 == 0 ? 1.0F / 128 : -1.0F / 128;
+                offset_values[index] = scale_values[index] > 0 ? -1.0F : 1.0F;
+            }
+        }
+        write_u32(packed, words);
+        write_bf16(scales, scale_values);
+        write_bf16(offsets, offset_values);
+        auto shape = tensor_shape::make({ outputs, inputs });
+        REQUIRE(shape);
+        auto matrix = quantized_matrix::from_packed(std::move(*shape), std::move(packed),
+                                                    std::move(scales), std::move(offsets), 8);
+        REQUIRE(matrix);
+        return std::move(*matrix);
+    }
     auto dense = make_tensor(context, dtype::bf16, { outputs, inputs });
     std::vector<float> values(outputs * inputs);
     for (std::size_t o = 0; o < outputs; ++o)
@@ -186,13 +220,49 @@ TEST_CASE("Q4 minmax encoding bounds error using the stored scale")
     }
 }
 
-TEST_CASE("Q4 projections preserve split layout and residuals across decode and prefill")
+TEST_CASE("Q8 imports unsigned bytes low bits first and rejects invalid bit widths")
 {
+    const auto& context = test_context();
+    const auto import = [&](std::uint32_t bits, std::size_t words) {
+        auto shape = tensor_shape::make({ 2, 64 });
+        REQUIRE(shape);
+        auto packed = make_tensor(context, dtype::u32, { 2, words });
+        auto scales = make_tensor(context, dtype::bf16, { 2, 1 });
+        auto offsets = make_tensor(context, dtype::bf16, { 2, 1 });
+        write_u32(packed, std::vector<std::uint32_t>(2 * words, 0xff807f00u));
+        write_bf16(scales, { 1.0F / 128, -1.0F / 128 });
+        write_bf16(offsets, { -1.0F, 1.0F });
+        return quantized_matrix::from_packed(std::move(*shape), std::move(packed),
+                                             std::move(scales), std::move(offsets), bits);
+    };
+    auto matrix = import(8, 16);
+    REQUIRE(matrix);
+    CHECK(matrix->bits() == 8);
+    CHECK(matrix->size_bytes() == 136);
+    const auto values = decode(*matrix);
+    const std::array<float, 4> codes { 0, 127, 128, 255 };
+    for (std::size_t i = 0; i < 64; ++i) {
+        CHECK(values[i] == codes[i % 4] / 128 - 1);
+        CHECK(values[64 + i] == 1 - codes[i % 4] / 128);
+    }
+    CHECK_FALSE(import(8, 8));
+    for (const auto bits : { 0, 2, 16 })
+        CHECK_FALSE(import(bits, 16));
+}
+
+TEST_CASE("Q4/Q8 projections preserve split layout and residuals across decode and prefill")
+{
+    std::uint32_t bits = 4;
+    SUBCASE("Q4") {}
+    SUBCASE("Q8")
+    {
+        bits = 8;
+    }
     auto made = metal_context::make(kernel_source());
     REQUIRE(made);
     auto& context = *made;
-    auto weight = make_matrix(context, 73, 192);
-    auto other = make_matrix(context, 73, 192, 5);
+    auto weight = make_matrix(context, 73, 192, 0, bits);
+    auto other = make_matrix(context, 73, 192, 5, bits);
     for (const std::size_t rows : { 1, 3, 8, 65 }) {
         CAPTURE(rows);
         std::vector<float> values(rows * 192);
@@ -230,10 +300,16 @@ TEST_CASE("Q4 projections preserve split layout and residuals across decode and 
     }
 }
 
-TEST_CASE("Q4 embeddings gather only requested rows and reject invalid tokens")
+TEST_CASE("Q4/Q8 embeddings gather only requested rows and reject invalid tokens")
 {
+    std::uint32_t bits = 4;
+    SUBCASE("Q4") {}
+    SUBCASE("Q8")
+    {
+        bits = 8;
+    }
     const auto& context = test_context();
-    auto weight = make_matrix(context, 73, 64);
+    auto weight = make_matrix(context, 73, 64, 0, bits);
     const std::array<token_id, 4> tokens { 72, 3, 0, 3 };
     auto embedded = embed_tokens(context, weight, tokens);
     REQUIRE(embedded);
@@ -248,10 +324,16 @@ TEST_CASE("Q4 embeddings gather only requested rows and reject invalid tokens")
     CHECK(bad.error() == tensor_op_errc::token_out_of_range);
 }
 
-TEST_CASE("Q4 vocabulary argmax matches scalar scores and chooses the first tied token")
+TEST_CASE("Q4/Q8 vocabulary argmax matches scalar scores and chooses the first tied token")
 {
+    std::uint32_t bits = 4;
+    SUBCASE("Q4") {}
+    SUBCASE("Q8")
+    {
+        bits = 8;
+    }
     const auto& context = test_context();
-    auto weight = make_matrix(context, 73, 64);
+    auto weight = make_matrix(context, 73, 64, 0, bits);
     auto norm = make_tensor(context, dtype::bf16, { 64 });
     write_bf16(norm, std::vector<float>(64, 1.0F));
     auto hidden = make_tensor(context, dtype::f32, { 3, 64 });

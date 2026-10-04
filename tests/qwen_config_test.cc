@@ -78,7 +78,7 @@ TEST_CASE("Qwen3 config loads the checkpoint geometry")
     CHECK(loaded->queries_per_kv_head() == 2);
 }
 
-TEST_CASE("Qwen configs accept MLX affine Q4 and reject unsupported quantization")
+TEST_CASE("Qwen configs accept MLX affine Q4/Q8 and reject unsupported quantization")
 {
     const auto add_quantization = [](std::string config, std::string_view settings) {
         config.insert(config.find('{') + 1, "\"quantization\":" + std::string(settings) + ",");
@@ -88,13 +88,15 @@ TEST_CASE("Qwen configs accept MLX affine Q4 and reject unsupported quantization
     const std::string hybrid { std::istreambuf_iterator<char>(input),
                                std::istreambuf_iterator<char>() };
     for (const auto settings :
-         { R"({"bits":4,"group_size":64,"mode":"affine"})", R"({"bits":4,"group_size":64})" }) {
+         { R"({"bits":4,"group_size":64,"mode":"affine"})", R"({"bits":4,"group_size":64})",
+           R"({"bits":8,"group_size":64,"mode":"affine"})", R"({"bits":8,"group_size":64})" }) {
         CHECK(parse_qwen3_config(add_quantization(valid_config(), settings)));
         CHECK(parse_qwen3_5_config(add_quantization(hybrid, settings)));
     }
-    for (const auto settings : { R"({"bits":8,"group_size":64})", R"({"bits":4,"group_size":32})",
-                                 R"({"bits":4,"group_size":64,"mode":"mxfp4"})",
-                                 R"({"bits":4,"group_size":64,"quant_method":"gptq"})" }) {
+    for (const auto settings :
+         { R"({"bits":2,"group_size":64})", R"({"bits":4,"group_size":32})",
+           R"({"bits":8,"group_size":32})", R"({"bits":4,"group_size":64,"mode":"mxfp4"})",
+           R"({"bits":4,"group_size":64,"quant_method":"gptq"})" }) {
         const auto qwen = parse_qwen3_config(add_quantization(valid_config(), settings));
         const auto qwen35 = parse_qwen3_5_config(add_quantization(hybrid, settings));
         REQUIRE_FALSE(qwen);

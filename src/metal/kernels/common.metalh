@@ -81,7 +81,10 @@ struct bf16_matrix {
     }
 };
 
-struct q4_matrix {
+// Pipeline specialization fixes the bit width before execution.
+constant uint affine_bits [[function_constant(0)]];
+
+struct affine_matrix {
     device const uint* values;
     device const bf16_storage* scales;
     device const bf16_storage* offsets;
@@ -91,8 +94,10 @@ struct q4_matrix {
     load(ulong row, uint column) const
     {
         const ulong index = row * columns + column;
-        const uint packed = values[index / 8];
-        const float q = float((packed >> ((column % 8) * 4)) & 15u);
+        const uint values_per_word = 32 / affine_bits;
+        const uint packed = values[index / values_per_word];
+        const float q = float((packed >> ((column % values_per_word) * affine_bits))
+                              & ((1u << affine_bits) - 1u));
         return load_bf16(scales[index / 64]) * q + load_bf16(offsets[index / 64]);
     }
 
@@ -101,15 +106,16 @@ struct q4_matrix {
     {
         float accumulator = 0.0f;
         const ulong base = ulong(row) * columns;
-        for (uint k = lane * 8; k < columns; k += simd_width * 8) {
-            uint packed = values[(base + k) / 8];
+        const uint values_per_word = 32 / affine_bits;
+        for (uint k = lane * values_per_word; k < columns; k += simd_width * values_per_word) {
+            uint packed = values[(base + k) / values_per_word];
             float product = 0.0f;
             float sum = 0.0f;
-            for (uint i = 0; i < 8; ++i) {
+            for (uint i = 0; i < values_per_word; ++i) {
                 const float x = input[k + i];
-                product += x * float(packed & 15u);
+                product += x * float(packed & ((1u << affine_bits) - 1u));
                 sum += x;
-                packed >>= 4;
+                packed >>= affine_bits;
             }
             accumulator += load_bf16(scales[(base + k) / 64]) * product
                 + load_bf16(offsets[(base + k) / 64]) * sum;

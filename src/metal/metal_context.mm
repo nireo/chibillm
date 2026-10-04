@@ -54,17 +54,29 @@ environment_flag(const char* name)
 }
 
 result<id<MTLComputePipelineState>, metal_error>
-make_compute_pipeline(id<MTLDevice> device, id<MTLLibrary> library, NSString* name)
+make_compute_pipeline(id<MTLDevice> device,
+                      id<MTLLibrary> library,
+                      NSString* name,
+                      std::uint32_t bits = 0)
 {
     const char* utf8_name = name.UTF8String;
     const std::string function_name = utf8_name == nullptr ? "unknown" : utf8_name;
-    id<MTLFunction> function = [library newFunctionWithName:name];
+    NSError* error = nil;
+    id<MTLFunction> function;
+    if (bits != 0) {
+        auto* constants = [[MTLFunctionConstantValues alloc] init];
+        [constants setConstantValue:&bits type:MTLDataTypeUInt atIndex:0];
+        function = [library newFunctionWithName:name constantValues:constants error:&error];
+    } else {
+        function = [library newFunctionWithName:name];
+    }
     if (function == nil) {
-        return fail(make_error(metal_errc::kernel_function_not_found,
-                               "the Metal kernel library does not contain " + function_name));
+        return fail(
+            make_error(metal_errc::kernel_function_not_found,
+                       message_from_error(
+                           error, "the Metal kernel library does not contain " + function_name)));
     }
 
-    NSError* error = nil;
     id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function
                                                                                  error:&error];
     if (pipeline == nil) {
@@ -271,16 +283,22 @@ metal_context::make(std::string_view kernel_source)
                       make_compute_pipeline(device, library, @"linear_split_bf16"));
         CL_TRY_ASSIGN(implementation->linear_split_bf16_decode_pipeline,
                       make_compute_pipeline(device, library, @"linear_split_bf16_decode"));
-        CL_TRY_ASSIGN(implementation->embedding_q4_pipeline,
-                      make_compute_pipeline(device, library, @"embedding_q4"));
-        CL_TRY_ASSIGN(implementation->linear_add_q4_decode_pipeline,
-                      make_compute_pipeline(device, library, @"linear_add_q4_decode"));
-        CL_TRY_ASSIGN(implementation->linear_split_q4_decode_pipeline,
-                      make_compute_pipeline(device, library, @"linear_split_q4_decode"));
-        CL_TRY_ASSIGN(implementation->linear_q4_partial_argmax_pipeline,
-                      make_compute_pipeline(device, library, @"linear_q4_partial_argmax"));
-        CL_TRY_ASSIGN(implementation->expand_q4_bf16_pipeline,
-                      make_compute_pipeline(device, library, @"expand_q4_bf16"));
+        for (const std::uint32_t bits : { 4, 8 }) {
+            auto& pipelines = implementation->affine[bits == 8];
+            CL_TRY_ASSIGN(pipelines.embedding,
+                          make_compute_pipeline(device, library, @"embedding_affine", bits));
+            CL_TRY_ASSIGN(
+                pipelines.linear_add,
+                make_compute_pipeline(device, library, @"linear_add_affine_decode", bits));
+            CL_TRY_ASSIGN(
+                pipelines.linear_split,
+                make_compute_pipeline(device, library, @"linear_split_affine_decode", bits));
+            CL_TRY_ASSIGN(
+                pipelines.partial_argmax,
+                make_compute_pipeline(device, library, @"linear_affine_partial_argmax", bits));
+            CL_TRY_ASSIGN(pipelines.expand,
+                          make_compute_pipeline(device, library, @"expand_affine_bf16", bits));
+        }
         CL_TRY_ASSIGN(implementation->embedding_bf16_pipeline,
                       make_compute_pipeline(device, library, @"embedding_bf16"));
         CL_TRY_ASSIGN(implementation->rms_norm_bf16_pipeline,

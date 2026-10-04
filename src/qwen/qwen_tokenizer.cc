@@ -314,7 +314,38 @@ load_json(const std::filesystem::path& path)
 result<qwen_tokenizer, qwen_tokenizer_errc>
 qwen_tokenizer::load(const std::filesystem::path& model_directory)
 {
+    auto tokenizer_config = load_json(model_directory / "tokenizer_config.json");
+    if (!tokenizer_config)
+        return fail(tokenizer_config.error());
+    if (!tokenizer_config->is_object())
+        return fail(qwen_tokenizer_errc::invalid_vocabulary);
+
+    const bool has_vocab = std::filesystem::exists(model_directory / "vocab.json");
+    const bool has_merges = std::filesystem::exists(model_directory / "merges.txt");
+    json serialized;
+    // Recent MLX exports keep BPE merges and added tokens in tokenizer.json.
+    if ((!has_vocab || !has_merges || !tokenizer_config->contains("added_tokens_decoder"))
+        && std::filesystem::exists(model_directory / "tokenizer.json")) {
+        auto loaded = load_json(model_directory / "tokenizer.json");
+        if (!loaded)
+            return fail(loaded.error());
+        serialized = std::move(*loaded);
+        if (!serialized.is_object())
+            return fail(qwen_tokenizer_errc::invalid_vocabulary);
+        if ((!has_vocab || !has_merges)
+            && (!serialized.contains("model")
+                || !serialized["model"].is_object()
+                || !serialized["model"].contains("type")
+                || serialized["model"]["type"] != "BPE"))
+            return fail(qwen_tokenizer_errc::invalid_vocabulary);
+    }
     auto vocab = load_json(model_directory / "vocab.json");
+    if (!has_vocab && serialized.contains("model")) {
+        const auto& model = serialized["model"];
+        if (!model.contains("vocab"))
+            return fail(qwen_tokenizer_errc::invalid_vocabulary);
+        vocab = model["vocab"];
+    }
     if (!vocab) {
         return fail(vocab.error());
     }
@@ -336,21 +367,34 @@ qwen_tokenizer::load(const std::filesystem::path& model_directory)
         largest_id = std::max(largest_id, static_cast<std::size_t>(id));
     }
 
-    auto tokenizer_config = load_json(model_directory / "tokenizer_config.json");
-    if (!tokenizer_config) {
-        return fail(tokenizer_config.error());
+    json added;
+    if (tokenizer_config->contains("added_tokens_decoder")) {
+        added = (*tokenizer_config)["added_tokens_decoder"];
+        if (!added.is_object())
+            return fail(qwen_tokenizer_errc::invalid_vocabulary);
+    } else if (serialized.contains("added_tokens")) {
+        if (!serialized["added_tokens"].is_array())
+            return fail(qwen_tokenizer_errc::invalid_vocabulary);
+        added = json::object();
+        for (const auto& token : serialized["added_tokens"]) {
+            if (!token.is_object() || !token.contains("id") || !token["id"].is_number_integer())
+                return fail(qwen_tokenizer_errc::invalid_vocabulary);
+            const auto id = token["id"].get<std::int64_t>();
+            if (id < 0 || id > std::numeric_limits<token_id>::max())
+                return fail(qwen_tokenizer_errc::invalid_vocabulary);
+            const auto key = std::to_string(id);
+            if (added.contains(key))
+                return fail(qwen_tokenizer_errc::invalid_vocabulary);
+            added[key] = token;
+        }
     }
-    if (!tokenizer_config->is_object()) {
-        return fail(qwen_tokenizer_errc::invalid_vocabulary);
-    }
-    const auto added = tokenizer_config->find("added_tokens_decoder");
     std::vector<std::pair<std::string, token_id>> added_tokens;
     std::vector<token_id> added_special_tokens;
-    if (added != tokenizer_config->end()) {
-        if (!added->is_object()) {
+    if (!added.is_null()) {
+        if (!added.is_object()) {
             return fail(qwen_tokenizer_errc::invalid_vocabulary);
         }
-        for (const auto& [id_text, token] : added->items()) {
+        for (const auto& [id_text, token] : added.items()) {
             std::int64_t id = 0;
             const auto parsed =
                 std::from_chars(id_text.data(), id_text.data() + id_text.size(), id);
@@ -360,7 +404,8 @@ qwen_tokenizer::load(const std::filesystem::path& model_directory)
                 || id > std::numeric_limits<token_id>::max()
                 || !token.is_object()
                 || !token.contains("content")
-                || !token["content"].is_string()) {
+                || !token["content"].is_string()
+                || (token.contains("special") && !token["special"].is_boolean())) {
                 return fail(qwen_tokenizer_errc::invalid_vocabulary);
             }
             auto content = token["content"].get<std::string>();
@@ -382,23 +427,10 @@ qwen_tokenizer::load(const std::filesystem::path& model_directory)
         special_tokens[static_cast<std::size_t>(id)] = true;
     }
 
-    std::ifstream merges(model_directory / "merges.txt");
-    if (!merges) {
-        return fail(qwen_tokenizer_errc::file_read_failed);
-    }
     std::unordered_map<std::string, std::size_t> merge_ranks;
     merge_ranks.reserve(vocabulary.size());
-    std::string line;
     std::size_t rank = 0;
-    bool first_line = true;
-    while (std::getline(merges, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        // Qwen3 exports a version header; Qwen3.5 starts with the first merge.
-        if (std::exchange(first_line, false) && line.starts_with("#version:")) {
-            continue;
-        }
+    const auto add_merge = [&](std::string_view line) -> result<void, qwen_tokenizer_errc> {
         const auto separator = line.find(' ');
         if (separator == std::string::npos
             || separator == 0
@@ -409,14 +441,45 @@ qwen_tokenizer::load(const std::filesystem::path& model_directory)
         merge_ranks.emplace(merge_key(std::string_view(line).substr(0, separator),
                                       std::string_view(line).substr(separator + 1)),
                             rank++);
+        return {};
+    };
+    if (has_merges) {
+        std::ifstream merges(model_directory / "merges.txt");
+        if (!merges)
+            return fail(qwen_tokenizer_errc::file_read_failed);
+        std::string line;
+        bool first_line = true;
+        while (std::getline(merges, line)) {
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            // Qwen3 exports a version header; Qwen3.5 starts with the first merge.
+            if (std::exchange(first_line, false) && line.starts_with("#version:"))
+                continue;
+            CL_TRY(add_merge(line));
+        }
+        if (merges.bad())
+            return fail(qwen_tokenizer_errc::file_read_failed);
+        if (first_line)
+            return fail(qwen_tokenizer_errc::invalid_merge);
+    } else {
+        if (!serialized.contains("model"))
+            return fail(qwen_tokenizer_errc::file_read_failed);
+        const auto& model = serialized["model"];
+        if (!model.contains("merges") || !model["merges"].is_array())
+            return fail(qwen_tokenizer_errc::invalid_merge);
+        for (const auto& pair : model["merges"]) {
+            if (pair.is_string()) {
+                CL_TRY(add_merge(pair.get_ref<const std::string&>()));
+            } else if (pair.is_array()
+                       && pair.size() == 2
+                       && pair[0].is_string()
+                       && pair[1].is_string()) {
+                CL_TRY(add_merge(pair[0].get<std::string>() + " " + pair[1].get<std::string>()));
+            } else {
+                return fail(qwen_tokenizer_errc::invalid_merge);
+            }
+        }
     }
-    if (merges.bad()) {
-        return fail(qwen_tokenizer_errc::file_read_failed);
-    }
-    if (first_line) {
-        return fail(qwen_tokenizer_errc::invalid_merge);
-    }
-
     std::ranges::sort(added_tokens, [](const auto& first, const auto& second) {
         return first.first.size() > second.first.size();
     });

@@ -27,19 +27,33 @@ error_name(matrix_errc code) noexcept
 
 using matrix_error = error<matrix_errc>;
 
-// Row-major affine Q4: eight consecutive values per U32, one BF16 scale and
-// offset per 64 input features. Logical dimensions never describe packed data.
+// Row-major affine Q4/Q8: packed U32 values, one BF16 scale and offset per 64
+// input features. Logical dimensions never describe packed data.
 class quantized_matrix {
 public:
     static constexpr std::size_t group_size = 64;
-    static constexpr std::size_t values_per_word = 8;
 
     [[nodiscard]] static result<quantized_matrix, matrix_error>
     quantize(const metal_context& context, const metal_tensor& source);
 
-    // Import an existing affine Q4 encoding without reconstructing its weights.
-    [[nodiscard]] static result<quantized_matrix, matrix_error>
-    from_packed(tensor_shape shape, metal_tensor packed, metal_tensor scales, metal_tensor offsets);
+    // Import an existing affine encoding without reconstructing its weights.
+    [[nodiscard]] static result<quantized_matrix, matrix_error> from_packed(tensor_shape shape,
+                                                                            metal_tensor packed,
+                                                                            metal_tensor scales,
+                                                                            metal_tensor offsets,
+                                                                            std::uint32_t bits = 4);
+
+    [[nodiscard]] std::uint32_t
+    bits() const noexcept
+    {
+        return bits_;
+    }
+
+    [[nodiscard]] std::size_t
+    values_per_word() const noexcept
+    {
+        return 32 / bits_;
+    }
 
     [[nodiscard]] const tensor_shape&
     shape() const noexcept
@@ -77,17 +91,20 @@ private:
     quantized_matrix(tensor_shape shape,
                      metal_tensor packed,
                      metal_tensor scales,
-                     metal_tensor offsets)
+                     metal_tensor offsets,
+                     std::uint32_t bits = 4)
         : shape_(std::move(shape))
         , packed_(std::move(packed))
         , scales_(std::move(scales))
         , offsets_(std::move(offsets))
+        , bits_(bits)
     {}
 
     tensor_shape shape_;
     metal_tensor packed_;
     metal_tensor scales_;
     metal_tensor offsets_;
+    std::uint32_t bits_;
 };
 
 // Non-owning operation argument. Existing dense tensors and owned model matrices
