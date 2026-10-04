@@ -15,6 +15,7 @@ print_usage(std::ostream& output)
               "of 16)\n"
               "  --max-tokens N      Reply limit / server default (default: 8192)\n"
               "  --quantize none|q4  Quantize eligible BF16 matrices once at load (default: none)\n"
+              "                      Prequantized MLX Q4 checkpoints load automatically\n"
               "  --serve             Start the HTTP server on 127.0.0.1:8000\n"
               "  --no-stream         Print REPL replies only when complete\n"
               "  --progress=auto|off  REPL prefill progress on terminals (default: auto)\n"

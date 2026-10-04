@@ -128,6 +128,44 @@ TEST_CASE("Q4 rejects invalid layouts and nonfinite source values")
     }
 }
 
+TEST_CASE("Q4 imports existing encodings and validates their storage")
+{
+    const auto& context = test_context();
+    const auto import = [&](std::vector<std::size_t> dimensions, dtype packed_type,
+                            std::vector<std::size_t> packed_shape, float scale) {
+        auto shape = tensor_shape::make(std::move(dimensions));
+        REQUIRE(shape);
+        auto packed = make_tensor(context, packed_type, std::move(packed_shape));
+        auto scales = make_tensor(context, dtype::bf16, { 2, 1 });
+        auto offsets = make_tensor(context, dtype::bf16, { 2, 1 });
+        if (packed_type == dtype::u32)
+            write_u32(packed,
+                      std::vector<std::uint32_t>(packed.descriptor().element_count(), 0x76543210u));
+        write_bf16(scales, { scale, -0.125F });
+        write_bf16(offsets, { -1.0F, 0.5F });
+        return quantized_matrix::from_packed(std::move(*shape), std::move(packed),
+                                             std::move(scales), std::move(offsets));
+    };
+    auto imported = import({ 2, 64 }, dtype::u32, { 2, 8 }, 0.25F);
+    REQUIRE(imported);
+    const auto values = decode(*imported);
+    for (std::size_t i = 0; i < 64; ++i) {
+        CHECK(values[i] == float(i % 8) * 0.25F - 1.0F);
+        CHECK(values[64 + i] == float(i % 8) * -0.125F + 0.5F);
+    }
+    for (auto dimensions : { std::vector<std::size_t> { 128 }, { 2, 63 } }) {
+        const auto result = import(std::move(dimensions), dtype::u32, { 2, 8 }, 0.25F);
+        REQUIRE_FALSE(result);
+        CHECK(result.error() == matrix_errc::invalid_layout);
+    }
+    CHECK_FALSE(import({ 2, 64 }, dtype::bf16, { 2, 8 }, 0.25F));
+    CHECK_FALSE(import({ 2, 64 }, dtype::u32, { 2, 16 }, 0.25F));
+    const auto nonfinite =
+        import({ 2, 64 }, dtype::u32, { 2, 8 }, std::numeric_limits<float>::infinity());
+    REQUIRE_FALSE(nonfinite);
+    CHECK(nonfinite.error() == matrix_errc::nonfinite_weight);
+}
+
 TEST_CASE("Q4 minmax encoding bounds error using the stored scale")
 {
     const auto& context = test_context();

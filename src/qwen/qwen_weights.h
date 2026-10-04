@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <variant>
 #include <vector>
 
@@ -29,8 +30,14 @@ struct qwen_layer_weights {
 struct qwen_weights {
     matrix_weight token_embedding;
     metal_tensor final_norm;
-    matrix_weight output;
+    std::optional<matrix_weight> output;
     std::vector<qwen_layer_weights> layers;
+
+    [[nodiscard]] matrix_view
+    vocabulary() const noexcept
+    {
+        return output ? matrix_view(*output) : matrix_view(token_embedding);
+    }
 };
 
 struct qwen3_5_full_attention_weights {
@@ -63,12 +70,14 @@ struct qwen3_5_layer_weights {
     matrix_weight gateup_packed;
     matrix_weight mlp_down;
     qwen3_5_mixer_weights mixer;
+    bool zero_centered_norm = true;
 };
 
 struct qwen3_5_weights {
     matrix_weight token_embedding;
     metal_tensor final_norm;
     std::vector<qwen3_5_layer_weights> layers;
+    bool zero_centered_norm = true;
 };
 
 [[nodiscard]] result<void, weight_error> validate_qwen_weights(const safetensors_file& weights,

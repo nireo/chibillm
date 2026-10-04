@@ -67,7 +67,7 @@ add_tensor(nlohmann::json& header,
     for (const auto dimension : shape) {
         elements *= dimension;
     }
-    const auto element_bytes = dtype == "F32" ? 4U : 2U;
+    const auto element_bytes = dtype == "F32" || dtype == "U32" ? 4U : 2U;
     const auto begin = data.size();
     data.resize(begin + elements * element_bytes);
     header[std::move(name)] = {

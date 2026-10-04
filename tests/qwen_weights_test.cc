@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -214,6 +215,114 @@ write_weights(std::vector<tensor_spec> tensors, std::string filename)
         value = static_cast<std::byte>(std::to_integer<unsigned int>(value) + 1);
     }
     return temporary_file(std::move(filename), header, data);
+}
+
+// Independent MLX-shaped checkpoint fixture, with an exactly representable
+// dense counterpart. No production quantizer is used to create packed weights.
+temporary_file
+write_mlx_weights(std::vector<tensor_spec> tensors,
+                  std::string filename,
+                  bool converted = false,
+                  bool dense_reference = false)
+{
+    nlohmann::json header;
+    std::vector<std::byte> data;
+    const auto add_values = [&](const tensor_spec& spec, const std::vector<float>& values) {
+        const auto begin = data.size();
+        safetensors_test::add_tensor(header, data, spec.name, spec.dtype, spec.shape);
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            if (spec.dtype == "F32")
+                std::memcpy(data.data() + begin + i * sizeof(float), &values[i], sizeof(float));
+            else {
+                const auto bits = bf16::from_float(values[i]).bits();
+                std::memcpy(data.data() + begin + i * sizeof(bits), &bits, sizeof(bits));
+            }
+        }
+    };
+    std::size_t seed = 0;
+    for (auto spec : tensors) {
+        ++seed;
+        const auto logical = spec.shape;
+        const bool matrix = spec.dtype == "BF16" && logical.size() == 2 && logical[1] % 64 == 0;
+        const auto scale = [&](std::size_t row, std::size_t group) {
+            return float(1 + (seed + row + group) % 3) / 2048.0F;
+        };
+        const auto offset = [&](std::size_t row, std::size_t group) {
+            return -float(4 + (seed + row + group) % 4) / 2048.0F;
+        };
+        if (converted) {
+            spec.name.replace(0, std::string("model.language_model.").size(),
+                              "language_model.model.");
+            if (spec.name.ends_with("conv1d.weight"))
+                std::swap(spec.shape[1], spec.shape[2]);
+            if (spec.name.ends_with("linear_attn.norm.weight"))
+                spec.dtype = "BF16";
+        }
+        if (matrix && !dense_reference) {
+            spec.dtype = "U32";
+            spec.shape[1] /= 8;
+            const auto begin = data.size();
+            safetensors_test::add_tensor(header, data, spec.name, spec.dtype, spec.shape);
+            for (std::size_t row = 0; row < logical[0]; ++row)
+                for (std::size_t word = 0; word < logical[1] / 8; ++word) {
+                    std::uint32_t packed = 0;
+                    for (std::size_t i = 0; i < 8; ++i)
+                        packed |= std::uint32_t((seed + row * 3 + word * 8 + i) % 16) << (4 * i);
+                    std::memcpy(
+                        data.data() + begin + (row * logical[1] / 8 + word) * sizeof(packed),
+                        &packed, sizeof(packed));
+                }
+            const auto prefix = spec.name.substr(0, spec.name.size() - 7);
+            std::vector<float> scales, offsets;
+            for (std::size_t row = 0; row < logical[0]; ++row)
+                for (std::size_t group = 0; group < logical[1] / 64; ++group) {
+                    scales.push_back(scale(row, group));
+                    offsets.push_back(offset(row, group));
+                }
+            add_values({ prefix + ".scales", "BF16", { logical[0], logical[1] / 64 } }, scales);
+            add_values({ prefix + ".biases", "BF16", { logical[0], logical[1] / 64 } }, offsets);
+        } else {
+            std::size_t count = 1;
+            for (const auto dimension : logical)
+                count *= dimension;
+            const bool norm = spec.name.find("norm.weight") != std::string::npos;
+            const bool linear_norm = spec.name.ends_with("linear_attn.norm.weight");
+            std::vector<float> values(count,
+                                      norm ? (dense_reference && !linear_norm ? 0.0F : 1.0F)
+                                          : spec.name.ends_with("A_log") ? 0.0F
+                                                                         : 0.015625F);
+            if (matrix)
+                for (std::size_t row = 0; row < logical[0]; ++row)
+                    for (std::size_t column = 0; column < logical[1]; ++column)
+                        values[row * logical[1] + column] =
+                            float((seed + row * 3 + column) % 16) * scale(row, column / 64)
+                            + offset(row, column / 64);
+            add_values(spec, values);
+        }
+    }
+    return temporary_file(std::move(filename), header, data);
+}
+
+void
+check_packed_rows(const safetensors_file& file,
+                  chibillm::matrix_view matrix,
+                  const std::vector<std::string>& sources)
+{
+    REQUIRE(matrix.quantized());
+    for (const auto& [suffix, tensor] :
+         { std::pair { ".weight", &matrix.quantized()->packed() },
+           std::pair { ".scales", &matrix.quantized()->scales() },
+           std::pair { ".biases", &matrix.quantized()->offsets() } }) {
+        std::vector<std::byte> expected;
+        for (const auto& source : sources) {
+            const auto name = source + suffix;
+            REQUIRE(file.find(name));
+            const auto begin = expected.size();
+            expected.resize(begin + file.find(name)->byte_count);
+            REQUIRE(file.read(name, std::span(expected).subspan(begin)));
+        }
+        CHECK(std::ranges::equal(tensor->buffer().bytes(), expected));
+    }
 }
 
 class temporary_model_directory {
@@ -518,21 +627,22 @@ TEST_CASE("Qwen output selects requested rows and samples their largest logits")
     std::vector<float> output(config.vocabulary_size * config.hidden_size, 0.0F);
     output[3 * config.hidden_size] = 2.0F;
     output[5 * config.hidden_size + 2] = 2.0F;
-    write_bf16(weights->output, output);
+    REQUIRE(weights->output);
+    write_bf16(*weights->output, output);
 
     const std::vector<chibillm::token_id> input_tokens { 0, 1, 2 };
     auto hidden_states = embed_tokens(*context, weights->token_embedding, input_tokens);
     REQUIRE(hidden_states.has_value());
 
     const std::vector<std::size_t> logits_indices { 2, 0 };
-    auto sampled = encode_greedy(*context, weights->final_norm, weights->output, config.rms_epsilon,
-                                 *hidden_states, logits_indices);
+    auto sampled = encode_greedy(*context, weights->final_norm, weights->vocabulary(),
+                                 config.rms_epsilon, *hidden_states, logits_indices);
     REQUIRE(sampled.has_value());
     CHECK(read_greedy(*sampled) == std::vector<chibillm::token_id> { 5, 3 });
 
     const std::vector<std::size_t> invalid_indices { input_tokens.size() };
-    auto invalid = encode_greedy(*context, weights->final_norm, weights->output, config.rms_epsilon,
-                                 *hidden_states, invalid_indices);
+    auto invalid = encode_greedy(*context, weights->final_norm, weights->vocabulary(),
+                                 config.rms_epsilon, *hidden_states, invalid_indices);
     REQUIRE_FALSE(invalid.has_value());
     CHECK(invalid.error() == chibillm::tensor_op_errc::logits_index_out_of_range);
 }
@@ -670,16 +780,25 @@ TEST_CASE("Qwen3.5 factory loads a sole shard and generates with tied zero-cente
 
 TEST_CASE("Qwen3.5 official checkpoint generates consistently across batching and cancellation")
 {
-    const std::filesystem::path directory { QWEN3_5_MODEL_PATH };
-    if (!std::filesystem::exists(directory / "config.json")) {
-        MESSAGE("Qwen3.5 model is not installed; skipping local generation validation");
-        return;
-    }
+    std::filesystem::path directory { QWEN3_5_MODEL_PATH };
     auto quantization = chibillm::weight_quantization::none;
     SUBCASE("BF16") {}
     SUBCASE("Q4")
     {
         quantization = chibillm::weight_quantization::q4;
+    }
+    SUBCASE("MLX Q4")
+    {
+        const auto* model = std::getenv("CHIBILLM_MLX_Q4_MODEL_PATH");
+        if (!model) {
+            MESSAGE("Set CHIBILLM_MLX_Q4_MODEL_PATH to validate an MLX Q4 checkpoint");
+            return;
+        }
+        directory = model;
+    }
+    if (!std::filesystem::exists(directory / "config.json")) {
+        MESSAGE("Qwen3.5 model is not installed; skipping local generation validation");
+        return;
     }
     auto loaded = chibillm::load_model(directory, kernel_source(), 16, 16, "qwen3.5", quantization);
     REQUIRE(loaded.has_value());
@@ -1008,7 +1127,7 @@ TEST_CASE("Qwen loaders quantize packed matrices and keep sensitive hybrid weigh
     REQUIRE(dense);
     REQUIRE(quantized);
     CHECK(chibillm::matrix_view(quantized->token_embedding).quantized());
-    CHECK(chibillm::matrix_view(quantized->output).quantized());
+    CHECK(quantized->vocabulary().quantized());
     CHECK(quantized->token_embedding.size_bytes() * 32 == dense->token_embedding.size_bytes() * 9);
     CHECK(chibillm::matrix_view(quantized->layers[0].qkv_packed).quantized());
     CHECK(chibillm::matrix_view(quantized->layers[0].gateup_packed).quantized());
@@ -1048,4 +1167,174 @@ TEST_CASE("Qwen loaders quantize packed matrices and keep sensitive hybrid weigh
     REQUIRE(small);
     CHECK(small->token_embedding.dense());
     CHECK(small->layers[0].qkv_packed.dense());
+}
+
+TEST_CASE("MLX Q4 weights retain packed bytes and fused projection row order")
+{
+    const auto& context = test_context();
+    auto c = test_config();
+    c.hidden_size = 64;
+    c.intermediate_size = 128;
+    c.vocabulary_size = 128;
+    c.head_dimension = 32;
+    bool tied = false;
+    SUBCASE("separate output") {}
+    SUBCASE("tied embedding output")
+    {
+        tied = true;
+    }
+    auto tensors = expected_tensors(c);
+    if (tied)
+        std::erase_if(tensors, [](const auto& tensor) { return tensor.name == "lm_head.weight"; });
+    auto source = write_mlx_weights(std::move(tensors), "chibillm_mlx_qwen3.safetensors");
+    auto file = safetensors_file::open(source.path());
+    REQUIRE(file);
+    REQUIRE(validate_qwen_weights(*file, c));
+    for (const auto conversion :
+         { chibillm::weight_quantization::none, chibillm::weight_quantization::q4 }) {
+        auto loaded = load_qwen_weights(context, *file, c, conversion);
+        REQUIRE(loaded);
+        check_packed_rows(*file, loaded->token_embedding, { "model.embed_tokens" });
+        CHECK(loaded->output.has_value() == !tied);
+        check_packed_rows(*file, loaded->vocabulary(), { tied ? "model.embed_tokens" : "lm_head" });
+        check_packed_rows(*file, loaded->layers[0].qkv_packed,
+                          { "model.layers.0.self_attn.q_proj", "model.layers.0.self_attn.k_proj",
+                            "model.layers.0.self_attn.v_proj" });
+        check_packed_rows(*file, loaded->layers[0].gateup_packed,
+                          { "model.layers.0.mlp.gate_proj", "model.layers.0.mlp.up_proj" });
+    }
+    if (tied) {
+        c.tie_word_embeddings = false;
+        const auto result = validate_qwen_weights(*file, c);
+        REQUIRE_FALSE(result);
+        CHECK(result.error() == weight_errc::missing_tensor);
+    }
+}
+
+TEST_CASE("MLX Q4 validation rejects incomplete metadata and incompatible fused layouts")
+{
+    const chibillm::weight_layout layout {
+        { "projection", { { "proj.weight", { 2, 64 } } }, chibillm::weight_role::matrix },
+    };
+    const std::vector<tensor_spec> valid {
+        { "proj.weight", "U32", { 2, 8 } },
+        { "proj.scales", "BF16", { 2, 1 } },
+        { "proj.biases", "BF16", { 2, 1 } },
+    };
+    const auto check = [&](std::vector<tensor_spec> tensors, weight_errc expected) {
+        auto source = write_weights(std::move(tensors), "chibillm_bad_mlx_metadata.safetensors");
+        auto file = safetensors_file::open(source.path());
+        REQUIRE(file);
+        const auto result = chibillm::validate_weights(*file, "", layout);
+        REQUIRE_FALSE(result);
+        CHECK(result.error() == expected);
+    };
+    auto missing = valid;
+    missing.pop_back();
+    check(std::move(missing), weight_errc::missing_tensor);
+    auto wrong_shape = valid;
+    wrong_shape[1].shape = { 2, 2 };
+    check(std::move(wrong_shape), weight_errc::tensor_shape_mismatch);
+    auto wrong_type = valid;
+    wrong_type[1].dtype = "F32";
+    check(std::move(wrong_type), weight_errc::unsupported_dtype);
+    auto dense_with_metadata = valid;
+    dense_with_metadata[0] = { "proj.weight", "BF16", { 2, 64 } };
+    check(std::move(dense_with_metadata), weight_errc::invalid_configuration);
+    auto mixed = valid;
+    mixed.push_back({ "other.weight", "BF16", { 2, 64 } });
+    auto source = write_weights(std::move(mixed), "chibillm_mixed_mlx_projection.safetensors");
+    auto file = safetensors_file::open(source.path());
+    REQUIRE(file);
+    auto fused = layout;
+    fused[0].tensors.push_back({ "other.weight", { 2, 64 } });
+    const auto result = chibillm::validate_weights(*file, "", fused);
+    REQUIRE_FALSE(result);
+    CHECK(result.error() == weight_errc::unsupported_dtype);
+}
+
+TEST_CASE("MLX Qwen3.5 converted weights match an independent dense checkpoint")
+{
+    auto c = qwen3_5_test_config();
+    SUBCASE("standard convolution") {}
+    SUBCASE("singleton convolution")
+    {
+        c.linear_conv_kernel_dimension = 1;
+    }
+    c.hidden_size = 64;
+    c.intermediate_size = 128;
+    c.vocabulary_size = 128;
+    c.head_dimension = 32;
+    c.linear_key_head_count = 2;
+    c.linear_key_head_dimension = 32;
+    c.linear_value_head_count = 4;
+    c.linear_value_head_dimension = 16;
+    auto source =
+        write_mlx_weights(expected_qwen3_5_tensors(c), "chibillm_mlx_hybrid.safetensors", true);
+    auto reference = write_mlx_weights(expected_qwen3_5_tensors(c),
+                                       "chibillm_mlx_hybrid_dense.safetensors", false, true);
+    auto file = safetensors_file::open(source.path());
+    auto dense_file = safetensors_file::open(reference.path());
+    REQUIRE(file);
+    REQUIRE(dense_file);
+    auto made = metal_context::make(kernel_source());
+    REQUIRE(made);
+    auto& context = *made;
+    auto packed = load_qwen3_5_weights(context, *file, c);
+    auto dense = load_qwen3_5_weights(context, *dense_file, c);
+    REQUIRE(packed);
+    REQUIRE(dense);
+    CHECK_FALSE(packed->zero_centered_norm);
+    CHECK(dense->zero_centered_norm);
+    for (const auto& layer : packed->layers)
+        CHECK_FALSE(layer.zero_centered_norm);
+    const auto& linear = std::get<qwen3_5_linear_attention_weights>(packed->layers[0].mixer);
+    check_packed_rows(*file, linear.decay_projection,
+                      { "language_model.model.layers.0.linear_attn.in_proj_a" });
+    CHECK(std::ranges::equal(linear.convolution.descriptor().shape().dimensions(),
+                             std::vector<std::size_t> { 192, 1, c.linear_conv_kernel_dimension }));
+    check_floats(linear.norm, std::vector<float>(16, 1.0F));
+    for (const std::size_t rows : { 1, 3, 8 }) {
+        CAPTURE(rows);
+        const auto execute = [&](const chibillm::qwen3_5_weights& weights) {
+            auto state = chibillm::qwen3_5_model_state::make(context, c, 2, 16);
+            REQUIRE(state);
+            REQUIRE((*state)->reserve(1, rows));
+            chibillm::model_batch batch { .id = 1,
+                                          .phase = chibillm::batch_phase::prefill,
+                                          .kv_block_size = 16,
+                                          .tokens = std::vector<chibillm::token_id>(rows, 1),
+                                          .positions = {},
+                                          .items = { { .id = 1,
+                                                       .token_offset = 0,
+                                                       .token_count = rows,
+                                                       .logits_index = rows - 1,
+                                                       .block_table = { 0 } } } };
+            for (std::size_t i = 0; i < rows; ++i)
+                batch.positions.push_back(static_cast<chibillm::position_id>(i));
+            const auto blocks = (*state)->resources(1).blocks;
+            batch.items[0].block_table.assign(blocks.begin(), blocks.end());
+            REQUIRE((*state)->begin_batch(batch));
+            auto input = make_tensor(context, chibillm::dtype::f32, { rows, c.hidden_size });
+            std::vector<float> values(rows * c.hidden_size);
+            for (std::size_t i = 0; i < values.size(); ++i)
+                values[i] = std::sin(float(i) * 0.13F);
+            write_floats(input, values);
+            chibillm::compute_pass pass(context);
+            REQUIRE(pass.begin());
+            auto output =
+                chibillm::run_qwen3_5_layers(context, c, weights, std::move(input), batch, **state);
+            REQUIRE(output);
+            auto normalized = chibillm::rms_norm(context, *output, weights.final_norm,
+                                                 c.rms_epsilon, weights.zero_centered_norm);
+            REQUIRE(normalized);
+            REQUIRE(pass.finish());
+            (*state)->commit_batch();
+            return read_floats(*normalized);
+        };
+        const auto expected = execute(*dense), actual = execute(*packed);
+        REQUIRE(actual.size() == expected.size());
+        for (std::size_t i = 0; i < actual.size(); ++i)
+            CHECK(actual[i] == doctest::Approx(expected[i]).epsilon(2e-5).scale(1.0));
+    }
 }

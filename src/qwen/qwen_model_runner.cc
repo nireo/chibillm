@@ -118,7 +118,7 @@ qwen_model_runner::make(const std::filesystem::path& model_directory,
     if (!tokenizer) {
         return fail(qwen_model_runner_errc::tokenizer_load_failed, tokenizer.error(), "tokenizer");
     }
-    auto file = safetensors_file::open(model_directory / "model.safetensors");
+    auto file = safetensors_file::open_model(model_directory);
     if (!file) {
         return fail(qwen_model_runner_errc::weights_open_failed, file.error(), "safetensors");
     }
@@ -247,8 +247,8 @@ qwen_model_runner::execute(const model_batch& batch, model_state& state)
     if (!final_hidden) {
         return fail(model_runner_errc::backend_failure, final_hidden.error(), "layers");
     }
-    return finish_greedy(pass, context_, weights_.final_norm, weights_.output, config_.rms_epsilon,
-                         *final_hidden, metadata->logits_indices);
+    return finish_greedy(pass, context_, weights_.final_norm, weights_.vocabulary(),
+                         config_.rms_epsilon, *final_hidden, metadata->logits_indices);
 }
 
 result<qwen3_5_model_runner, qwen_model_runner_error>
@@ -373,7 +373,8 @@ qwen3_5_model_runner::execute(const model_batch& batch, model_state& state)
     if (!output)
         return fail(model_runner_errc::backend_failure, output.error(), "layers");
     return finish_greedy(pass, context_, weights_.final_norm, weights_.token_embedding,
-                         config_.rms_epsilon, *output, metadata->logits_indices, true);
+                         config_.rms_epsilon, *output, metadata->logits_indices,
+                         weights_.zero_centered_norm);
 }
 
 } // namespace chibillm

@@ -172,8 +172,8 @@ run_qwen3_5_full_attention(const metal_context& context,
         || config.rotary_dimension() == 0)
         return fail(tensor_op_errc::input_shape_mismatch);
 
-    auto normalized =
-        rms_norm(context, hidden_states, weights.input_norm, config.rms_epsilon, true);
+    auto normalized = rms_norm(context, hidden_states, weights.input_norm, config.rms_epsilon,
+                               weights.zero_centered_norm);
     if (!normalized)
         return fail(at_stage(normalized.error(), "cache layer " + std::to_string(cache_layer)));
     auto projected = linear_split(context, *normalized, attention->qkv_packed,
@@ -187,8 +187,10 @@ run_qwen3_5_full_attention(const metal_context& context,
     auto& [query, gate] = *split;
 
     // Each norm and rotation supports in-place operation on independent heads.
-    CL_TRY(rms_norm(context, query, attention->query_norm, config.rms_epsilon, query, true));
-    CL_TRY(rms_norm(context, key, attention->key_norm, config.rms_epsilon, key, true));
+    CL_TRY(rms_norm(context, query, attention->query_norm, config.rms_epsilon, query,
+                    weights.zero_centered_norm));
+    CL_TRY(rms_norm(context, key, attention->key_norm, config.rms_epsilon, key,
+                    weights.zero_centered_norm));
     CL_TRY(rope(context, query, prepared.positions(), config.query_head_count, config.rope_theta,
                 query, config.rotary_dimension()));
     CL_TRY(rope(context, key, prepared.positions(), config.kv_head_count, config.rope_theta, key,
@@ -222,8 +224,8 @@ run_linear_attention(const metal_context& context,
     const auto rows = hidden_states.descriptor().shape().dimensions()[0];
     const auto qkv_width = 2 * config.linear_key_width() + config.linear_value_width();
     const auto value_width = config.linear_value_width();
-    auto normalized =
-        rms_norm(context, hidden_states, weights.input_norm, config.rms_epsilon, true);
+    auto normalized = rms_norm(context, hidden_states, weights.input_norm, config.rms_epsilon,
+                               weights.zero_centered_norm);
     if (!normalized)
         return fail(normalized.error());
     auto qkv = linear(context, *normalized, attention.qkv_projection);
@@ -375,9 +377,9 @@ run_qwen3_5_layers(const metal_context& context,
                                          state.cache());
         if (!mixed)
             return fail(at_stage(mixed.error(), "layer " + std::to_string(layer)));
-        auto output = normalized_swiglu(context, layer_weights.post_attention_norm,
-                                        layer_weights.gateup_packed, layer_weights.mlp_down,
-                                        config.rms_epsilon, *mixed, true);
+        auto output = normalized_swiglu(
+            context, layer_weights.post_attention_norm, layer_weights.gateup_packed,
+            layer_weights.mlp_down, config.rms_epsilon, *mixed, layer_weights.zero_centered_norm);
         if (!output)
             return fail(at_stage(output.error(), "layer " + std::to_string(layer)));
         hidden_states = std::move(*output);

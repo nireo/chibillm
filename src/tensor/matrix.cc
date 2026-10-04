@@ -7,6 +7,39 @@
 namespace chibillm {
 
 result<quantized_matrix, matrix_error>
+quantized_matrix::from_packed(tensor_shape shape,
+                              metal_tensor packed,
+                              metal_tensor scales,
+                              metal_tensor offsets)
+{
+    if (shape.rank() != 2 || shape.dimensions()[1] % group_size != 0)
+        return fail(matrix_errc::invalid_layout);
+    const auto rows = shape.dimensions()[0], columns = shape.dimensions()[1];
+    const auto matches = [](const metal_tensor& tensor, dtype type, std::size_t n, std::size_t k) {
+        const auto& descriptor = tensor.descriptor();
+        return descriptor.type() == type
+            && descriptor.shape().rank() == 2
+            && descriptor.shape().dimensions()[0] == n
+            && descriptor.shape().dimensions()[1] == k;
+    };
+    if (!matches(packed, dtype::u32, rows, columns / values_per_word)
+        || !matches(scales, dtype::bf16, rows, columns / group_size)
+        || !matches(offsets, dtype::bf16, rows, columns / group_size))
+        return fail(matrix_errc::invalid_layout);
+    for (const auto* tensor : { &scales, &offsets }) {
+        const auto bytes = tensor->buffer().bytes();
+        for (std::size_t i = 0; i < bytes.size(); i += sizeof(std::uint16_t)) {
+            std::uint16_t bits;
+            std::memcpy(&bits, bytes.data() + i, sizeof(bits));
+            if (!std::isfinite(bf16::from_bits(bits).to_float()))
+                return fail(matrix_errc::nonfinite_weight);
+        }
+    }
+    return quantized_matrix(std::move(shape), std::move(packed), std::move(scales),
+                            std::move(offsets));
+}
+
+result<quantized_matrix, matrix_error>
 quantized_matrix::quantize(const metal_context& context, const metal_tensor& source)
 {
     const auto& shape = source.descriptor().shape();

@@ -37,6 +37,10 @@ public:
     [[nodiscard]] static result<quantized_matrix, matrix_error>
     quantize(const metal_context& context, const metal_tensor& source);
 
+    // Import an existing affine Q4 encoding without reconstructing its weights.
+    [[nodiscard]] static result<quantized_matrix, matrix_error>
+    from_packed(tensor_shape shape, metal_tensor packed, metal_tensor scales, metal_tensor offsets);
+
     [[nodiscard]] const tensor_shape&
     shape() const noexcept
     {

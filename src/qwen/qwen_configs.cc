@@ -274,9 +274,34 @@ parse_common_geometry(const json& object, Config& config)
     return {};
 }
 
+result<void, qwen_config_errc>
+validate_quantization(const json& object)
+{
+    for (const auto key : { "quantization", "quantization_config" }) {
+        const auto found = object.find(key);
+        if (found == object.end() || found->is_null())
+            continue;
+        if (!found->is_object())
+            return fail(qwen_config_errc::invalid_field);
+        std::size_t bits, group;
+        CL_TRY_ASSIGN(bits, required_size(*found, "bits"));
+        CL_TRY_ASSIGN(group, required_size(*found, "group_size"));
+        if (bits != 4 || group != 64)
+            return fail(qwen_config_errc::unsupported_configuration);
+        if (found->contains("mode"))
+            CL_TRY(require_string_value(*found, "mode", "affine"));
+        for (const auto& [name, value] : found->items()) {
+            if (name != "bits" && name != "group_size" && name != "mode")
+                return fail(qwen_config_errc::unsupported_configuration);
+        }
+    }
+    return {};
+}
+
 result<qwen3_config, qwen_config_errc>
 parse_qwen3_object(const json& object)
 {
+    CL_TRY(validate_quantization(object));
     CL_TRY(require_string_value(object, "model_type", "qwen3",
                                 qwen_config_errc::unsupported_model_type));
     CL_TRY(require_string_value(object, "hidden_act", "silu"));
@@ -308,11 +333,13 @@ parse_qwen3_object(const json& object)
 result<qwen3_5_config, qwen_config_errc>
 parse_qwen3_5_object(const json& object)
 {
+    CL_TRY(validate_quantization(object));
     CL_TRY(require_string_value(object, "model_type", "qwen3_5",
                                 qwen_config_errc::unsupported_model_type));
 
     const json* text = nullptr;
     CL_TRY_ASSIGN(text, required_object(object, "text_config"));
+    CL_TRY(validate_quantization(*text));
     CL_TRY(require_string_value(*text, "model_type", "qwen3_5_text",
                                 qwen_config_errc::unsupported_model_type));
     CL_TRY(require_string_value(*text, "hidden_act", "silu"));
