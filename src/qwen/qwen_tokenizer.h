@@ -42,8 +42,13 @@ error_name(qwen_tokenizer_errc code) noexcept
     return index < names.size() ? names[index] : "qwen_tokenizer.unknown_error";
 }
 
-result<std::string, model_runner_error> format_qwen_chat(std::span<const chat_message> messages,
-                                                         bool thinking = false);
+struct formatted_chat {
+    std::string text;
+    std::vector<std::size_t> checkpoint_offsets;
+};
+
+result<formatted_chat, model_runner_error> format_qwen_chat(std::span<const chat_message> messages,
+                                                            bool thinking = false);
 
 class qwen_tokenizer {
 public:
@@ -52,12 +57,16 @@ public:
 
     [[nodiscard]] result<std::vector<token_id>, qwen_tokenizer_errc>
     encode(std::string_view text) const;
+    [[nodiscard]] result<encoded_prompt, model_runner_error>
+    encode_chat(std::span<const chat_message> messages, bool thinking = false) const;
 
     [[nodiscard]] result<std::string, qwen_tokenizer_errc>
     decode(std::span<const token_id> tokens, bool skip_special_tokens = true) const;
 
 private:
     qwen_tokenizer() = default;
+    result<encoded_prompt, qwen_tokenizer_errc>
+    encode_prompt(std::string_view text, std::span<const std::size_t> checkpoint_offsets) const;
 
     [[nodiscard]] result<std::vector<token_id>, qwen_tokenizer_errc>
     encode_piece(std::string_view piece) const;

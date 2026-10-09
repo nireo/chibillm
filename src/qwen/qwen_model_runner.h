@@ -68,7 +68,7 @@ public:
     [[nodiscard]] const qwen3_config& config() const noexcept;
     [[nodiscard]] const model_info& info() const noexcept override;
 
-    [[nodiscard]] result<std::vector<token_id>, model_runner_error>
+    [[nodiscard]] result<encoded_prompt, model_runner_error>
     encode_chat(std::span<const chat_message> messages) override;
 
     [[nodiscard]] result<std::string, model_runner_error>
@@ -114,7 +114,7 @@ public:
     result<std::unique_ptr<model_state>, model_runner_error>
     make_state(scheduler_config config) const override;
     const model_info& info() const noexcept override;
-    result<std::vector<token_id>, model_runner_error>
+    result<encoded_prompt, model_runner_error>
     encode_chat(std::span<const chat_message> messages) override;
     result<std::string, model_runner_error> decode(std::span<const token_id> tokens) const override;
     result<std::vector<token_id>, model_runner_error> execute(const model_batch& batch,

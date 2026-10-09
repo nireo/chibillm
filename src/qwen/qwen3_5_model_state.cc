@@ -208,6 +208,79 @@ qwen3_5_model_state::resources(seq_id id) const noexcept
     return pages_.resources(id);
 }
 
+std::size_t
+qwen3_5_model_state::prefix_checkpoint::size_bytes() const noexcept
+{
+    auto bytes = kv_cache_checkpoint::size_bytes();
+    for (const auto& layer : layers)
+        bytes += layer.convolution.size() + layer.recurrent.size();
+    return bytes;
+}
+
+std::size_t
+qwen3_5_model_state::checkpoint_bytes(std::size_t tokens) const noexcept
+{
+    const auto kv = cache_.checkpoint_bytes(tokens);
+    if (!kv || tokens > config_.max_position_embeddings)
+        return 0;
+    const auto per_layer =
+        convolution_descriptor_.size_bytes() + recurrent_descriptor_.size_bytes();
+    if (linear_count_ > (std::numeric_limits<std::size_t>::max() - kv) / per_layer)
+        return 0;
+    return kv + linear_count_ * per_layer;
+}
+
+result<std::unique_ptr<model_checkpoint>, state_error>
+qwen3_5_model_state::checkpoint(seq_id id, std::size_t tokens) const
+try {
+    if (batch_open_ || !tokens || committed_tokens(id) != tokens)
+        return fail(state_errc::invalid_reservation);
+    auto kv = cache_.checkpoint(resources(id).blocks, tokens);
+    if (!kv)
+        return fail(kv.error());
+    auto saved = std::make_unique<prefix_checkpoint>(std::move(**kv));
+    saved->layers.reserve(linear_count_);
+    for (const auto& layer : sequences_.at(id).layers) {
+        const auto conv = layer.convolution.buffer().bytes();
+        const auto recurrent = layer.recurrent.buffer().bytes();
+        saved->layers.push_back(
+            { { conv.begin(), conv.end() }, { recurrent.begin(), recurrent.end() } });
+    }
+    return saved;
+} catch (const std::bad_alloc&) {
+    return fail(state_errc::allocation_failed);
+}
+
+result<void, state_error>
+qwen3_5_model_state::restore(seq_id id, const model_checkpoint& checkpoint)
+{
+    const auto* saved = dynamic_cast<const prefix_checkpoint*>(&checkpoint);
+    if (batch_open_
+        || !saved
+        || !checkpoint_bytes(saved->token_count)
+        || saved->layers.size() != linear_count_
+        || committed_tokens(id).value_or(0))
+        return fail(state_errc::invalid_reservation);
+    for (const auto& layer : saved->layers) {
+        if (layer.convolution.size() != convolution_descriptor_.size_bytes()
+            || layer.recurrent.size() != recurrent_descriptor_.size_bytes())
+            return fail(state_errc::invalid_reservation);
+    }
+    CL_TRY(reserve(id, saved->token_count));
+    CL_TRY(cache_.restore(resources(id).blocks, *saved));
+    auto& sequence = sequences_.at(id);
+    for (std::size_t index = 0; index < linear_count_; ++index) {
+        const auto& source = saved->layers[index];
+        auto& target = sequence.layers[index];
+        std::memcpy(target.convolution.buffer().bytes().data(), source.convolution.data(),
+                    source.convolution.size());
+        std::memcpy(target.recurrent.buffer().bytes().data(), source.recurrent.data(),
+                    source.recurrent.size());
+    }
+    sequence.committed_tokens = saved->token_count;
+    return {};
+}
+
 result<void, state_error>
 qwen3_5_model_state::begin_batch(const model_batch& batch)
 try {

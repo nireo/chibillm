@@ -1,11 +1,39 @@
 #include "metal/metal_kv_cache.h"
 
+#include <algorithm>
+#include <cstring>
+#include <limits>
+#include <new>
 #include <utility>
 #include <vector>
 
 #include "tensor/types.h"
 
 namespace chibillm {
+namespace {
+void
+copy_prefix(std::span<const std::byte> source,
+            std::span<std::byte> target,
+            std::span<const block_id> blocks,
+            const metal_kv_cache& cache,
+            std::size_t tokens,
+            bool restore)
+{
+    const auto token_bytes = cache.elements_per_token() * sizeof(float);
+    const auto block_bytes = cache.elements_per_block() * sizeof(float);
+    const auto layer_bytes = cache.elements_per_layer() * sizeof(float);
+    for (std::size_t layer = 0; layer < cache.layer_count(); ++layer) {
+        for (std::size_t token = 0; token < tokens; token += cache.block_size()) {
+            const auto page = blocks[token / cache.block_size()];
+            const auto paged_offset = layer * layer_bytes + page * block_bytes;
+            const auto packed_offset = (layer * tokens + token) * token_bytes;
+            const auto count = std::min(cache.block_size(), tokens - token) * token_bytes;
+            std::memcpy(target.data() + (restore ? paged_offset : packed_offset),
+                        source.data() + (restore ? packed_offset : paged_offset), count);
+        }
+    }
+}
+} // namespace
 
 result<metal_kv_cache, kv_cache_error>
 metal_kv_cache::make(const metal_context& context, kv_cache_config config)
@@ -172,6 +200,56 @@ const metal_tensor&
 metal_kv_cache::values() const noexcept
 {
     return values_;
+}
+
+std::size_t
+metal_kv_cache::checkpoint_bytes(std::size_t tokens) const noexcept
+{
+    if (!tokens || tokens > block_count() * block_size())
+        return 0;
+    const auto bytes = tokens * elements_per_token() * layer_count() * sizeof(float);
+    return bytes <= std::numeric_limits<std::size_t>::max() / 2 ? 2 * bytes : 0;
+}
+
+bool
+metal_kv_cache::valid_prefix(std::span<const block_id> blocks, std::size_t tokens) const noexcept
+{
+    if (!checkpoint_bytes(tokens))
+        return false;
+    const auto required = 1 + (tokens - 1) / block_size();
+    return blocks.size() >= required
+        && std::ranges::all_of(blocks.first(required),
+                               [&](auto block) { return block < block_count(); });
+}
+
+result<std::unique_ptr<kv_cache_checkpoint>, state_error>
+metal_kv_cache::checkpoint(std::span<const block_id> blocks, std::size_t tokens) const
+try {
+    if (!valid_prefix(blocks, tokens))
+        return fail(state_errc::invalid_reservation);
+    auto saved = std::make_unique<kv_cache_checkpoint>(config_, tokens);
+    saved->keys.resize(checkpoint_bytes(tokens) / 2);
+    saved->values.resize(saved->keys.size());
+    copy_prefix(keys_.buffer().bytes(), saved->keys, blocks, *this, tokens, false);
+    copy_prefix(values_.buffer().bytes(), saved->values, blocks, *this, tokens, false);
+    return saved;
+} catch (const std::bad_alloc&) {
+    return fail(state_errc::allocation_failed);
+}
+
+result<void, state_error>
+metal_kv_cache::restore(std::span<const block_id> blocks, const kv_cache_checkpoint& saved)
+{
+    if (!valid_prefix(blocks, saved.token_count)
+        || saved.config.layer_count != layer_count()
+        || saved.config.kv_head_count != kv_head_count()
+        || saved.config.head_dimension != head_dimension()
+        || saved.keys.size() != checkpoint_bytes(saved.token_count) / 2
+        || saved.values.size() != saved.keys.size())
+        return fail(state_errc::invalid_reservation);
+    copy_prefix(saved.keys, keys_.buffer().bytes(), blocks, *this, saved.token_count, true);
+    copy_prefix(saved.values, values_.buffer().bytes(), blocks, *this, saved.token_count, true);
+    return {};
 }
 
 } // namespace chibillm

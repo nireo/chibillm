@@ -25,6 +25,13 @@ def positive(text):
     return value
 
 
+def nonnegative(text):
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError('must be nonnegative')
+    return value
+
+
 def read_records(path, expected):
     rows = [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
     if len(rows) != expected:
@@ -63,6 +70,7 @@ def run_session(args, prompt, budget, count, metrics_path):
     command = [args.binary, '--context-length', str(args.context_length),
                '--max-tokens', str(budget), '--progress=off',
                '--quantize', args.quantize,
+               '--prompt-cache-mib', str(args.prompt_cache_mib),
                '--metrics-jsonl', str(metrics_path)]
     if not args.stream:
         command.append('--no-stream')
@@ -101,6 +109,8 @@ def main():
     parser.add_argument('--binary', default='build/chibillm')
     parser.add_argument('--model', default='qwen3_5_model')
     parser.add_argument('--quantize', choices=['none', 'q4'], default='none')
+    parser.add_argument('--prompt-cache-mib', type=nonnegative, default=0,
+                        help='prefix cache budget; disabled by default to measure prefill')
     parser.add_argument('--output', required=True)
     parser.add_argument('--mode', choices=['warm', 'cold', 'both'], default='warm')
     parser.add_argument('--iterations', type=positive, default=3)
@@ -121,6 +131,7 @@ def main():
         'platform': platform.platform(), 'machine': platform.machine(), 'cpu': cpu,
         'binary_sha256': binary_hash, 'model_directory': str(Path(args.model).resolve()),
         'quantization': args.quantize,
+        'prompt_cache_mib': args.prompt_cache_mib,
     }, 'processes': [], 'results': [], 'summaries': []}
     modes = ['cold', 'warm'] if args.mode == 'both' else [args.mode]
     with tempfile.TemporaryDirectory(prefix='chibillm-benchmark-') as directory:

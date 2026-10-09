@@ -1,5 +1,6 @@
 #include "seq.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <utility>
@@ -15,7 +16,10 @@ seq::seq(seq_id id, std::vector<token_id> prompt_tokens, generation_params param
 }
 
 result<seq, seq_errc>
-seq::make(seq_id id, std::vector<token_id> prompt_tokens, generation_params params)
+seq::make(seq_id id,
+          std::vector<token_id> prompt_tokens,
+          generation_params params,
+          std::vector<std::size_t> checkpoints)
 {
     if (prompt_tokens.empty()) {
         return fail(seq_errc::empty_prompt);
@@ -25,11 +29,35 @@ seq::make(seq_id id, std::vector<token_id> prompt_tokens, generation_params para
         return fail(seq_errc::invalid_max_new_tokens);
     }
 
-    return seq {
+    if (checkpoints.empty() && prompt_tokens.size() > 1)
+        checkpoints.push_back(prompt_tokens.size() - 1);
+    std::ranges::sort(checkpoints);
+    if ((!checkpoints.empty()
+         && (!checkpoints.front() || checkpoints.back() >= prompt_tokens.size()))
+        || std::adjacent_find(checkpoints.begin(), checkpoints.end()) != checkpoints.end())
+        return fail(seq_errc::invalid_cached_prefix);
+    auto sequence = seq {
         id,
         std::move(prompt_tokens),
         params,
     };
+    sequence.checkpoints_ = std::move(checkpoints);
+    return sequence;
+}
+
+result<void, seq_errc>
+seq::restore_prefix(std::size_t count)
+{
+    if (status_ != seq_status::waiting
+        || processed_token_count_
+        || scheduled_token_count_
+        || completion_token_count()
+        || !count
+        || count >= prompt_token_count_)
+        return fail(seq_errc::invalid_cached_prefix);
+    processed_token_count_ = cached_token_count_ = count;
+    assert_invariants();
+    return {};
 }
 
 seq_id

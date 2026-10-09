@@ -32,6 +32,10 @@ public:
     void release(seq_id id) noexcept override;
     std::size_t block_size() const noexcept override;
     sequence_resources resources(seq_id id) const noexcept override;
+    std::size_t checkpoint_bytes(std::size_t tokens) const noexcept override;
+    result<std::unique_ptr<model_checkpoint>, state_error>
+    checkpoint(seq_id id, std::size_t tokens) const override;
+    result<void, state_error> restore(seq_id id, const model_checkpoint& saved) override;
 
     result<void, state_error> begin_batch(const model_batch& batch) override;
     void commit_batch() noexcept override;
@@ -64,6 +68,15 @@ private:
         seq_id id;
         std::size_t end_position;
         std::vector<layer_snapshot> layers;
+    };
+
+    struct prefix_checkpoint final : kv_cache_checkpoint {
+        explicit prefix_checkpoint(kv_cache_checkpoint kv)
+            : kv_cache_checkpoint(std::move(kv))
+        {}
+
+        std::vector<layer_snapshot> layers;
+        std::size_t size_bytes() const noexcept override;
     };
 
     qwen3_5_model_state(const metal_context& context,

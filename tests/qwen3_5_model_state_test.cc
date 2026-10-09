@@ -162,6 +162,52 @@ TEST_CASE("hybrid state maps official layers to 18 recurrent states and six KV l
     CHECK(state.linear_state(7, 24) == nullptr);
 }
 
+TEST_CASE(
+    "hybrid checkpoints fork exact recurrent prefixes into independent pages and survive retries")
+{
+    const auto& context = test_context();
+    auto state = make_state(context);
+    REQUIRE(state->reserve(1, 4));
+    auto prefix = batch_for(*state, { 1 }, 3);
+    REQUIRE(state->begin_batch(prefix));
+    execute(context, *state, prefix);
+    CHECK_FALSE(state->checkpoint(1, 3)); // GPU transaction must be committed.
+    state->commit_batch();
+    auto saved = state->checkpoint(1, 3);
+    REQUIRE(saved);
+    CHECK((*saved)->size_bytes() == state->checkpoint_bytes(3));
+    CHECK_FALSE(state->checkpoint(1, 2)); // Recurrent state cannot be shortened.
+    const auto before = read_floats(state->linear_state(1, 0)->recurrent);
+
+    auto suffix = batch_for(*state, { 1 });
+    REQUIRE(state->begin_batch(suffix));
+    const auto expected = execute(context, *state, suffix);
+    state->commit_batch();
+    REQUIRE(state->restore(2, **saved));
+    REQUIRE(state->restore(3, **saved));
+    CHECK(state->committed_tokens(2) == 3);
+    CHECK(read_floats(state->linear_state(2, 0)->recurrent) == before);
+    CHECK(state->resources(2).blocks.front() != state->resources(3).blocks.front());
+    CHECK_FALSE(state->restore(1, **saved)); // Do not overwrite a live prefix.
+
+    REQUIRE(state->reserve(2, 4));
+    REQUIRE(state->reserve(3, 4));
+    auto branch = batch_for(*state, { 2 });
+    REQUIRE(state->begin_batch(branch));
+    CHECK(execute(context, *state, branch) == expected);
+    state->abort_batch();
+    CHECK(state->committed_tokens(2) == 3);
+    CHECK(read_floats(state->linear_state(2, 0)->recurrent) == before);
+    REQUIRE(state->begin_batch(branch));
+    CHECK(execute(context, *state, branch) == expected);
+    state->commit_batch();
+    CHECK(read_floats(state->linear_state(3, 0)->recurrent) == before);
+    auto other = batch_for(*state, { 3 });
+    REQUIRE(state->begin_batch(other));
+    CHECK(execute(context, *state, other) == expected);
+    state->commit_batch();
+}
+
 TEST_CASE("hybrid reservations grow without resetting and release returns both memory and pages")
 {
     auto state = make_state(test_context(), 3);

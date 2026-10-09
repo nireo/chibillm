@@ -49,6 +49,7 @@ struct request_state {
     std::string output;
     std::unique_ptr<text_decoder> decoder;
     std::size_t prompt_tokens {};
+    std::size_t cached_prompt_tokens {};
     std::size_t completion_tokens {};
     finish_reason reason { finish_reason::none };
     std::optional<generation_error> error;

@@ -42,7 +42,7 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_warm_session_resets_history_without_restarting_process(self):
         args = SimpleNamespace(binary='chibillm', model='model', context_length=4096,
-                               stream=False, timeout=10, quantize='q4')
+                               stream=False, timeout=10, quantize='q4', prompt_cache_mib=128)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'metrics.jsonl'
             row = {'schema_version': 1, 'type': 'request', 'status': 'ok', 'output_bytes': 1}
@@ -51,6 +51,7 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertIn('--no-stream', command)
                 self.assertIn('--progress=off', command)
                 self.assertEqual(command[command.index('--quantize') + 1], 'q4')
+                self.assertEqual(command[command.index('--prompt-cache-mib') + 1], '128')
                 self.assertEqual(kwargs['input'], b'hello\n/reset\n' * 4 + b'/quit\n')
                 path.write_text((json.dumps(row) + '\n') * 4)
                 return subprocess.CompletedProcess(command, 0, stdout=b'qwen> A\n' * 4, stderr=b'')

@@ -3,6 +3,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -236,4 +237,48 @@ TEST_CASE("Qwen tokenizer accepts byte-level BPE with no merge rules")
     auto tokenizer = chibillm::qwen_tokenizer::load(fixture.path());
     REQUIRE(tokenizer);
     CHECK(tokenizer->encode("Hello").value() == std::vector<chibillm::token_id> { 1, 2, 3, 3, 4 });
+}
+
+TEST_CASE("chat checkpoints preserve tokenization and match shared systems and the next "
+          "conversation turn")
+{
+    const auto root = std::filesystem::path(QWEN3_5_MODEL_PATH).parent_path();
+    for (const auto& directory : { root / "qwen_model", root / "qwen3_5_model" }) {
+        if (!std::filesystem::exists(directory / "tokenizer_config.json"))
+            continue;
+        CAPTURE(directory);
+        auto tokenizer = chibillm::qwen_tokenizer::load(directory);
+        REQUIRE(tokenizer);
+        const std::vector<chibillm::chat_message> first {
+            { "system", "You are a helpful assistant." },
+            { "developer", "Be brief." },
+            { "user", "Say hello." },
+        };
+        auto next = first;
+        next.push_back({ "assistant", "Hello." });
+        next.push_back({ "user", "Say goodbye." });
+        auto initial = tokenizer->encode_chat(first);
+        auto continued = tokenizer->encode_chat(next);
+        REQUIRE(initial);
+        REQUIRE(continued);
+        REQUIRE(initial->checkpoints.size() == 2);
+        REQUIRE(continued->checkpoints.size() == 2);
+        CHECK(initial->checkpoints.front() == continued->checkpoints.front());
+        const auto boundary = initial->checkpoints.back();
+        CHECK(std::ranges::equal(std::span(initial->tokens).first(boundary),
+                                 std::span(continued->tokens).first(boundary)));
+        CHECK(initial->tokens[boundary] != continued->tokens[boundary]);
+        for (bool thinking : { false, true }) {
+            auto formatted = chibillm::format_qwen_chat(next, thinking);
+            REQUIRE(formatted);
+            auto ordinary = tokenizer->encode(formatted->text);
+            auto with_boundaries = tokenizer->encode_chat(next, thinking);
+            REQUIRE(ordinary);
+            REQUIRE(with_boundaries);
+            CHECK(*ordinary == with_boundaries->tokens);
+            CHECK(std::ranges::is_sorted(with_boundaries->checkpoints));
+            for (const auto point : with_boundaries->checkpoints)
+                CHECK(point < with_boundaries->tokens.size());
+        }
+    }
 }

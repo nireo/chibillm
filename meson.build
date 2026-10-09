@@ -68,6 +68,7 @@ chibillm_core = static_library(
   'chibillm_core',
   [
     'src/seq.cc',
+    'src/prefix_cache.cc',
     'src/block_manager.cc',
     'src/scheduler.cc',
     'src/model_batch.cc',
@@ -175,6 +176,7 @@ foreach spec : [
   {'name': 'unit', 'sources': ['tests/seq_test.cc', 'tests/block_manager_test.cc'], 'library': chibillm_core},
   {'name': 'repl', 'sources': ['tests/repl_test.cc', 'tests/generation_metrics_test.cc', 'src/repl.cc', 'src/cli_options.cc', 'src/generation_metrics.cc'], 'library': chibillm_core, 'deps': [nlohmann_json_dep]},
   {'name': 'scheduler', 'sources': ['tests/scheduler_test.cc'], 'library': chibillm_core},
+  {'name': 'prefix cache', 'sources': ['tests/prefix_cache_test.cc'], 'library': chibillm_core},
   {'name': 'model batch', 'sources': ['tests/model_batch_test.cc'], 'library': chibillm_core},
   {'name': 'inference engine', 'sources': ['tests/inference_engine_test.cc', 'tests/fake_model_runner.cc'], 'library': chibillm_core},
   {'name': 'server', 'sources': ['tests/server_test.cc', 'tests/serving_runtime_test.cc'], 'library': chibillm_server, 'deps': [cpp_httplib_dep, nlohmann_json_dep]},
@@ -184,6 +186,7 @@ foreach spec : [
   {'name': 'qwen tokenizer', 'sources': ['tests/qwen_tokenizer_test.cc'], 'library': chibillm_qwen, 'deps': [nlohmann_json_dep]},
   {'name': 'safetensors', 'sources': ['tests/safetensors_test.cc'], 'library': chibillm_model_format, 'deps': [nlohmann_json_dep]},
   {'name': 'qwen weights', 'sources': ['tests/qwen_weights_test.cc'], 'library': chibillm_models, 'deps': [nlohmann_json_dep]},
+  {'name': 'prompt cache generation', 'sources': ['tests/prompt_cache_generation_test.cc'], 'library': chibillm_models},
   {'name': 'kv cache', 'sources': ['tests/metal_kv_cache_test.cc'], 'library': chibillm_metal},
   {'name': 'tensor', 'sources': ['tests/tensor_test.cc'], 'library': chibillm_metal},
   {'name': 'deltanet', 'sources': ['tests/deltanet_test.cc'], 'library': chibillm_metal},

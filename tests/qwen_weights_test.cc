@@ -914,15 +914,15 @@ TEST_CASE("Qwen3.5 official checkpoint generates consistently across batching an
         };
         if (budget == 7) {
             // Release a partially populated recurrent state and reuse its ID/pages.
-            add(1, *second_prompt);
+            add(1, second_prompt->tokens);
             auto partial = engine->step();
             REQUIRE(partial.has_value());
             CHECK(partial->empty());
             REQUIRE(engine->cancel(1).has_value());
             REQUIRE(engine->remove(1).has_value());
         }
-        add(1, *first_prompt);
-        add(2, *second_prompt);
+        add(1, first_prompt->tokens);
+        add(2, second_prompt->tokens);
         for (int step = 0; !engine->is_finished() && step < 64; ++step)
             REQUIRE(engine->step().has_value());
         REQUIRE(engine->is_finished());

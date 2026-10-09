@@ -42,6 +42,31 @@ public:
         return pages_.resources(id);
     }
 
+    std::size_t
+    checkpoint_bytes(std::size_t tokens) const noexcept override
+    {
+        return cache_.checkpoint_bytes(tokens);
+    }
+
+    result<std::unique_ptr<model_checkpoint>, state_error>
+    checkpoint(seq_id id, std::size_t tokens) const override
+    {
+        auto saved = cache_.checkpoint(resources(id).blocks, tokens);
+        if (!saved)
+            return fail(saved.error());
+        return std::move(*saved);
+    }
+
+    result<void, state_error>
+    restore(seq_id id, const model_checkpoint& checkpoint) override
+    {
+        const auto* saved = dynamic_cast<const kv_cache_checkpoint*>(&checkpoint);
+        if (!saved)
+            return fail(state_errc::invalid_reservation);
+        CL_TRY(reserve(id, saved->token_count));
+        return cache_.restore(resources(id).blocks, *saved);
+    }
+
     metal_kv_cache&
     cache()
     {

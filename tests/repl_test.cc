@@ -61,12 +61,12 @@ public:
         return metadata;
     }
 
-    chibillm::result<std::vector<chibillm::token_id>, chibillm::model_runner_error>
+    chibillm::result<chibillm::encoded_prompt, chibillm::model_runner_error>
     encode_chat(std::span<const chibillm::chat_message> messages) override
     {
         histories.emplace_back(messages.begin(), messages.end());
         calls = 0;
-        return std::vector<chibillm::token_id>(prompt_size, 1);
+        return chibillm::encoded_prompt { std::vector<chibillm::token_id>(prompt_size, 1), {} };
     }
 
     chibillm::result<std::string, chibillm::model_runner_error>
@@ -388,5 +388,26 @@ TEST_CASE("CLI quantization is opt-in and rejects unsupported formats")
     CHECK(chibillm::parse_cli_options(3, args)->quantization
           == chibillm::weight_quantization::none);
     args[2] = unsupported;
+    CHECK_FALSE(chibillm::parse_cli_options(3, args));
+}
+
+TEST_CASE("CLI accepts a byte-bounded prompt cache and disabling it")
+{
+    char program[] = "chibillm";
+    char option[] = "--prompt-cache-mib";
+    char budget[] = "64";
+    char zero[] = "0";
+    char negative[] = "-1";
+    char overflow[] = "18446744073709551615";
+    char* args[] = { program, option, budget };
+    CHECK(chibillm::parse_cli_options(1, args)->prefix_cache_mib == 128);
+    CHECK_FALSE(chibillm::parse_cli_options(2, args));
+    REQUIRE(chibillm::parse_cli_options(3, args));
+    CHECK(chibillm::parse_cli_options(3, args)->prefix_cache_mib == 64);
+    args[2] = zero;
+    CHECK(chibillm::parse_cli_options(3, args)->prefix_cache_mib == 0);
+    args[2] = negative;
+    CHECK_FALSE(chibillm::parse_cli_options(3, args));
+    args[2] = overflow;
     CHECK_FALSE(chibillm::parse_cli_options(3, args));
 }

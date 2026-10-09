@@ -52,7 +52,7 @@ public:
         return value;
     }
 
-    result<std::vector<token_id>, model_runner_error>
+    result<chibillm::encoded_prompt, model_runner_error>
     encode_chat(std::span<const chibillm::chat_message>) override
     {
         return chibillm::fail(model_runner_errc::backend_failure);
@@ -261,10 +261,10 @@ TEST_CASE(
             return result;
         }
 
-        result<std::vector<token_id>, model_runner_error>
+        result<chibillm::encoded_prompt, model_runner_error>
         encode_chat(std::span<const chibillm::chat_message>) override
         {
-            return std::vector<token_id> { 1 };
+            return chibillm::encoded_prompt { { 1 }, {} };
         }
 
         result<std::string, model_runner_error>

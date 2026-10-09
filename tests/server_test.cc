@@ -39,7 +39,7 @@ public:
         return info_;
     }
 
-    result<std::vector<token_id>, model_runner_error>
+    result<chibillm::encoded_prompt, model_runner_error>
     encode_chat(std::span<const chat_message> messages) override
     {
         if (std::exchange(fail_encode, false))
@@ -48,7 +48,7 @@ public:
         if (messages.empty()) {
             return chibillm::fail(model_runner_errc::invalid_chat);
         }
-        return std::vector<token_id> { 1 };
+        return chibillm::encoded_prompt { { 1 }, {} };
     }
 
     result<std::string, model_runner_error>

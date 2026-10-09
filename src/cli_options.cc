@@ -1,6 +1,7 @@
 #include "cli_options.h"
 
 #include <charconv>
+#include <limits>
 #include <ostream>
 #include <string_view>
 
@@ -13,6 +14,7 @@ print_usage(std::ostream& output)
               "  --context-length N  Prompt + output capacity (default: 32768; multiple of 16)\n"
               "  --kv-cache-tokens N Shared server KV capacity (default: context length; multiple "
               "of 16)\n"
+              "  --prompt-cache-mib N Prefix checkpoint budget (default: 128 MiB; 0 disables)\n"
               "  --max-tokens N      Reply limit / server default (default: 8192)\n"
               "  --quantize none|q4  Quantize eligible BF16 matrices once at load (default: none)\n"
               "                      Prequantized MLX Q4/Q8 checkpoints load automatically\n"
@@ -52,6 +54,17 @@ parse_cli_options(int argc, char** argv)
                 value == "q4" ? weight_quantization::q4 : weight_quantization::none;
         } else if (arg == "--serve") {
             settings.serve = true;
+        } else if (arg == "--prompt-cache-mib") {
+            if (++i >= argc)
+                return fail("missing value for --prompt-cache-mib");
+            const std::string_view text(argv[i]);
+            std::size_t value = 0;
+            const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+            if (parsed.ec != std::errc {}
+                || parsed.ptr != text.data() + text.size()
+                || value > std::numeric_limits<std::size_t>::max() / (1024 * 1024))
+                return fail("invalid prompt cache budget: " + std::string(text));
+            settings.prefix_cache_mib = value;
         } else if (arg == "--context-length"
                    || arg == "--max-tokens"
                    || arg == "--kv-cache-tokens") {

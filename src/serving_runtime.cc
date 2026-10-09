@@ -134,8 +134,8 @@ private:
                   .code = std::string(error_name(prompt.error().code)) });
             return;
         }
-        if (prompt->size() >= context_limit
-            || submission.request.max_completion_tokens > context_limit - prompt->size()) {
+        if (prompt->tokens.size() >= context_limit
+            || submission.request.max_completion_tokens > context_limit - prompt->tokens.size()) {
             finish_error(
                 submission.state,
                 { .kind = generation_errc::invalid_input,
@@ -145,8 +145,9 @@ private:
             return;
         }
 
-        auto sequence = seq::make(submission.state->id, std::move(*prompt),
-                                  { .max_new_tokens = submission.request.max_completion_tokens });
+        auto sequence = seq::make(submission.state->id, std::move(prompt->tokens),
+                                  { .max_new_tokens = submission.request.max_completion_tokens },
+                                  std::move(prompt->checkpoints));
         if (!sequence) {
             finish_error(
                 submission.state,
@@ -258,6 +259,11 @@ private:
                                .param = "max_completion_tokens",
                                .code = "cache_capacity_exceeded" });
             } else {
+                {
+                    std::lock_guard lock(request.state->mutex);
+                    request.state->cached_prompt_tokens =
+                        engine_.find_sequence(request.state->id)->cached_token_count();
+                }
                 active_.emplace(request.state->id, request.state);
             }
             pending_.pop_front();

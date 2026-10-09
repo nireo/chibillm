@@ -21,10 +21,10 @@ public:
         return info;
     }
 
-    result<std::vector<token_id>, model_runner_error>
+    result<encoded_prompt, model_runner_error>
     encode_chat(std::span<const chat_message> messages) override
     {
-        return std::vector<token_id>(messages.front().content.size(), 10);
+        return encoded_prompt { std::vector<token_id>(messages.front().content.size(), 10), {} };
     }
 
     result<std::string, model_runner_error>

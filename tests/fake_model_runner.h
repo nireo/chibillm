@@ -8,7 +8,7 @@ public:
 
     [[nodiscard]] const model_info& info() const noexcept override;
 
-    [[nodiscard]] result<std::vector<token_id>, model_runner_error>
+    [[nodiscard]] result<encoded_prompt, model_runner_error>
     encode_chat(std::span<const chat_message> messages) override;
 
     [[nodiscard]] result<std::string, model_runner_error>

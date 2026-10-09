@@ -151,24 +151,26 @@ generate(model_runner& runner,
     metrics.tokenization_seconds = seconds(encode_started, clock::now());
     if (!prompt)
         return fail(chat_errc::generation_failed, prompt.error(), "tokenization");
-    metrics.prompt_tokens = prompt->size();
+    metrics.prompt_tokens = prompt->tokens.size();
     metrics.stage = "context_check";
     const auto context_length = runner.info().max_context_tokens;
-    if (prompt->size() >= context_length) {
+    if (metrics.prompt_tokens >= context_length) {
         metrics.stop = "context_capacity";
         return fail(chat_errc::context_full);
     }
 
-    metrics.token_budget = std::min(max_new_tokens, context_length - prompt->size());
+    metrics.token_budget = std::min(max_new_tokens, context_length - metrics.prompt_tokens);
     metrics.stage = "admission";
-    auto sequence = seq::make(1, std::move(*prompt),
-                              { .max_new_tokens = metrics.token_budget, .ignore_eos = false });
+    auto sequence = seq::make(1, std::move(prompt->tokens),
+                              { .max_new_tokens = metrics.token_budget, .ignore_eos = false },
+                              std::move(prompt->checkpoints));
     metrics.admission_at = seconds(submitted, clock::now());
     if (!sequence)
         return fail(chat_errc::generation_failed, sequence.error(), "create sequence");
     auto added = engine.add(std::move(*sequence));
     if (!added)
         return fail(chat_errc::generation_failed, added.error(), "admission");
+    metrics.cached_prompt_tokens = engine.find_sequence(1)->cached_token_count();
 
     metrics.stage = "decoder_setup";
     auto decoder = stream ? runner.make_decoder() : nullptr;
@@ -176,7 +178,7 @@ generate(model_runner& runner,
         return fail(chat_errc::generation_failed, "decoder creation returned null",
                     "decoder setup");
     std::string text;
-    display.update(0, metrics.prompt_tokens, clock::now());
+    display.update(metrics.cached_prompt_tokens, metrics.prompt_tokens, clock::now());
     while (!engine.is_finished()) {
         const auto* current = engine.find_sequence(1);
         if (!current)
@@ -278,7 +280,9 @@ print_performance(const generation_metrics& m)
         << std::setprecision(3)
         << "[perf] prompt "
         << m.prompt_tokens
-        << " tok | output "
+        << " tok ("
+        << m.cached_prompt_tokens
+        << " cached) | output "
         << m.output_tokens
         << " tok | tokenize "
         << m.tokenization_seconds * 1000

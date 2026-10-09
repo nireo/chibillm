@@ -21,6 +21,7 @@ struct latency_summary {
 // Accounting accepts timestamps explicitly so boundaries can be tested without sleeps.
 struct generation_metrics {
     std::size_t prompt_tokens = 0;
+    std::size_t cached_prompt_tokens = 0;
     std::size_t processed_prompt_tokens = 0;
     std::size_t output_tokens = 0; // Includes EOS, even if it produces no text.
     std::size_t output_bytes = 0;  // Successfully decoded answer bytes, not terminal framing.

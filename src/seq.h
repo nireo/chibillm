@@ -39,6 +39,7 @@ enum class seq_errc : std::uint8_t {
     work_already_scheduled,
     too_many_scheduled_tokens,
     no_work_scheduled,
+    invalid_cached_prefix,
 };
 
 [[nodiscard]] inline std::string_view
@@ -49,7 +50,7 @@ error_name(seq_errc code) noexcept
         "seq.already_finished",       "seq.invalid_state_transition",
         "seq.invalid_finish_reason",  "seq.zero_scheduled_tokens",
         "seq.work_already_scheduled", "seq.too_many_scheduled_tokens",
-        "seq.no_work_scheduled",
+        "seq.no_work_scheduled",      "seq.invalid_cached_prefix",
     };
     const auto index = static_cast<std::size_t>(code);
     return index < names.size() ? names[index] : "seq.unknown_error";
@@ -61,8 +62,10 @@ struct generation_params {
 };
 
 struct seq {
-    [[nodiscard]] static result<seq, seq_errc>
-    make(seq_id id, std::vector<token_id> prompt_tokens, generation_params params);
+    [[nodiscard]] static result<seq, seq_errc> make(seq_id id,
+                                                    std::vector<token_id> prompt_tokens,
+                                                    generation_params params,
+                                                    std::vector<std::size_t> checkpoints = {});
 
     seq(const seq&) = delete;
     seq& operator=(const seq&) = delete;
@@ -91,6 +94,20 @@ struct seq {
     [[nodiscard]] result<void, seq_errc> finish(finish_reason reason);
 
     [[nodiscard]] std::size_t processed_token_count() const noexcept;
+
+    [[nodiscard]] std::size_t
+    cached_token_count() const noexcept
+    {
+        return cached_token_count_;
+    }
+
+    [[nodiscard]] std::span<const std::size_t>
+    checkpoints() const noexcept
+    {
+        return checkpoints_;
+    }
+
+    [[nodiscard]] result<void, seq_errc> restore_prefix(std::size_t count);
     [[nodiscard]] std::size_t scheduled_token_count() const noexcept;
 
     // scheduled tokens stay unprocessed until model execution succeeds.
@@ -123,6 +140,8 @@ private:
 
     // processed tokens always form a prefix of tokens_.
     std::size_t processed_token_count_ { 0 };
+    std::size_t cached_token_count_ { 0 };
+    std::vector<std::size_t> checkpoints_;
     std::size_t scheduled_token_count_ { 0 };
 
     generation_params params_;

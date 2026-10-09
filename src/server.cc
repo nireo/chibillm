@@ -195,6 +195,7 @@ usage_json(const request_state& state)
 {
     return {
         { "prompt_tokens", state.prompt_tokens },
+        { "prompt_tokens_details", { { "cached_tokens", state.cached_prompt_tokens } } },
         { "completion_tokens", state.completion_tokens },
         { "total_tokens", state.prompt_tokens + state.completion_tokens },
     };

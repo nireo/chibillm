@@ -44,19 +44,6 @@ private:
     std::string pending_;
 };
 
-result<std::vector<token_id>, model_runner_error>
-encode_qwen_chat(const qwen_tokenizer& tokenizer, std::span<const chat_message> messages)
-{
-    auto prompt = format_qwen_chat(messages);
-    if (!prompt)
-        return fail(prompt.error());
-    auto tokens = tokenizer.encode(*prompt);
-    if (!tokens) {
-        return fail(model_runner_errc::tokenizer_failure, tokens.error(), "chat encode");
-    }
-    return std::move(*tokens);
-}
-
 result<std::string, model_runner_error>
 decode_qwen_text(const qwen_tokenizer& tokenizer, std::span<const token_id> tokens)
 {
@@ -196,10 +183,10 @@ qwen_model_runner::info() const noexcept
     return info_;
 }
 
-result<std::vector<token_id>, model_runner_error>
+result<encoded_prompt, model_runner_error>
 qwen_model_runner::encode_chat(std::span<const chat_message> messages)
 {
-    return encode_qwen_chat(tokenizer_, messages);
+    return tokenizer_.encode_chat(messages);
 }
 
 result<std::string, model_runner_error>
@@ -333,10 +320,10 @@ qwen3_5_model_runner::info() const noexcept
     return info_;
 }
 
-result<std::vector<token_id>, model_runner_error>
+result<encoded_prompt, model_runner_error>
 qwen3_5_model_runner::encode_chat(std::span<const chat_message> messages)
 {
-    return encode_qwen_chat(tokenizer_, messages);
+    return tokenizer_.encode_chat(messages);
 }
 
 result<std::string, model_runner_error>

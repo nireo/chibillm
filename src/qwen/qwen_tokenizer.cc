@@ -557,7 +557,17 @@ qwen_tokenizer::encode_piece(std::string_view piece) const
 result<std::vector<token_id>, qwen_tokenizer_errc>
 qwen_tokenizer::encode(std::string_view text) const
 {
-    std::vector<token_id> output;
+    auto prompt = encode_prompt(text, {});
+    if (!prompt)
+        return fail(prompt.error());
+    return std::move(prompt->tokens);
+}
+
+result<encoded_prompt, qwen_tokenizer_errc>
+qwen_tokenizer::encode_prompt(std::string_view text,
+                              std::span<const std::size_t> checkpoint_offsets) const
+{
+    encoded_prompt output;
     const auto encode_ordinary =
         [&](std::string_view ordinary) -> result<void, qwen_tokenizer_errc> {
         auto pieces = pretokenize(ordinary);
@@ -569,7 +579,7 @@ qwen_tokenizer::encode(std::string_view text) const
             if (!encoded) {
                 return fail(encoded.error());
             }
-            output.insert(output.end(), encoded->begin(), encoded->end());
+            output.tokens.insert(output.tokens.end(), encoded->begin(), encoded->end());
         }
         return {};
     };
@@ -596,10 +606,27 @@ qwen_tokenizer::encode(std::string_view text) const
         if (!encoded) {
             return fail(encoded.error());
         }
-        output.push_back(next_token->second);
+        // Record only actual tokenizer boundaries; never split ordinary BPE text.
+        if (!output.tokens.empty()
+            && std::ranges::binary_search(checkpoint_offsets, next_offset)
+            && (output.checkpoints.empty() || output.checkpoints.back() != output.tokens.size()))
+            output.checkpoints.push_back(output.tokens.size());
+        output.tokens.push_back(next_token->second);
         offset = next_offset + next_token->first.size();
     }
     return output;
+}
+
+result<encoded_prompt, model_runner_error>
+qwen_tokenizer::encode_chat(std::span<const chat_message> messages, bool thinking) const
+{
+    auto prompt = format_qwen_chat(messages, thinking);
+    if (!prompt)
+        return fail(prompt.error());
+    auto encoded = encode_prompt(prompt->text, prompt->checkpoint_offsets);
+    if (!encoded)
+        return fail(model_runner_errc::tokenizer_failure, encoded.error(), "chat encode");
+    return std::move(*encoded);
 }
 
 result<std::string, qwen_tokenizer_errc>
@@ -634,14 +661,16 @@ qwen_tokenizer::decode(std::span<const token_id> tokens, bool skip_special_token
     return output;
 }
 
-result<std::string, model_runner_error>
+result<formatted_chat, model_runner_error>
 format_qwen_chat(std::span<const chat_message> messages, bool thinking)
 {
     if (messages.empty()) {
         return fail(model_runner_errc::invalid_chat);
     }
 
-    std::string prompt;
+    formatted_chat prompt;
+    std::size_t system_end = 0;
+    bool system_prefix = true;
     for (const auto& message : messages) {
         if (message.role != "developer"
             && message.role != "system"
@@ -650,11 +679,20 @@ format_qwen_chat(std::span<const chat_message> messages, bool thinking)
             return fail(model_runner_errc::invalid_chat);
         }
         const auto role = message.role == "developer" ? "system" : message.role;
-        prompt += "<|im_start|>" + role + "\n" + message.content + "<|im_end|>\n";
+        prompt.text += "<|im_start|>" + role + "\n" + message.content + "<|im_end|>\n";
+        system_prefix = system_prefix && role == "system";
+        if (system_prefix)
+            system_end = prompt.text.size();
     }
-    prompt += "<|im_start|>assistant\n";
-    if (!thinking)
-        prompt += "<think>\n\n</think>\n\n";
+    if (system_end)
+        prompt.checkpoint_offsets.push_back(system_end);
+    if (thinking)
+        prompt.checkpoint_offsets.push_back(prompt.text.size());
+    prompt.text += "<|im_start|>assistant\n";
+    if (!thinking) {
+        prompt.checkpoint_offsets.push_back(prompt.text.size());
+        prompt.text += "<think>\n\n</think>\n\n";
+    }
 
     return prompt;
 }

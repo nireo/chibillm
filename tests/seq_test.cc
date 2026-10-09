@@ -34,6 +34,25 @@ TEST_CASE("a sequence owns its prompt and starts waiting")
     CHECK(sequence.completion_tokens().empty());
 }
 
+TEST_CASE("a restored prefix keeps prompt accounting and leaves tokens to execute")
+{
+    auto sequence = seq::make(1, { 1, 2, 3, 4 }, generation_params {}, { 3, 1 });
+    REQUIRE(sequence);
+    CHECK(sequence->checkpoints()[0] == 1);
+    CHECK(sequence->checkpoints()[1] == 3);
+    CHECK_FALSE(sequence->restore_prefix(0));
+    CHECK_FALSE(sequence->restore_prefix(4));
+    REQUIRE(sequence->restore_prefix(3));
+    CHECK(sequence->cached_token_count() == 3);
+    CHECK(sequence->prompt_token_count() == 4);
+    CHECK(sequence->completion_token_count() == 0);
+    CHECK(sequence->schedulable_token_count() == 1);
+    CHECK_FALSE(sequence->restore_prefix(2));
+    CHECK_FALSE(seq::make(2, { 1, 2 }, generation_params {}, { 2 }));
+    CHECK_FALSE(seq::make(2, { 1, 2 }, generation_params {}, { 0 }));
+    CHECK_FALSE(seq::make(2, { 1, 2 }, generation_params {}, { 1, 1 }));
+}
+
 TEST_CASE("invalid construction arguments return specific errors")
 {
     CHECK(seq::make(1, {}, generation_params {}).error() == seq_errc::empty_prompt);

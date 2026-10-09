@@ -93,6 +93,7 @@ run_application(const cli_options& settings)
         .max_batch_tokens = settings.serve ? 128u : 512u,
         .kv_block_count = kv_block_count,
         .kv_block_size = kv_block_size,
+        .prefix_cache_bytes = settings.prefix_cache_mib * 1024 * 1024,
     };
     const auto max_tokens = std::min(settings.max_tokens, context_length - 1);
     const auto load_time =

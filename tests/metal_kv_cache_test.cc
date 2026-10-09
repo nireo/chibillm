@@ -4,6 +4,7 @@
 #include "metal_test_support.h"
 
 #include <limits>
+#include <numeric>
 
 #include "metal/metal_kv_cache.h"
 #include "tensor/types.h"
@@ -97,4 +98,45 @@ TEST_CASE("metal kv cache flattens coordinates in layout order and rejects inval
     CHECK(cache->element_offset(0, 0, 4, 0, 0).error() == kv_cache_errc::token_offset_out_of_range);
     CHECK(cache->element_offset(0, 0, 0, 2, 0).error() == kv_cache_errc::kv_head_out_of_range);
     CHECK(cache->element_offset(0, 0, 0, 0, 8).error() == kv_cache_errc::head_feature_out_of_range);
+}
+
+TEST_CASE("KV checkpoints remap fragmented pages and copy only the committed partial tail")
+{
+    auto cache = metal_kv_cache::make(metal_test::test_context(), valid_config());
+    REQUIRE(cache);
+    std::vector<float> keys(cache->element_count()), values(cache->element_count());
+    std::iota(keys.begin(), keys.end(), 1.0F);
+    std::iota(values.begin(), values.end(), 1001.0F);
+    metal_test::write_floats(cache->keys(), keys);
+    metal_test::write_floats(cache->values(), values);
+    const std::vector<chibillm::block_id> source { 2, 0 }, target { 0, 1 };
+    auto saved = cache->checkpoint(source, 5);
+    REQUIRE(saved);
+    CHECK((*saved)->size_bytes() == cache->checkpoint_bytes(5));
+    const std::vector<float> zeros(cache->element_count(), 0);
+    metal_test::write_floats(cache->keys(), zeros);
+    metal_test::write_floats(cache->values(), zeros);
+    REQUIRE(cache->restore(target, **saved));
+    const auto restored_keys = metal_test::read_floats(cache->keys());
+    const auto restored_values = metal_test::read_floats(cache->values());
+    for (std::size_t layer = 0; layer < cache->layer_count(); ++layer) {
+        for (std::size_t token = 0; token < 8; ++token) {
+            for (std::size_t feature = 0; feature < cache->elements_per_token(); ++feature) {
+                const auto destination = layer * cache->elements_per_layer()
+                    + token * cache->elements_per_token()
+                    + feature;
+                const auto original = layer * cache->elements_per_layer()
+                    + source[token / 4] * cache->elements_per_block()
+                    + (token % 4) * cache->elements_per_token()
+                    + feature;
+                CHECK(restored_keys[destination] == (token < 5 ? keys[original] : 0));
+                CHECK(restored_values[destination] == (token < 5 ? values[original] : 0));
+            }
+        }
+    }
+    CHECK_FALSE(cache->checkpoint(std::vector<chibillm::block_id> { 3 }, 1));
+    CHECK_FALSE(cache->checkpoint(source, 9));
+    (*saved)->values.pop_back();
+    CHECK_FALSE(cache->restore(target, **saved));
+    CHECK(metal_test::read_floats(cache->keys()) == restored_keys);
 }

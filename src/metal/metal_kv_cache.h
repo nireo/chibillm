@@ -7,6 +7,7 @@
 
 #include "metal/metal_context.h"
 #include "metal/metal_tensor.h"
+#include "model_state.h"
 #include "result.h"
 
 namespace chibillm {
@@ -18,6 +19,24 @@ struct kv_cache_config {
     std::size_t block_size;
     std::size_t kv_head_count;
     std::size_t head_dimension;
+};
+
+// Packed [layer, token, head, feature] data, independent of physical page IDs.
+struct kv_cache_checkpoint : model_checkpoint {
+    kv_cache_checkpoint(kv_cache_config config, std::size_t tokens)
+        : model_checkpoint(tokens)
+        , config(config)
+    {}
+
+    kv_cache_config config;
+    std::vector<std::byte> keys;
+    std::vector<std::byte> values;
+
+    std::size_t
+    size_bytes() const noexcept override
+    {
+        return keys.size() + values.size();
+    }
 };
 
 enum class kv_cache_errc : std::uint8_t {
@@ -87,8 +106,15 @@ public:
     [[nodiscard]] metal_tensor& values() noexcept;
     [[nodiscard]] const metal_tensor& values() const noexcept;
 
+    std::size_t checkpoint_bytes(std::size_t token_count) const noexcept;
+    result<std::unique_ptr<kv_cache_checkpoint>, state_error>
+    checkpoint(std::span<const block_id> blocks, std::size_t token_count) const;
+    result<void, state_error> restore(std::span<const block_id> blocks,
+                                      const kv_cache_checkpoint& saved);
+
 private:
     metal_kv_cache(kv_cache_config config, metal_tensor keys, metal_tensor values);
+    bool valid_prefix(std::span<const block_id> blocks, std::size_t token_count) const noexcept;
 
     kv_cache_config config_;
     metal_tensor keys_;

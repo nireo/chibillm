@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cassert>
 #include <limits>
+#include <new>
 #include <utility>
 
 namespace chibillm {
@@ -77,6 +78,7 @@ scheduler::scheduler(scheduler_config config,
     : config_(config)
     , eos_token_(eos_token)
     , state_(std::move(state))
+    , prefixes_(config.prefix_cache_bytes)
 {
     assert_invariants();
 }
@@ -202,6 +204,26 @@ scheduler::try_add(seq& sequence)
         return fail(scheduler_errc::block_manager_failure, reserved.error(), "admit sequence");
     }
 
+    if (const auto* cached = prefixes_.find(sequence.prompt_tokens())) {
+        bool restored = false;
+        try {
+            restored = state_->restore(id, *cached).has_value();
+        } catch (const std::bad_alloc&) {}
+        if (restored) {
+            auto applied = sequence.restore_prefix(cached->token_count);
+            assert(applied);
+        } else {
+            // A cache miss must not prevent otherwise valid admission.
+            state_->release(id);
+            reserved = state_->reserve(id, 1);
+            if (!reserved) {
+                state_->release(id);
+                return fail(scheduler_errc::block_manager_failure, reserved.error(),
+                            "admit sequence");
+            }
+        }
+    }
+
     auto insert = sequences_.try_emplace(id, std::move(sequence));
     if (!insert.second) {
         return fail(scheduler_errc::duplicate_sequence_id);
@@ -250,8 +272,19 @@ scheduler::schedule()
             const auto available = sequence->schedulable_token_count();
             if (!available || (batch.phase == batch_phase::decode && available != 1))
                 return fail(scheduler_errc::invalid_sequence_state);
-            const auto count =
-                std::min({ available, quantum, config_.max_batch_tokens - used_tokens });
+            auto count = std::min({ available, quantum, config_.max_batch_tokens - used_tokens });
+            if (batch.phase == batch_phase::prefill) {
+                const auto start = sequence->processed_token_count();
+                for (const auto boundary : sequence->checkpoints()) {
+                    if (boundary > start
+                        && boundary < start + count
+                        && cacheable_prefix(boundary)
+                        && !prefixes_.contains(sequence->prompt_tokens().first(boundary))) {
+                        count = boundary - start;
+                        break;
+                    }
+                }
+            }
             auto capacity = state_->reserve(id, sequence->processed_token_count() + count);
             if (!capacity) {
                 if (capacity.error() == state_errc::capacity_exhausted) {
@@ -337,6 +370,8 @@ scheduler::complete(batch_id id, std::span<const token_id> sampled_tokens)
             assert(false && "prevalidated scheduled-token commit failed");
             return fail(scheduler_errc::sequence_failure, committed.error());
         }
+        if (active.phase == batch_phase::prefill)
+            cache_prefix(*sequence);
 
         auto& source = active.phase == batch_phase::prefill ? waiting_ : running_;
         assert(!source.empty() && source.front() == item.id);
@@ -484,6 +519,30 @@ scheduler::remove_from_queue(std::deque<seq_id>& queue, seq_id id) noexcept
 
     queue.erase(found);
     return true;
+}
+
+void
+scheduler::cache_prefix(const seq& sequence) noexcept
+try {
+    const auto count = sequence.processed_token_count();
+    if (!std::ranges::binary_search(sequence.checkpoints(), count) || !cacheable_prefix(count))
+        return;
+    const auto tokens = sequence.prompt_tokens().first(count);
+    if (prefixes_.contains(tokens))
+        return;
+    prefixes_.make_room(count, state_->checkpoint_bytes(count));
+    auto checkpoint = state_->checkpoint(sequence.id(), count);
+    if (checkpoint)
+        prefixes_.insert(tokens, std::move(*checkpoint));
+} catch (const std::bad_alloc&) {
+    // Checkpoint allocation is optional; generation can continue without it.
+}
+
+bool
+scheduler::cacheable_prefix(std::size_t count) const noexcept
+{
+    return count >= config_.prefix_cache_min_tokens
+        && prefixes_.fits(count, state_->checkpoint_bytes(count));
 }
 
 void

@@ -12,7 +12,7 @@ fake_model_runner::info() const noexcept
     return info_;
 }
 
-result<std::vector<token_id>, model_runner_error>
+result<encoded_prompt, model_runner_error>
 fake_model_runner::encode_chat(std::span<const chat_message> messages)
 {
     if (messages.empty()) {
@@ -28,7 +28,7 @@ fake_model_runner::encode_chat(std::span<const chat_message> messages)
     if (tokens.empty()) {
         tokens.push_back(0);
     }
-    return tokens;
+    return encoded_prompt { std::move(tokens), {} };
 }
 
 result<std::string, model_runner_error>

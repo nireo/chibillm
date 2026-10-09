@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "block_manager.h"
+#include "prefix_cache.h"
 #include "result.h"
 #include "seq.h"
 
@@ -33,6 +34,8 @@ struct scheduler_config {
     std::size_t kv_block_size { 16 };
     // Applied only when other sequences compete for inference time.
     std::size_t prefill_chunk_tokens { 64 };
+    std::size_t prefix_cache_bytes { 128 * 1024 * 1024 };
+    std::size_t prefix_cache_min_tokens { 64 };
 };
 
 enum class admission_result : std::uint8_t {
@@ -174,6 +177,8 @@ private:
 
     // cancels token reservations but keeps allocated cache blocks.
     void rollback_reservations(const scheduled_batch& batch) noexcept;
+    bool cacheable_prefix(std::size_t count) const noexcept;
+    void cache_prefix(const seq& sequence) noexcept;
 
     void assert_invariants() const noexcept;
 
@@ -189,6 +194,7 @@ private:
     scheduler_config config_;
     token_id eos_token_;
     std::unique_ptr<model_state> state_;
+    prefix_cache prefixes_;
 
     // the map owns sequences; queues store ids.
     std::unordered_map<seq_id, seq> sequences_;

@@ -42,6 +42,12 @@ struct chat_message {
     std::string content;
 };
 
+struct encoded_prompt {
+    std::vector<token_id> tokens;
+    // Stable prefix boundaries, strictly inside the prompt.
+    std::vector<std::size_t> checkpoints;
+};
+
 struct model_info {
     std::string id;
     std::size_t max_context_tokens;
@@ -69,7 +75,7 @@ public:
 
     [[nodiscard]] virtual const model_info& info() const noexcept = 0;
 
-    [[nodiscard]] virtual result<std::vector<token_id>, model_runner_error>
+    [[nodiscard]] virtual result<encoded_prompt, model_runner_error>
     encode_chat(std::span<const chat_message> messages) = 0;
 
     [[nodiscard]] virtual result<std::string, model_runner_error>

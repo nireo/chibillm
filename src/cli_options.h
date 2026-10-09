@@ -19,6 +19,7 @@ struct cli_options {
     std::size_t context_length { 32768 };
     std::size_t max_tokens { 8192 };
     std::optional<std::size_t> kv_cache_tokens;
+    std::size_t prefix_cache_mib { 128 };
     weight_quantization quantization { weight_quantization::none };
     bool serve { false };
     bool stream { true };
